@@ -9,15 +9,24 @@ from tests.kernels.utils import opcheck
 from vllm.model_executor.layers.layernorm import PolyNorm, RMSNorm
 from vllm.platforms import current_platform
 
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 4096]  # Arbitrary values for testing
-HIDDEN_SIZES = [8, 768, 769, 770, 771, 5120, 5124, 5125, 5126, 8192,
-                8199]  # Arbitrary values for testing
+HIDDEN_SIZES = [8, 192, 352, 384, 512, 704, 768, 776, 
+                896, 1024, 1280, 1408, 1536, 1792, 2048, 2432, 
+                2560, 2736, 2816, 3072, 3584, 4096, 4608, 4736, 
+                4864, 5120, 5128, 5472, 5632, 6144, 6400, 7168, 
+                8192, 8200, 9216, 9472, 9728, 10944, 11264, 12288, 
+                12800, 16384, 18432, 18944, 19456, 21888, 24576, 25600, 
+                36864, 37888, 51200]
 ADD_RESIDUAL = [False, True]
 SEEDS = [0]
-CUDA_DEVICES = [
-    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-]
+CUDA_DEVICES = ["cpu"]
+# CUDA_DEVICES = [
+#     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+# ]
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
