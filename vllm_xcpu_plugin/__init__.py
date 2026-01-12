@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
-
 from vllm.logger import logger
 
-# def xcpu_platform_plugin() -> Optional[str]:
-#     return "vllm_xcpu_plugin.xcpu_platform_plugin.XcpuPlatform"
+
+def xcpu_platform_plugin() -> str | None:
+    return "vllm_xcpu_plugin.platform.XcpuPlatform"
 
 
 def register_ops():
