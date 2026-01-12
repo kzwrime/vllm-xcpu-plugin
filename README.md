@@ -48,6 +48,51 @@ pip install --no-build-isolation -e .
 
 如果遇到问题，请尝试 pip uninstall vllm_xcpu_plugin，或更进一步地删除 site-packages 下的相关目录。
 
+### 代码风格
+
+项目使用以下工具进行代码检查和格式化：
+
+| 脚本 | 用途 |
+|------|------|
+| `./scripts/format.sh` | 自动格式化代码 (ruff format + fix) |
+| `./scripts/lint.sh` | 检查代码风格 (ruff check only) |
+| `./scripts/mypy.py` | 类型检查 (mypy) |
+| `./scripts/check.sh` | 运行所有检查 |
+
+提交代码前请运行：
+
+```bash
+# 自动检查（不修改代码）
+./scripts/check.sh
+
+# 如果 lint 失败，可以运行自动格式化
+./scripts/format.sh
+
+# 如果 lint 仍然失败 / mypy 失败，请依据提示修复
+```
+
+### Git 钩子
+
+项目配置了 Git 钩子，在 commit/push 前自动运行代码检查：
+
+- **pre-commit**: 检查暂存的 Python 文件
+- **pre-push**: 检查所有 Python 文件
+
+安装钩子：
+
+```bash
+./scripts/install-hooks.sh
+```
+
+如果 lint 失败，钩子会提示运行 `./scripts/format.sh` 自动修复。
+
+临时跳过钩子（不推荐）：
+
+```bash
+git commit --no-verify
+git push --no-verify
+```
+
 ### 添加新算子
 
 1. 在 `custom_ops.py` 中创建继承自对应基类的自定义操作
