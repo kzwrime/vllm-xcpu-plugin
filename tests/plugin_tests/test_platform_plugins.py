@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-import torch
-
 from vllm.plugins import load_general_plugins
-
 
 # def test_platform_plugins():
 #     # simulate workload by running an example
@@ -29,8 +26,9 @@ def test_oot_custom_op(monkeypatch: pytest.MonkeyPatch):
     # simulate workload by running an example
     load_general_plugins()
     from vllm.model_executor.layers.layernorm import RMSNorm
+
     layer = RMSNorm(1024)
     assert layer.__class__.__name__ == "XcpuRMSNorm", (
         f"Expected XcpuRMSNorm, got {layer.__class__.__name__}, "
-        "possibly because the custom op is not registered correctly.")
-
+        "possibly because the custom op is not registered correctly."
+    )
