@@ -3,16 +3,17 @@
 
 import pytest
 import torch
-from tests.kernels.quant_utils import FP8_DTYPE
-from tests.kernels.utils import opcheck
-from vllm.model_executor.layers.layernorm import PolyNorm, RMSNorm
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
+from vllm.utils.torch_utils import set_random_seed
+
+from tests.kernels.utils import opcheck
 
 load_general_plugins()
 
-DTYPES = [torch.half, torch.bfloat16, torch.float]
+DTYPES = [torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 4096]  # Arbitrary values for testing
+
 # fmt: skip
 HIDDEN_SIZES = [
     8,
@@ -67,6 +68,7 @@ HIDDEN_SIZES = [
     37888,
     51200,
 ]
+
 ADD_RESIDUAL = [False, True]
 SEEDS = [0]
 CUDA_DEVICES = ["cpu"]
@@ -84,6 +86,7 @@ CUDA_DEVICES = ["cpu"]
 @pytest.mark.parametrize("strided_input", [False, True])
 @torch.inference_mode()
 def test_rms_norm(
+    default_vllm_config,
     num_tokens: int,
     hidden_size: int,
     add_residual: bool,
@@ -92,7 +95,7 @@ def test_rms_norm(
     device: str,
     strided_input: bool,
 ) -> None:
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     torch.set_default_device(device)
     layer = RMSNorm(hidden_size).to(dtype=dtype)
     layer.weight.data.normal_(mean=1.0, std=0.1)
@@ -119,125 +122,19 @@ def test_rms_norm(
 
     if residual is not None:
         opcheck(
-            torch.ops._C.fused_add_rms_norm,
+            torch.ops.torch_xcpu.fused_add_rms_norm,
             (x, residual, layer.weight.data, layer.variance_epsilon),
         )
     else:
-        opcheck(
-            torch.ops._C.rms_norm, (out, x, layer.weight.data, layer.variance_epsilon)
-        )
-
-
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_poly_norm(
-    num_tokens: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    seed: int,
-    device: str,
-) -> None:
-    current_platform.seed_everything(seed)
-    torch.set_default_device(device)
-    layer = PolyNorm().to(dtype=dtype)
-    layer.weight.data.normal_(mean=1.0, std=0.1)
-    layer.bias.data.normal_(mean=1.0, std=0.1)
-    scale = 1 / (2 * hidden_size)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    x *= scale
-
-    ref_out = layer.forward_native(x)
-    out = layer(x)
-    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
-
-    opcheck(
-        torch.ops._C.poly_norm,
-        (out, x, layer.weight.data, layer.bias.data, layer.variance_epsilon),
-    )
-
-
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("quant_scale", [1.0, 0.01, 10.0])
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("strided_input", [False, True])
-def test_fused_rms_norm_quant(
-    num_tokens: int,
-    hidden_size: int,
-    add_residual: bool,
-    dtype: torch.dtype,
-    quant_scale: float,
-    seed: int,
-    device: str,
-    strided_input: bool,
-) -> None:
-    current_platform.seed_everything(seed)
-    torch.set_default_device(device)
-
-    weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
-    scale = 1 / (2 * hidden_size)
-    last_dim = 2 * hidden_size if strided_input else hidden_size
-    x_base = torch.randn(num_tokens, last_dim, dtype=dtype)
-    x = x_base[..., :hidden_size]
-    assert x.is_contiguous() != strided_input
-
-    x *= scale
-    if add_residual:
-        residual = torch.randn_like(x) * scale
-        residual_fused = residual.clone()
-    else:
-        residual = residual_fused = None
-
-    out_norm = torch.empty_like(x)
-    out_quant = torch.empty_like(x, dtype=FP8_DTYPE)
-    out_quant_fused = torch.empty_like(out_quant)
-
-    quant_scale_t = torch.tensor(quant_scale, dtype=torch.float32)
-
-    if add_residual:
-        torch.ops._C.fused_add_rms_norm_static_fp8_quant(
-            out_quant_fused, x, residual_fused, weight, quant_scale_t, 1e-6
-        )
-
-        # Unfused kernel is in-place so it goes second
-        # Also use a separate clone of x to avoid modifying the input
-        x_unfused_base = x_base.clone()
-        x_unfused = x_unfused_base[..., :hidden_size]
-        assert x_unfused.is_contiguous() != strided_input
-        torch.ops._C.fused_add_rms_norm(x_unfused, residual, weight, 1e-6)
-        torch.ops._C.static_scaled_fp8_quant(
-            out_quant, x_unfused.contiguous(), quant_scale_t
-        )
-
-        torch.cuda.synchronize()
-        torch.testing.assert_close(residual_fused, residual, atol=1e-2, rtol=1e-2)
-        opcheck(
-            torch.ops._C.fused_add_rms_norm_static_fp8_quant,
-            (out_quant_fused, x, residual_fused, weight, quant_scale_t, 1e-6),
-        )
-    else:
-        torch.ops._C.rms_norm_static_fp8_quant(
-            out_quant_fused, x, weight, quant_scale_t, 1e-6
-        )
-
-        torch.ops._C.rms_norm(out_norm, x, weight, 1e-6)
-        torch.ops._C.static_scaled_fp8_quant(out_quant, out_norm, quant_scale_t)
-
-        opcheck(
-            torch.ops._C.rms_norm_static_fp8_quant,
-            (out_quant_fused, x, weight, quant_scale_t, 1e-6),
-        )
-
-    torch.testing.assert_close(
-        out_quant.to(dtype=torch.float32),
-        out_quant_fused.to(dtype=torch.float32),
-        atol=1e-3,
-        rtol=1e-3,
-    )
+        if x.dtype == torch.bfloat16:
+            opcheck(
+                torch.ops.torch_xcpu.rms_norm_bf16,
+                (out, x, layer.weight.data, layer.variance_epsilon),
+            )
+        elif x.dtype == torch.float:
+            opcheck(
+                torch.ops.torch_xcpu.rms_norm_fp32,
+                (out, x, layer.weight.data, layer.variance_epsilon),
+            )
+        else:
+            raise RuntimeError(f"Unsupported dtype: {x.dtype}")
