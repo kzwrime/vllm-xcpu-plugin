@@ -1,6 +1,38 @@
 import torch
-from vllm.logger import logger
-from vllm.model_executor.layers.layernorm import RMSNorm, fused_add_rms_norm, rms_norm
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.platforms import current_platform
+
+
+def rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+) -> torch.Tensor:
+    import torch_xcpu.ops as ops
+
+    out = torch.empty_like(x)
+    ops.rms_norm(
+        out,
+        x,
+        weight,
+        variance_epsilon,
+    )
+    return out
+
+
+def fused_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_xcpu.ops as ops
+
+    ops.fused_add_rms_norm(
+        x,
+        residual,
+        weight,
+        variance_epsilon,
+    )
+    return x, residual
 
 
 @RMSNorm.register_oot
@@ -14,7 +46,10 @@ class XcpuRMSNorm(RMSNorm):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
-        logger.info("Init XcpuRMSNorm")
+        # logger.info("Init XcpuRMSNorm")
+
+        if current_platform.is_cpu():
+            self._forward_method = self.forward_cpu
 
     def forward_cpu(
         self,
@@ -28,6 +63,8 @@ class XcpuRMSNorm(RMSNorm):
 
         add_residual = residual is not None
         if add_residual:
+            assert residual is not None
+            assert self.weight.data is not None
             return fused_add_rms_norm(
                 x, residual, self.weight.data, self.variance_epsilon
             )
