@@ -121,10 +121,16 @@ def test_rms_norm(
         torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
     if residual is not None:
-        opcheck(
-            torch.ops.torch_xcpu.fused_add_rms_norm,
-            (x, residual, layer.weight.data, layer.variance_epsilon),
-        )
+        if x.dtype == torch.bfloat16:
+            opcheck(
+                torch.ops.torch_xcpu.fused_add_rms_norm_bf16,
+                (x, residual, layer.weight.data, layer.variance_epsilon),
+            )
+        elif x.dtype == torch.float:
+            opcheck(
+                torch.ops.torch_xcpu.fused_add_rms_norm_fp32,
+                (x, residual, layer.weight.data, layer.variance_epsilon),
+            )
     else:
         if x.dtype == torch.bfloat16:
             opcheck(
