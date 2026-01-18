@@ -11,3 +11,4 @@ def xcpu_platform_plugin() -> str | None:
 def register_ops():
     logger.info("register_ops")
     import vllm_xcpu_plugin.custom_ops  # noqa
+    import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
