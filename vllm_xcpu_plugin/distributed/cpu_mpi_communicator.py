@@ -80,20 +80,25 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
 
         if self.use_all2all:
             all2all_backend = envs.VLLM_ALL2ALL_BACKEND
-            if all2all_backend == "naive":
-                from .all2all import NaiveAll2AllManager
+            if all2all_backend == "naive":  # type: ignore[has-type]
+                from vllm.distributed.device_communicators.all2all import (
+                    NaiveAll2AllManager,
+                )
 
                 self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
-                logger.info("Using naive all2all manager.")
-            elif all2all_backend == "allgather_reducescatter":
-                from .all2all import AgRsAll2AllManager
+            elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]
+                from vllm.distributed.device_communicators.all2all import (
+                    All2allvSingleAll2AllManager,
+                )
 
-                self.all2all_manager = AgRsAll2AllManager(self.device_group)
-                logger.info("Using AllGather-ReduceScatter all2all manager.")
+                self.all2all_manager = All2allvSingleAll2AllManager(
+                    cpu_group=self.cpu_group
+                )
             else:
                 raise ValueError(
                     f"Unknown/Unsupported all2all backend: {all2all_backend}"
                 )
+            logger.info("Using all2all_backend = {all2all_backend}.")
 
         self.comm_ptr = self.mpi_group_comm.py2f()
 
