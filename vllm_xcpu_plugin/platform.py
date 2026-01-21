@@ -21,9 +21,7 @@ class XcpuPlatform(CpuPlatform):
                 "vllm_xcpu_plugin.distributed.cpu_mpi_communicator.CpuMPICommunicator"  # noqa
             )
         else:
-            return (
-                "vllm.distributed.device_communicators.cpu_communicator.CpuCommunicator"  # noqa
-            )
+            return "vllm_xcpu_plugin.distributed.xcpu_communicator.CpuCommunicator"  # noqa
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

@@ -31,6 +31,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
+    "VLLM_ALL2ALL_BACKEND_XCPU": lambda: os.getenv("VLLM_ALL2ALL_BACKEND_XCPU", ""),
 }
 
 # end-env-vars-definition

@@ -1,11 +1,16 @@
 import torch
 import torch.distributed as dist
-import vllm.envs as envs
 from torch.distributed import ProcessGroup
+from vllm.distributed.device_communicators.all2all import (
+    All2AllManagerBase,
+    NaiveAll2AllManager,
+)
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.logger import logger
+
+import vllm_xcpu_plugin.envs as envs_xcpu
 
 try:
     import mpi4py.rc
@@ -79,12 +84,8 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         assert self.mpi_group_size == self.world_size
 
         if self.use_all2all:
-            all2all_backend = envs.VLLM_ALL2ALL_BACKEND
-            if all2all_backend == "naive":  # type: ignore[has-type]
-                from vllm.distributed.device_communicators.all2all import (
-                    NaiveAll2AllManager,
-                )
-
+            self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
+            if self.all2all_backend == "naive":  # type: ignore[has-type]
                 self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]
                 from vllm.distributed.device_communicators.all2all import (
@@ -94,11 +95,14 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = All2allvSingleAll2AllManager(
                     cpu_group=self.cpu_group
                 )
+            elif self.all2all_backend == "torch_all_to_all_single":  # type: ignore[has-type]
+                # do nothing
+                self.all2all_manager = All2AllManagerBase(cpu_group=self.cpu_group)
             else:
                 raise ValueError(
-                    f"Unknown/Unsupported all2all backend: {all2all_backend}"
+                    f"Unknown/Unsupported all2all backend: {self.all2all_backend}"
                 )
-            logger.info("Using all2all_backend = {all2all_backend}.")
+            logger.info("Using all2all_backend = %s", self.all2all_backend)
 
         self.comm_ptr = self.mpi_group_comm.py2f()
 
