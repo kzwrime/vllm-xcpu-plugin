@@ -1,26 +1,24 @@
 import torch
-from torch import Tensor  # 显式导入Tensor类型，解决mypy类型注解问题
+from torch import Tensor
 from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.platforms import current_platform
+from vllm.plugins import load_general_plugins
 
 
-# 工具函数：检查torch.ops.torch_xcpu算子是否可用（替换原._C检查）
 def _is_torch_xcpu_op_available(op_name: str) -> bool:
     try:
-        # 改为检查torch.ops.torch_xcpu下的算子
         return hasattr(torch.ops.torch_xcpu, op_name)
     except Exception:
         return False
 
 
-# 清空原生注册，避免重复
 if hasattr(SiluAndMul, "op_registry_oot"):
     SiluAndMul.op_registry_oot = {}
     logger.info("清空原生SiluAndMul的op_registry_oot，避免重复注册")
 
 
-# 注册torch.ops算子（移除强制assert，适配torch.ops路径）
 def _register_silu_and_mul_op():
     if hasattr(torch.ops.torch_xcpu, "silu_and_mul"):
         logger.info("silu_and_mul already registered, skip")
@@ -38,7 +36,6 @@ def _register_silu_and_mul_op():
                 a = input[..., :d]
                 b = input[..., d:]
 
-                # 替换：从torch_xcpu._C改为torch.ops.torch_xcpu
                 if input.dtype == torch.float32 and _is_torch_xcpu_op_available(
                     "silu_and_mul_fp32"
                 ):
@@ -71,12 +68,10 @@ def _register_silu_and_mul_op():
             return out
 
 
-# 核心：移除forward_cpu中的所有logger语句 + 修复forward_native签名
 @SiluAndMul.register_oot
 class XcpuSiluAndMul(SiluAndMul):
     def __init__(self) -> None:
         super().__init__()
-        # __init__里的日志不会被编译，可保留
         logger.info("Init XcpuSiluAndMul (XCPU backend)")
 
         if current_platform.is_cpu():
@@ -84,7 +79,6 @@ class XcpuSiluAndMul(SiluAndMul):
                 self._forward_method = self.forward_cpu
                 fp32_ok = _is_torch_xcpu_op_available("silu_and_mul_fp32")
                 bf16_ok = _is_torch_xcpu_op_available("silu_and_mul_bf16")
-                # 仅保留__init__里的日志（非编译路径）
                 logger.info(f"XCPU算子可用性：fp32={fp32_ok}, bf16={bf16_ok}")
             except Exception as e:
                 logger.warning(f"Failed to set forward_cpu, fallback to native: {e}")
@@ -93,9 +87,6 @@ class XcpuSiluAndMul(SiluAndMul):
             self._forward_method = self.forward_native
 
     def forward_cpu(self, input: Tensor) -> Tensor:
-        """移除所有logger语句，避免torch.compile不兼容"""
-        # 1. 彻底删除logger.debug语句（核心修复）
-        # 2. 保留核心逻辑，无任何日志输出
         if input.size(-1) % 2 != 0:
             raise ValueError(
                 f"SiluAndMul input last dim must be even, got {input.size(-1)}"
@@ -106,7 +97,6 @@ class XcpuSiluAndMul(SiluAndMul):
             *input.shape[:-1], d_out, dtype=input.dtype, device=input.device
         )
 
-        # 替换：从torch_xcpu._C改为torch.ops.torch_xcpu
         if input.dtype == torch.float32 and _is_torch_xcpu_op_available(
             "silu_and_mul_fp32"
         ):
@@ -131,25 +121,82 @@ class XcpuSiluAndMul(SiluAndMul):
 
         return out
 
-    # 核心修复：对齐父类签名（添加@staticmethod + 参数名改为x）
     @staticmethod
     def forward_native(x: Tensor) -> Tensor:
-        """
-        修复mypy override错误：
-        1. 添加@staticmethod装饰器（对齐父类）
-        2. 参数名改为x（对齐父类的forward_native(x: Tensor)）
-        3. 内部逻辑保持不变，仅把input替换为x
-        """
         d = x.shape[-1] // 2
         a = x[..., :d]
         b = x[..., d:]
         return torch.nn.functional.silu(a) * b
 
 
+def rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+) -> torch.Tensor:
+    import torch_xcpu.ops as ops
+
+    out = torch.empty_like(x)
+    ops.rms_norm(
+        out,
+        x,
+        weight,
+        variance_epsilon,
+    )
+    return out
+
+
+def fused_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_xcpu.ops as ops
+
+    ops.fused_add_rms_norm(
+        x,
+        residual,
+        weight,
+        variance_epsilon,
+    )
+    return x, residual
+
+
+@RMSNorm.register_oot
+class XcpuRMSNorm(RMSNorm):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        var_hidden_size: int | None = None,
+        has_weight: bool = True,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
+
+        if current_platform.is_cpu():
+            self._forward_method = self.forward_cpu
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        add_residual = residual is not None
+        if add_residual:
+            assert residual is not None
+            assert self.weight.data is not None
+            return fused_add_rms_norm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return rms_norm(x, self.weight.data, self.variance_epsilon)
+
+
 def register_ops():
     try:
-        from vllm.plugins import load_general_plugins
-
         load_general_plugins()
         _register_silu_and_mul_op()
         SiluAndMul.op_registry_oot["cpu"] = XcpuSiluAndMul
@@ -159,4 +206,4 @@ def register_ops():
         pass
 
 
-__all__ = ["XcpuSiluAndMul", "register_ops"]
+__all__ = ["XcpuSiluAndMul", "XcpuRMSNorm", "register_ops"]
