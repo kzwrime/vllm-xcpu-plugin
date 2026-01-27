@@ -173,6 +173,7 @@ class XcpuRMSNorm(RMSNorm):
     ) -> None:
         super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
         # logger.info("Init XcpuRMSNorm")
+        
         if current_platform.is_cpu():
             self._forward_method = self.forward_cpu
 
