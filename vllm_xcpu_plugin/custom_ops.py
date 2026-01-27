@@ -172,7 +172,7 @@ class XcpuRMSNorm(RMSNorm):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
-
+        # logger.info("Init XcpuRMSNorm")
         if current_platform.is_cpu():
             self._forward_method = self.forward_cpu
 
@@ -181,6 +181,8 @@ class XcpuRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # logger.debug("XcpuRMSNorm.forward_cpu")
+        
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
