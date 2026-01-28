@@ -228,66 +228,46 @@ def fused_moe_compute(
     topk_ids_flat = topk_ids.view(-1)  # [M * topk]
     # Filter tokens based on expert_map (for expert parallelism)
     # Tokens assigned to experts not in this rank should be excluded
-    if expert_map is not None:
-        # Create a mask for valid experts (experts that belong to this rank)
-        # valid_expert_mask = expert_map != -1
-        # Map global expert IDs to local expert IDs
-        local_expert_ids = expert_map[topk_ids_flat]
-        # Keep only tokens assigned to local experts
-        valid_token_mask = local_expert_ids != -1
 
-        # expert_num_tokens[i] = number of tokens for expert i
-        if expert_num_tokens is None:
-            expert_num_tokens = torch.zeros(
-                (num_experts), device=topk_ids.device, dtype=torch.int32
-            )
-            for i in range(num_experts):
-                expert_num_tokens[i] = (local_expert_ids == i).sum()
+    if expert_map is None:
+        expert_map = torch.arange(num_experts, device=topk_ids.device)
 
-        expert_offsets = torch.nn.functional.pad(
-            torch.cumsum(expert_num_tokens, dim=0), (1, 0)
-        )
+    # Create a mask for valid experts (experts that belong to this rank)
+    # valid_expert_mask = expert_map != -1
+    # Map global expert IDs to local expert IDs
+    local_expert_ids = expert_map[topk_ids_flat]
 
-        # Get indices of valid tokens
-        valid_token_indices = torch.nonzero(valid_token_mask, as_tuple=False).view(-1)
-
-        if len(valid_token_indices) == 0:
-            # No tokens assigned to local experts,
-            # output is already zero-initialized.
-            # TODO: really ?
-            return
-
-        # Sort valid tokens by their local expert ID
-        local_expert_ids_valid = local_expert_ids[valid_token_indices]
-        sorted_by_expert = torch.argsort(local_expert_ids_valid)
-
-    else:
-        sorted_by_expert = torch.argsort(topk_ids_flat)
-
-        # Equal to expert_num_tokens =
-        #          torch.bincount(input=topk_ids_flat, minlength=num_experts)
-        # However, torch.bincount can't pass torch.compile
+    # expert_num_tokens[i] = number of tokens for expert i
+    if expert_num_tokens is None:
         expert_num_tokens = torch.zeros(
             (num_experts), device=topk_ids.device, dtype=torch.int32
         )
         for i in range(num_experts):
-            expert_num_tokens[i] = (topk_ids_flat == i).sum()
+            expert_num_tokens[i] = (local_expert_ids == i).sum()
 
-        expert_offsets = torch.nn.functional.pad(
-            torch.cumsum(expert_num_tokens, dim=0), (1, 0)
-        )
+    expert_offsets = torch.nn.functional.pad(
+        torch.cumsum(expert_num_tokens, dim=0), (1, 0)
+    )
 
-        valid_token_indices = torch.arange(
-            topk_ids_flat.numel(), device=topk_ids_flat.device
-        )
+    if expert_num_tokens.sum().item() == 0:
+        output.zero_()
+        return
+
+    sorted_by_expert = torch.empty(
+        int(expert_num_tokens.sum().item()), device=topk_ids.device, dtype=torch.int64
+    )
+    expert_offsets_ = expert_offsets.clone()
+    for i in range(M * topk):
+        expert_id = local_expert_ids[i]
+        if expert_id >= 0:
+            sorted_by_expert[expert_offsets_[expert_id]] = i
+            expert_offsets_[expert_id] += 1
 
     # Get permuted hidden states
     # Expand [M, K] -> [M * topk, K] by repeating each token topk times
     expanded_hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-    # Apply valid token mask
-    permuted_hidden_states = expanded_hidden_states[valid_token_indices]
-    # Sort by expert assignment
-    permuted_hidden_states = permuted_hidden_states[sorted_by_expert]
+    permuted_hidden_states = expanded_hidden_states[sorted_by_expert]
+
     torch._check(permuted_hidden_states.shape[0] <= M * topk)
 
     # Step 2: Grouped GEMM (first layer) - compute gate_up projections
@@ -333,15 +313,11 @@ def fused_moe_compute(
     )  # expert_output is [num_valid_tokens, K]
 
     # Step 5: Unpermute - restore tokens to original order
-    # First, unsort the expert outputs
-    unsorted_expert_output = torch.empty_like(input=expert_output)
-    unsorted_expert_output[sorted_by_expert] = expert_output
-
-    # Then, map back to the expanded token space
+    # map back to the expanded token space
     expanded_output = torch.zeros(
-        M * topk, K, dtype=hidden_states.dtype, device=hidden_states.device
+        M * topk, K, dtype=topk_weights.dtype, device=hidden_states.device
     )
-    expanded_output[valid_token_indices] = unsorted_expert_output
+    expanded_output[sorted_by_expert] = expert_output.to(topk_weights.dtype)
 
     # Step 6: Apply topk weights and reduce
     # Reshape to [M, topk, K]
@@ -352,7 +328,7 @@ def fused_moe_compute(
         reshaped_output = reshaped_output * topk_weights.view(M, topk, 1)
 
     # Sum across topk dimension to get final output
-    output.copy_(reshaped_output.sum(dim=1))
+    output.copy_(reshaped_output.sum(dim=1).to(output.dtype))
 
 
 direct_register_custom_op(
