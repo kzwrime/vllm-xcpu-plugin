@@ -26,6 +26,7 @@ from vllm.platforms import current_platform
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 from .cpu_groupgemm_moe_v1 import CPUGroupGemmExperts
+from .mpi_alltoallv_prepare_finalize import MpiAlltoallvPrepareAndFinalize
 from .torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
@@ -71,6 +72,23 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     * self.moe.num_local_experts,
                     tp_rank=self.moe.tp_rank,
                     tp_size=self.moe.tp_size,
+                )
+            elif envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU == "mpi_alltoallv":
+                _ep_group = get_ep_group()
+                assert _ep_group is not None
+                ep_group = (
+                    _ep_group.device_communicator.device_group
+                    if _ep_group.device_communicator.device_group is not None
+                    else _ep_group.device_communicator.cpu_group
+                )
+                num_dispatchers = all2all_manager.world_size
+
+                prepare_finalize = MpiAlltoallvPrepareAndFinalize(
+                    ep_group=ep_group,
+                    num_local_experts=self.moe.num_local_experts,
+                    num_dispatchers=num_dispatchers,
+                    rank_expert_offset=all2all_manager.rank
+                    * self.moe.num_local_experts,
                 )
             else:
                 pass
