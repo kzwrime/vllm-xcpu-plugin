@@ -292,8 +292,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_num_tokens_cpu=expert_num_tokens.cpu(),
         )
 
-        print(f"expert_num_tokens is {expert_num_tokens.sum().item()}")
-
         def _receiver() -> mk.PrepareResultType:
             # vLLM expects 2D topk_ids/weights [tokens, topk] usually, but since we
             # broke down the batch into individual tokens for EP,
