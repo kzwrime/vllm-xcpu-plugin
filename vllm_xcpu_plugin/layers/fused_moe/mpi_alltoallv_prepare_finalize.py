@@ -355,6 +355,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> Callable:
+        import torch_mpi_ext
         # # Validation
         # if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
         #      # Ensure we use a contiguous reducer logic if delegated
@@ -386,13 +387,24 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             (total_output_tokens, hidden_dim), dtype=dtype, device=device
         )
 
-        # # 3. All-to-All Single
-        dist.all_to_all_single(
-            recv_hidden_states,
-            fused_expert_output,
-            output_split_sizes=finalize_recv_sizes,
-            input_split_sizes=finalize_send_sizes,
-            group=self.ep_group,
+        sendcounts = (
+            torch.tensor(finalize_send_sizes, dtype=torch.int32, device=device)
+            * hidden_dim
+        )
+        recvcounts = (
+            torch.tensor(finalize_recv_sizes, dtype=torch.int32, device=device)
+            * hidden_dim
+        )
+        sdispls = torch.nn.functional.pad(torch.cumsum(sendcounts[:-1], dim=0), (1, 0))
+        rdispls = torch.nn.functional.pad(torch.cumsum(recvcounts[:-1], dim=0), (1, 0))
+        torch_mpi_ext.ops.alltoallv_out(
+            recvbuf=recv_hidden_states,
+            sendbuf=fused_expert_output,
+            sendcounts=sendcounts,
+            sdispls=sdispls,
+            recvcounts=recvcounts,
+            rdispls=rdispls,
+            comm_ptr=self.comm_ptr,
         )
 
         # 4. UNPERMUTE AND REDUCE
