@@ -7,6 +7,7 @@ import torch
 # Modular kernel interface for CPU MoE
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from torch.nn import functional as F
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -41,6 +42,8 @@ def moe_grouped_gemm(
     Returns:
         None (result is written to output tensor)
     """
+    import torch_xcpu
+
     # -------- Parameter and shape checking --------
     assert expert_offsets.dim() == 1, "expert_offsets must be 1D"
     expert_num = expert_offsets.numel() - 1
@@ -48,7 +51,9 @@ def moe_grouped_gemm(
         f"weight has {weight.shape[0]} experts but expert_offsets suggests {expert_num}"
     )
 
-    input_x_mat = input_x.transpose(-1, -2) if trans_a else input_x
+    assert trans_a is False
+
+    input_x_mat = input_x
     weight_mat = weight.transpose(-1, -2) if trans_b else weight
 
     m, k = input_x_mat.shape
@@ -73,10 +78,10 @@ def moe_grouped_gemm(
         w_i = weight_mat[i]  # [k, n]
 
         # Compute GEMM for this expert
-        y_i = x_i @ w_i  # [mi, n]
-
-        # Store results
-        output[start:end, :] = y_i
+        if envs.VLLM_USE_XCPU_LINEAR:
+            torch_xcpu.ops.mm(x_i, w_i, out=output[start:end, :])
+        else:
+            torch.mm(x_i, w_i, out=output[start:end, :])
 
 
 direct_register_custom_op(
