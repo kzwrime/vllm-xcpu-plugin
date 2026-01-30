@@ -42,6 +42,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # logger.info("Using XcpuUnquantizedFusedMoEMethod")
+        self.topk_reduce = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU != "mpi_alltoallv" 
 
     def maybe_make_prepare_finalize(
         self,
@@ -108,7 +109,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise NotImplementedError("BatchedExperts not supported")
         else:
             logger.debug("CPUGroupGemmExperts %s", self.moe)
-            return CPUGroupGemmExperts(layer, self.moe_quant_config)
+            return CPUGroupGemmExperts(layer, self.moe_quant_config, self.topk_reduce)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # super().process_weights_after_loading(layer)
@@ -122,7 +123,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         self.kernel = mk.FusedMoEModularKernel(
             MoEPrepareAndFinalizeNoEP(),
-            CPUGroupGemmExperts(layer, self.moe_quant_config),
+            CPUGroupGemmExperts(layer, self.moe_quant_config, self.topk_reduce),
             shared_experts=None,
         )
 

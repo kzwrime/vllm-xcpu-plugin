@@ -102,9 +102,11 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         self,
         layer: torch.nn.Module,
         quant_config: FusedMoEQuantConfig,
+        topk_reduce: bool = True,
     ):
         super().__init__(quant_config)
         self.layer = layer
+        self.topk_reduce = topk_reduce
 
     @property
     def activation_formats(
@@ -187,6 +189,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             if expert_tokens_meta
             else None,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            topk_reduce=self.topk_reduce,
         )
 
 
@@ -204,6 +207,7 @@ def fused_moe_compute(
     a2_scale: torch.Tensor | None,
     expert_num_tokens: torch.Tensor | None,
     apply_router_weight_on_input: bool,
+    topk_reduce: bool,
 ) -> None:
     """
     Execute CPU MoE computation using native torch operations.
@@ -295,16 +299,24 @@ def fused_moe_compute(
         # need to transpose last 2 dims
     )  # expert_output is [num_valid_tokens, K]
 
-    workspace_unpermute_and_reduce = torch.empty(
-        M, K, dtype=topk_weights.dtype, device=hidden_states.device
-    )
-    xcpu_ops.moe_unpermute(
-        output,
-        expert_output,
-        sorted_by_expert.to(torch.int32),
-        topk_weights,
-        workspace_unpermute_and_reduce,
-    )
+    if topk_reduce:
+        workspace_unpermute_and_reduce = torch.empty(
+            M, K, dtype=topk_weights.dtype, device=hidden_states.device
+        )
+        xcpu_ops.moe_unpermute(
+            output,
+            expert_output,
+            sorted_by_expert.to(torch.int32),
+            topk_weights=topk_weights,
+            workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
+        )
+    else:
+        xcpu_ops.moe_unpermute(
+            output,
+            expert_output,
+            sorted_by_expert.to(torch.int32),
+            topk=topk,
+        )
 
 
 direct_register_custom_op(

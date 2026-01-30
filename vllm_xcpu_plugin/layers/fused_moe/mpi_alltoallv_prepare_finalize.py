@@ -290,7 +290,9 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 None,  # no quant scale
                 expert_tokens_meta,
                 ret_topk_ids,
-                torch.ones(ret_topk_ids.shape, device=device, dtype=topk_weights.dtype),
+                torch.empty(
+                    ret_topk_ids.shape, device=device, dtype=topk_weights.dtype
+                ),
             )
 
         return _receiver
