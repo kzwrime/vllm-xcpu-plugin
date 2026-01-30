@@ -69,36 +69,13 @@ def permute_before_alltoallv(
     return sort_indices, split_sizes, target_ranks
 
 
-def unpermute_and_reduce_after_alltoallv(
-    output: torch.Tensor,
-    fused_expert_output: torch.Tensor,
-    row_indices: torch.Tensor,
-) -> None:
-    """
-    Scatter results back to original positions and reduce (sum) them.
-
-    Args:
-        output: [num_tokens, hidden_dim]
-                 The destination tensor (will be modified in-place).
-        fused_expert_output: [total_recv_tokens, hidden_dim]
-                              Results received from experts.
-        row_indices: [total_recv_tokens] Indices mapping each result row back to
-                     the original token index (0..num_tokens-1).
-    """
-    # fused_expert_output contains results for
-    #   [token_i_exp_a, token_i_exp_b, token_j_exp_a...]
-    # row_indices contains [i, i, j...] matching the order of fused_expert_output.
-    # index_add_ performs the reduction: output[idx] += src[i]
-    output.index_add_(0, row_indices, fused_expert_output)
-
-
 class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
     Improvements over original:
     1. Removes all Python loops for index generation (vectorized).
-    2. Uses index_add_ for fast unpermute-and-reduce.
+    2. Uses C++ kernel for finalize (alltoallv + unpermute+reduce fused).
     3. Removes quantization overhead.
     """
 
@@ -121,10 +98,13 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Context storage for finalize phase
         # We need to know where to put the received data back
         self._row_indices_restore: torch.Tensor | None = None
+        self.topk: int = -1
 
         # Communication metadata
-        self._send_split_sizes: list[int] | None = None
-        self._recv_split_sizes: list[int] | None = None
+        self._send_split_sizes: torch.Tensor | None = None
+        self._recv_split_sizes: torch.Tensor | None = None
+
+        self._topk_weights: torch.Tensor | None = None
 
         communicator = get_ep_group().device_communicator
         assert isinstance(communicator, CpuMPICommunicator)
@@ -193,6 +173,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_tokens, hidden_dim = a1.shape
         _, topk = topk_ids.shape
         device = a1.device
+        self.topk = topk
+        self._topk_weights = topk_weights
 
         # Repeat input for each topk choice: [num_tokens * topk, hidden_dim]
         hidden_states_source = a1.repeat_interleave(topk, dim=0)
@@ -210,11 +192,9 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # (which will be the order we receive results back)
         # back to the ORIGINAL row index (0..num_tokens-1) for reduction.
         # Create a mapping: [0, 0, 1, 1, 2, 2 ...] for topk=2
-        original_row_indices = torch.arange(
-            num_tokens, device=device
-        ).repeat_interleave(topk)
+        row_indices_restore = torch.arange(num_tokens * topk, device=device)
         # Reorder this mapping to match the data we are sending
-        self._row_indices_restore = original_row_indices[sort_indices]
+        self._row_indices_restore = row_indices_restore[sort_indices].to(torch.int32)
 
         # 4. Prepare Send Tensors
         # Use index_select or advanced indexing.
@@ -223,10 +203,9 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Flatten and sort metadata
         send_topk_ids = topk_ids.flatten()[sort_indices]
-        send_topk_weights = topk_weights.flatten()[sort_indices]
 
         # 5. Exchange Split Sizes
-        self._send_split_sizes = send_split_sizes_tensor.tolist()
+        self._send_split_sizes = send_split_sizes_tensor.to(torch.int32)
         recv_split_sizes_tensor = torch.empty_like(send_split_sizes_tensor)
 
         torch_mpi_ext.ops.alltoall_out(
@@ -234,7 +213,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             send_split_sizes_tensor,
             self.comm_ptr,
         )
-        self._recv_split_sizes = recv_split_sizes_tensor.tolist()
+        self._recv_split_sizes = recv_split_sizes_tensor.to(torch.int32)
 
         total_recv = int(recv_split_sizes_tensor.sum().item())
 
@@ -243,9 +222,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             (total_recv, hidden_dim), dtype=a1.dtype, device=device
         )
         recv_topk_ids = torch.empty((total_recv,), dtype=topk_ids.dtype, device=device)
-        recv_topk_weights = torch.empty(
-            (total_recv,), dtype=topk_weights.dtype, device=device
-        )
 
         # 7. Perform All-to-All
         # Note: We issue multiple all_to_all calls.
@@ -285,15 +261,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             rdispls=rdispls,
             comm_ptr=self.comm_ptr,
         )
-        torch_mpi_ext.ops.alltoallv_out(
-            recvbuf=recv_topk_weights,
-            sendbuf=send_topk_weights,
-            sendcounts=send_split_sizes_tensor,
-            sdispls=sdispls,
-            recvcounts=recv_split_sizes_tensor,
-            rdispls=rdispls,
-            comm_ptr=self.comm_ptr,
-        )
 
         # 8. Calculate Metadata for Expert Computation
         # We need to reshape 1D arrays back to the format
@@ -317,12 +284,13 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # vLLM expects 2D topk_ids/weights [tokens, topk] usually, but since we
             # broke down the batch into individual tokens for EP,
             # we return [total_recv, 1].
+            ret_topk_ids = recv_topk_ids.unsqueeze(1)
             return (
                 recv_hidden_states,
                 None,  # no quant scale
                 expert_tokens_meta,
-                recv_topk_ids.unsqueeze(1),
-                recv_topk_weights.unsqueeze(1),
+                ret_topk_ids,
+                torch.ones(ret_topk_ids.shape, device=device, dtype=topk_weights.dtype),
             )
 
         return _receiver
@@ -355,70 +323,64 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> Callable:
-        import torch_mpi_ext
-        # # Validation
-        # if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
-        #      # Ensure we use a contiguous reducer logic if delegated
-        #      weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+        from torch_xcpu import ops as xcpu_ops
 
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
-        device = output.device
 
-        # 1. Apply Weights (if not done on input)
-        # Note: topk_weights here comes from the 'prepare' return,
-        # so it is [total_recv, 1] fused_expert_output is [total_recv, hidden_dim]
-        # if not apply_router_weight_on_input and fused_expert_output.numel() > 0:
-        #     fused_expert_output = fused_expert_output * topk_weights
-
-        # 2. Reverse Communication (Experts -> Original Ranks)
+        # 1. Reverse Communication (Experts -> Original Ranks) + Unpermute and Reduce
         # Send back what we received.
         # send_split_sizes (for finalize) == recv_split_sizes (from prepare)
-        finalize_send_sizes = self._recv_split_sizes
-        finalize_recv_sizes = self._send_split_sizes
+        finalize_send_sizes_tensor = self._recv_split_sizes
+        finalize_recv_sizes_tensor = self._send_split_sizes
 
-        assert finalize_recv_sizes is not None
+        assert finalize_recv_sizes_tensor is not None
+        assert finalize_send_sizes_tensor is not None
 
-        total_output_tokens = sum(finalize_recv_sizes)
-        hidden_dim = output.size(1)
-        dtype = output.dtype
         device = output.device
+        hidden_dim = output.size(1)
 
-        recv_hidden_states = torch.empty(
-            (total_output_tokens, hidden_dim), dtype=dtype, device=device
-        )
+        # Calculate workspace sizes
+        total_output_tokens = int(finalize_recv_sizes_tensor.sum().item())
+        M = output.size(0)
 
-        sendcounts = (
-            torch.tensor(finalize_send_sizes, dtype=torch.int32, device=device)
-            * hidden_dim
-        )
-        recvcounts = (
-            torch.tensor(finalize_recv_sizes, dtype=torch.int32, device=device)
-            * hidden_dim
-        )
-        sdispls = torch.nn.functional.pad(torch.cumsum(sendcounts[:-1], dim=0), (1, 0))
-        rdispls = torch.nn.functional.pad(torch.cumsum(recvcounts[:-1], dim=0), (1, 0))
-        torch_mpi_ext.ops.alltoallv_out(
-            recvbuf=recv_hidden_states,
-            sendbuf=fused_expert_output,
-            sendcounts=sendcounts,
-            sdispls=sdispls,
-            recvcounts=recvcounts,
-            rdispls=rdispls,
-            comm_ptr=self.comm_ptr,
+        # Allocate or resize workspace buffers
+        _finalize_recv_hidden_states = torch.empty(
+            (total_output_tokens, hidden_dim),
+            dtype=output.dtype,
+            device=device,
         )
 
-        # 4. UNPERMUTE AND REDUCE
-        # We need to reset output first because we are accumulating
-        output.zero_()
+        _finalize_workspace = torch.empty(
+            (M, hidden_dim),
+            dtype=torch.float32,
+            device=device,
+        )
 
         # The magic happens here:
         # We use the restored indices from the prepare phase.
-        # recv_hidden_states is ordered exactly as we sent them in prepare.
-        # self._row_indices_restore maps that order to the original row index.
         assert self._row_indices_restore is not None
-        unpermute_and_reduce_after_alltoallv(
-            output, recv_hidden_states, self._row_indices_restore
+
+        # Call the C++ operator that combines:
+        # 1. Alltoallv reverse communication
+        # 2. Zero output
+        # 3. Unpermute and reduce (index_add)
+        xcpu_ops.moe_finalize(
+            output,
+            fused_expert_output,
+            self._row_indices_restore,
+            finalize_send_sizes_tensor,
+            finalize_recv_sizes_tensor,
+            self.ep_size,
+            self.comm_ptr,
+            _finalize_recv_hidden_states,
+            _finalize_workspace,
+            self.topk,
+            self._topk_weights,
         )
+        self._topk_weights = None
+        self._row_indices_restore = None
+        self._recv_split_sizes = None
+        self._send_split_sizes = None
 
         def _receiver():
             pass
