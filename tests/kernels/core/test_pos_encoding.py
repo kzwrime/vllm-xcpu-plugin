@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Sequence
-from typing import Any
-from unittest.mock import patch
+from collections.abc import Callable
 
 import pytest
 import torch
-from torch._prims_common import TensorLikeType
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
+
+from tests.kernels.utils import opcheck  # 从项目导入 opcheck
 
 load_general_plugins()
 
 # =============================================================================
 # Copied from tests/kernels/allclose_default.py to avoid import issues
+# =============================================================================
+# =============================================================================
+# 精度要求：此处相对 tests/kernels/allclose_default.py 降低了精度
+# -----------------------------------------------------------------------------
+# 原始默认（allclose_default）：bfloat16 atol=1e-3, rtol=1.6e-2；float atol=1e-5, rtol=1.3e-6
+# RotaryEmbedding 涉及 cos/sin 等运算，bfloat16 累积误差较大，故放宽 atol/rtol。
+# 当前采用：bfloat16 atol=2e-2, rtol=1.6e-2；float 与默认一致。
 # =============================================================================
 default_atol = {torch.float16: 1e-3, torch.bfloat16: 2e-2, torch.float: 1e-5}
 default_rtol = {torch.float16: 1e-3, torch.bfloat16: 1.6e-2, torch.float: 1.3e-6}
@@ -27,59 +33,6 @@ def get_default_atol(output) -> float:
 
 def get_default_rtol(output) -> float:
     return default_rtol[output.dtype]
-
-
-# =============================================================================
-# Copied from tests/kernels/utils.py to avoid import issues
-# =============================================================================
-ALL_OPCHECK_TEST_UTILS: tuple[str, ...] = (
-    "test_schema",
-    "test_autograd_registration",
-    "test_faketensor",
-    "test_aot_dispatch_dynamic",
-)
-
-
-def fp8_allclose(
-    a: TensorLikeType,
-    b: TensorLikeType,
-    rtol: float = 1e-05,
-    atol: float = 1e-08,
-    equal_nan: bool = False,
-) -> bool:
-    """Reference implementation of torch.allclose"""
-    torch._refs._check_close_args(name="torch.allclose", a=a, b=b, rtol=rtol, atol=atol)
-    return bool(
-        torch.all(
-            torch.isclose(
-                a.double(), b.double(), rtol=rtol, atol=atol, equal_nan=equal_nan
-            )
-        ).item()
-    )
-
-
-def opcheck(
-    op: (
-        torch._ops.OpOverload
-        | torch._ops.OpOverloadPacket
-        | torch._library.custom_ops.CustomOpDef
-    ),
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any] | None = None,
-    *,
-    test_utils: str | Sequence[str] = ALL_OPCHECK_TEST_UTILS,
-    raise_exception: bool = True,
-    cond: bool = True,
-) -> dict[str, str]:
-    with patch("torch.allclose", new=fp8_allclose):
-        return (
-            torch.library.opcheck(
-                op, args, kwargs, test_utils=test_utils, raise_exception=raise_exception
-            )
-            if cond
-            else {}
-        )
-
 
 # =============================================================================
 # Test Configuration

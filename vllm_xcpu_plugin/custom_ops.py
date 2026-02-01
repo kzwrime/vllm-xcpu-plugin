@@ -36,41 +36,6 @@ def fused_add_rms_norm(
     return x, residual
 
 
-# =============================================================================
-# RotaryEmbedding
-# =============================================================================
-
-
-def rotary_embedding(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor | None,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    """Apply rotary positional embedding to query and key tensors.
-
-    Args:
-        positions: Position indices [num_tokens] or [batch_size, seq_len]
-        query: Query tensor
-        key: Key tensor (optional)
-        head_size: Size of each attention head
-        cos_sin_cache: Cached cos/sin values [max_position, rot_dim]
-        is_neox: True for GPT-NeoX style, False for GPT-J style
-    """
-    import torch_xcpu.ops as ops
-
-    ops.rotary_embedding(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        is_neox,
-    )
-
-
 @RMSNorm.register_oot
 class XcpuRMSNorm(RMSNorm):
     def __init__(
@@ -134,9 +99,11 @@ class XcpuRotaryEmbedding(RotaryEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._match_cos_sin_cache_dtype(query)
 
+        import torch_xcpu.ops as ops
+
         # rotary_embedding() is an in-place operation
         # that updates the query and key tensors.
-        rotary_embedding(
+        ops.rotary_embedding(
             positions,
             query,
             key,
