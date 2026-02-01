@@ -42,7 +42,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # logger.info("Using XcpuUnquantizedFusedMoEMethod")
-        self.topk_reduce = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU != "mpi_alltoallv" 
+        self.topk_reduce = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU != "mpi_alltoallv"
 
     def maybe_make_prepare_finalize(
         self,
