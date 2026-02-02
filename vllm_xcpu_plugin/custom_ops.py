@@ -1,4 +1,5 @@
 import torch
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -112,3 +113,30 @@ class XcpuRotaryEmbedding(RotaryEmbedding):
             self.is_neox_style,
         )
         return query, key
+@SiluAndMul.register_oot
+class XcpuSiluAndMul(SiluAndMul):
+    """An activation function for SwiGLU.
+
+    The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
+
+    Shapes:
+        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
+        return: (num_tokens, d) or (batch_size, seq_len, d)
+    """
+
+    # --8<-- [end:silu_and_mul]
+
+    def __init__(self):
+        super().__init__()
+        if current_platform.is_cpu():
+            self._forward_method = self.forward_cpu
+            import torch_xcpu
+
+            self.op = torch_xcpu.ops.silu_and_mul
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x)
+        return out

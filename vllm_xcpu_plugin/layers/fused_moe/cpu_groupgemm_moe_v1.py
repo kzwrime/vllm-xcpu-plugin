@@ -7,6 +7,7 @@ import torch
 # Modular kernel interface for CPU MoE
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from torch.nn import functional as F
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -41,6 +42,8 @@ def moe_grouped_gemm(
     Returns:
         None (result is written to output tensor)
     """
+    import torch_xcpu
+
     # -------- Parameter and shape checking --------
     assert expert_offsets.dim() == 1, "expert_offsets must be 1D"
     expert_num = expert_offsets.numel() - 1
@@ -48,7 +51,9 @@ def moe_grouped_gemm(
         f"weight has {weight.shape[0]} experts but expert_offsets suggests {expert_num}"
     )
 
-    input_x_mat = input_x.transpose(-1, -2) if trans_a else input_x
+    assert trans_a is False
+
+    input_x_mat = input_x
     weight_mat = weight.transpose(-1, -2) if trans_b else weight
 
     m, k = input_x_mat.shape
@@ -73,10 +78,10 @@ def moe_grouped_gemm(
         w_i = weight_mat[i]  # [k, n]
 
         # Compute GEMM for this expert
-        y_i = x_i @ w_i  # [mi, n]
-
-        # Store results
-        output[start:end, :] = y_i
+        if envs.VLLM_USE_XCPU_LINEAR:
+            torch_xcpu.ops.mm(x_i, w_i, out=output[start:end, :])
+        else:
+            torch.mm(x_i, w_i, out=output[start:end, :])
 
 
 direct_register_custom_op(
@@ -97,9 +102,11 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         self,
         layer: torch.nn.Module,
         quant_config: FusedMoEQuantConfig,
+        topk_reduce: bool = True,
     ):
         super().__init__(quant_config)
         self.layer = layer
+        self.topk_reduce = topk_reduce
 
     @property
     def activation_formats(
@@ -182,6 +189,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             if expert_tokens_meta
             else None,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            topk_reduce=self.topk_reduce,
         )
 
 
@@ -199,6 +207,7 @@ def fused_moe_compute(
     a2_scale: torch.Tensor | None,
     expert_num_tokens: torch.Tensor | None,
     apply_router_weight_on_input: bool,
+    topk_reduce: bool,
 ) -> None:
     """
     Execute CPU MoE computation using native torch operations.
@@ -215,60 +224,38 @@ def fused_moe_compute(
 
     assert activation == "silu"
 
-    # TODO, 如果某个节点仅有 0 个有效 token，还能不能跑对
+    from torch_xcpu import ops as xcpu_ops
 
-    # Extract problem dimensions
     M, topk = topk_weights.shape
     K = hidden_states.shape[-1]
     num_experts = w1.shape[0]
-
-    # Step 1: Permute - group tokens by expert assignment
-    # We need to sort tokens according to their expert assignments
-    # Create a mapping from (token_idx, k_idx) to expert_id
-    topk_ids_flat = topk_ids.view(-1)  # [M * topk]
-    # Filter tokens based on expert_map (for expert parallelism)
-    # Tokens assigned to experts not in this rank should be excluded
+    device = hidden_states.device
+    fdtype = hidden_states.dtype
 
     if expert_map is None:
-        expert_map = torch.arange(num_experts, device=topk_ids.device)
+        expert_map = torch.arange(num_experts, device=device)
 
-    # Create a mask for valid experts (experts that belong to this rank)
-    # valid_expert_mask = expert_map != -1
-    # Map global expert IDs to local expert IDs
-    local_expert_ids = expert_map[topk_ids_flat]
+    permuted_hidden_states = torch.empty((M * topk, K), device=device, dtype=fdtype)
+    sorted_by_expert = torch.empty(M * topk, device=device, dtype=torch.int32)
+    expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
 
-    # expert_num_tokens[i] = number of tokens for expert i
-    if expert_num_tokens is None:
-        expert_num_tokens = torch.zeros(
-            (num_experts), device=topk_ids.device, dtype=torch.int32
-        )
-        for i in range(num_experts):
-            expert_num_tokens[i] = (local_expert_ids == i).sum()
-
-    expert_offsets = torch.nn.functional.pad(
-        torch.cumsum(expert_num_tokens, dim=0), (1, 0)
+    num_valid_tokens = xcpu_ops.moe_permute(
+        permuted_hidden_states,
+        sorted_by_expert,
+        expert_offsets,
+        hidden_states,
+        topk_ids.to(torch.int32),
+        expert_map.to(torch.int32),
+        num_experts,
+        global_num_experts,
     )
 
-    if expert_num_tokens.sum().item() == 0:
+    if num_valid_tokens == 0:
         output.zero_()
         return
 
-    sorted_by_expert = torch.empty(
-        int(expert_num_tokens.sum().item()), device=topk_ids.device, dtype=torch.int64
-    )
-    expert_offsets_ = expert_offsets.clone()
-    for i in range(M * topk):
-        expert_id = local_expert_ids[i]
-        if expert_id >= 0:
-            sorted_by_expert[expert_offsets_[expert_id]] = i
-            expert_offsets_[expert_id] += 1
-
-    # Get permuted hidden states
-    # Expand [M, K] -> [M * topk, K] by repeating each token topk times
-    expanded_hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-    permuted_hidden_states = expanded_hidden_states[sorted_by_expert]
-
-    torch._check(permuted_hidden_states.shape[0] <= M * topk)
+    permuted_hidden_states = permuted_hidden_states[:num_valid_tokens]
+    sorted_by_expert = sorted_by_expert[:num_valid_tokens]
 
     # Step 2: Grouped GEMM (first layer) - compute gate_up projections
     # Use moe_grouped_gemm to compute all experts in one pass
@@ -312,23 +299,24 @@ def fused_moe_compute(
         # need to transpose last 2 dims
     )  # expert_output is [num_valid_tokens, K]
 
-    # Step 5: Unpermute - restore tokens to original order
-    # map back to the expanded token space
-    expanded_output = torch.zeros(
-        M * topk, K, dtype=topk_weights.dtype, device=hidden_states.device
-    )
-    expanded_output[sorted_by_expert] = expert_output.to(topk_weights.dtype)
-
-    # Step 6: Apply topk weights and reduce
-    # Reshape to [M, topk, K]
-    reshaped_output = expanded_output.view(M, topk, K)
-
-    # Apply router weights
-    if not apply_router_weight_on_input:
-        reshaped_output = reshaped_output * topk_weights.view(M, topk, 1)
-
-    # Sum across topk dimension to get final output
-    output.copy_(reshaped_output.sum(dim=1).to(output.dtype))
+    if topk_reduce:
+        workspace_unpermute_and_reduce = torch.empty(
+            M, K, dtype=topk_weights.dtype, device=hidden_states.device
+        )
+        xcpu_ops.moe_unpermute(
+            output,
+            expert_output,
+            sorted_by_expert.to(torch.int32),
+            topk_weights=topk_weights,
+            workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
+        )
+    else:
+        xcpu_ops.moe_unpermute(
+            output,
+            expert_output,
+            sorted_by_expert.to(torch.int32),
+            topk=topk,
+        )
 
 
 direct_register_custom_op(

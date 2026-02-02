@@ -95,7 +95,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = All2allvSingleAll2AllManager(
                     cpu_group=self.cpu_group
                 )
-            elif self.all2all_backend == "torch_all_to_all_single":  # type: ignore[has-type]
+            elif self.all2all_backend in ("torch_all_to_all_single", "mpi_alltoallv"):  # type: ignore[has-type]
                 # do nothing
                 self.all2all_manager = All2AllManagerBase(cpu_group=self.cpu_group)
             else:
