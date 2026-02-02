@@ -113,6 +113,8 @@ class XcpuRotaryEmbedding(RotaryEmbedding):
             self.is_neox_style,
         )
         return query, key
+
+
 @SiluAndMul.register_oot
 class XcpuSiluAndMul(SiluAndMul):
     """An activation function for SwiGLU.

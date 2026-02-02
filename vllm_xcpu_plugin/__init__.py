@@ -10,7 +10,7 @@ def xcpu_platform_plugin() -> str | None:
 
 def register_attn_backend():
     logger.info("register_attn_backend")
-    import vllm_xcpu_plugin.attn_backend
+    import vllm_xcpu_plugin.attn_backend  # noqa
 
 
 def register_ops():

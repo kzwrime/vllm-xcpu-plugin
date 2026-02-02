@@ -225,17 +225,17 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len
+        # max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
-        seq_threshold_3D = attn_metadata.seq_threshold_3D
-        num_par_softmax_segments = attn_metadata.num_par_softmax_segments
-        softmax_segm_output = attn_metadata.softmax_segm_output
-        softmax_segm_max = attn_metadata.softmax_segm_max
-        softmax_segm_expsum = attn_metadata.softmax_segm_expsum
+        # seq_threshold_3D = attn_metadata.seq_threshold_3D
+        # num_par_softmax_segments = attn_metadata.num_par_softmax_segments
+        # softmax_segm_output = attn_metadata.softmax_segm_output
+        # softmax_segm_max = attn_metadata.softmax_segm_max
+        # softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
-        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        # descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+        # mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
         import torch_xcpu
 
         torch_xcpu.ops.unified_attention(
