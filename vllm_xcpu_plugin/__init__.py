@@ -8,6 +8,11 @@ def xcpu_platform_plugin() -> str | None:
     return "vllm_xcpu_plugin.platform.XcpuPlatform"
 
 
+def register_attn_backend():
+    logger.info("register_attn_backend")
+    import vllm_xcpu_plugin.attn_backend
+
+
 def register_ops():
     logger.info("register_ops")
     import vllm_xcpu_plugin.custom_ops  # noqa
