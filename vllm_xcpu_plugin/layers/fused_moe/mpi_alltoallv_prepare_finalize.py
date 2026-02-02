@@ -24,51 +24,6 @@ from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 logger = init_logger(__name__)
 
 
-def permute_before_alltoallv(
-    topk_ids: torch.Tensor,
-    experts_per_rank: int,
-    ep_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Prepare indices for all_to_all_single communication using vectorized operations.
-
-    This function flattens the token-expert assignments, sorts them by target rank,
-    and calculates split sizes.
-
-    NOTE: This implementation effectively
-          expands [batch_size, topk] to [batch_size * topk].
-
-    Args:
-        topk_ids: [num_tokens, topk] Tensor containing expert IDs.
-        experts_per_rank: Number of experts hosted on each rank.
-        ep_size: Expert Parallel world size.
-
-    Returns:
-        sort_indices: [num_tokens * topk]
-                        Indices to reorder data for sending.
-        split_sizes:  [ep_size]
-                        CPU Tensor containing number of tokens to send to each rank.
-        target_ranks: [num_tokens * topk]
-                        Rank index for each flattened token (auxiliary).
-    """
-    # Flatten structure: [token0_k0, token0_k1, token1_k0, token1_k1, ...]
-    flat_topk_ids = topk_ids.flatten()
-
-    # Calculate which rank owns each selected expert
-    # shape: [num_tokens * topk]
-    target_ranks = torch.div(flat_topk_ids, experts_per_rank, rounding_mode="floor")
-
-    # Sort by target rank to cluster data for contiguous memory sending.
-    # argsort is fast enough on CPU for this purpose compared to python loops.
-    sort_indices = torch.argsort(target_ranks)
-
-    # Calculate how many tokens go to each rank (input_split_sizes)
-    # bincount is highly optimized.
-    split_sizes = torch.bincount(target_ranks[sort_indices], minlength=ep_size)
-
-    return sort_indices, split_sizes, target_ranks
-
-
 class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     High-performance CPU implementation of Expert Parallel communication.
@@ -97,7 +52,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Context storage for finalize phase
         # We need to know where to put the received data back
-        self._row_indices_restore: torch.Tensor | None = None
+        self._sort_indices_back: torch.Tensor | None = None
         self.topk: int = -1
 
         # Communication metadata
@@ -167,6 +122,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert not apply_router_weight_on_input
         import torch_mpi_ext
 
+        from torch_xcpu import ops as xcpu_ops
+
         # Input shapes
         # a1: [num_tokens, hidden_dim]
         # topk_ids: [num_tokens, topk]
@@ -181,20 +138,28 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         experts_per_rank = num_experts // self.ep_size
 
-        # 2. PERMUTE LOGIC (Vectorized)
-        # We calculate sort indices based on target rank
-        sort_indices, send_split_sizes_tensor, _ = permute_before_alltoallv(
-            topk_ids, experts_per_rank, self.ep_size
+        # 2. PERMUTE LOGIC (Vectorized) - Now using C++ operator
+        # Allocate output tensors for the C++ operator
+        total_tokens = num_tokens * topk
+        sort_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        send_split_sizes_tensor = torch.empty(
+            self.ep_size, dtype=torch.int32, device=device
+        )
+
+        xcpu_ops.moe_prepare_phase1(
+            sort_indices,
+            sort_indices_back,
+            send_split_sizes_tensor,
+            topk_ids,
+            experts_per_rank,
+            self.ep_size,
         )
 
         # 3. Save state for Finalize
-        # We need to map the ORDER of data we sent
-        # (which will be the order we receive results back)
-        # back to the ORIGINAL row index (0..num_tokens-1) for reduction.
-        # Create a mapping: [0, 0, 1, 1, 2, 2 ...] for topk=2
-        row_indices_restore = torch.arange(num_tokens * topk, device=device)
-        # Reorder this mapping to match the data we are sending
-        self._row_indices_restore = row_indices_restore[sort_indices].to(torch.int32)
+        # sort_indices_back maps original position -> sorted position
+        # We'll use this in finalize to do sequential writes
+        self._sort_indices_back = sort_indices_back
 
         # 4. Prepare Send Tensors
         # Use index_select or advanced indexing.
@@ -359,17 +324,17 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         # The magic happens here:
-        # We use the restored indices from the prepare phase.
-        assert self._row_indices_restore is not None
+        # We use sort_indices_back from the prepare phase for sequential writes
+        assert self._sort_indices_back is not None
 
         # Call the C++ operator that combines:
         # 1. Alltoallv reverse communication
         # 2. Zero output
-        # 3. Unpermute and reduce (index_add)
+        # 3. Unpermute and reduce (sequential write using sort_indices_back)
         xcpu_ops.moe_finalize(
             output,
             fused_expert_output,
-            self._row_indices_restore,
+            self._sort_indices_back,
             finalize_send_sizes_tensor,
             finalize_recv_sizes_tensor,
             self.ep_size,
@@ -380,7 +345,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self._topk_weights,
         )
         self._topk_weights = None
-        self._row_indices_restore = None
+        self._sort_indices_back = None
         self._recv_split_sizes = None
         self._send_split_sizes = None
 
