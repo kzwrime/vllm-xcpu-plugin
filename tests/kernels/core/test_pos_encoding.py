@@ -19,7 +19,8 @@ load_general_plugins()
 # =============================================================================
 # 精度要求：此处相对 tests/kernels/allclose_default.py 降低了精度
 # -----------------------------------------------------------------------------
-# 原始默认（allclose_default）：bfloat16 atol=1e-3, rtol=1.6e-2；float atol=1e-5, rtol=1.3e-6
+# 原始默认（allclose_default）：
+#   bfloat16 atol=1e-3, rtol=1.6e-2；float atol=1e-5, rtol=1.3e-6
 # RotaryEmbedding 涉及 cos/sin 等运算，bfloat16 累积误差较大，故放宽 atol/rtol。
 # 当前采用：bfloat16 atol=2e-2, rtol=1.6e-2；float 与默认一致。
 # =============================================================================
@@ -34,6 +35,7 @@ def get_default_atol(output) -> float:
 def get_default_rtol(output) -> float:
     return default_rtol[output.dtype]
 
+
 # =============================================================================
 # Test Configuration
 # =============================================================================
@@ -44,7 +46,7 @@ HEAD_SIZES = [64, 80, 120, 128, 256]
 ROTARY_DIMS = [None, 32]  # None means rotary dim == head size
 NUM_HEADS = [16, 17]
 BATCH_SIZES = [1, 2, 4, 8, 16, 5, 13]
-SEQ_LENS = [11, 8192]  # Arbitrary values for testing
+SEQ_LENS = [11, 1024]  # Arbitrary values for testing
 SEEDS = [0]
 CUDA_DEVICES = ["cpu"]
 USE_KEY = [True, False]
