@@ -7,88 +7,11 @@ import torch
 # Modular kernel interface for CPU MoE
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from torch.nn import functional as F
-from vllm import envs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
-
-
-def moe_grouped_gemm(
-    output: torch.Tensor,
-    input_x: torch.Tensor,
-    weight: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    trans_a: bool = False,
-    trans_b: bool = False,
-) -> None:
-    """
-    PyTorch version of grouped GEMM for MoE.
-
-    Performs grouped matrix multiplication where different tokens are multiplied
-    by different expert weights. This is optimized for CPU execution.
-
-    Args:
-        output: Output tensor of shape [m, n] (will be modified in-place)
-        input_x: Tensor of shape [m, k] (row-major) or [k, m] if trans_a=True
-        weight: Tensor of shape [expert_num, k, n] or [expert_num, n, k] if trans_b=True
-        expert_offsets: Tensor of shape [expert_num + 1] with int64 dtype.
-                       expert_offsets[i] to expert_offsets[i+1] defines the range
-                       of tokens assigned to expert i.
-        trans_a: Whether to transpose input_x on last two dims
-        trans_b: Whether to transpose weight on last two dims
-
-    Returns:
-        None (result is written to output tensor)
-    """
-    import torch_xcpu
-
-    # -------- Parameter and shape checking --------
-    assert expert_offsets.dim() == 1, "expert_offsets must be 1D"
-    expert_num = expert_offsets.numel() - 1
-    assert weight.shape[0] == expert_num, (
-        f"weight has {weight.shape[0]} experts but expert_offsets suggests {expert_num}"
-    )
-
-    assert trans_a is False
-
-    input_x_mat = input_x
-    weight_mat = weight.transpose(-1, -2) if trans_b else weight
-
-    m, k = input_x_mat.shape
-    num_experts, wk, n = weight_mat.shape
-    assert wk == k, f"weight k dimension ({wk}) must match input k ({k})"
-    assert expert_offsets[-1].item() == m, (
-        f"Last expert offset ({expert_offsets[-1].item()}) must equal m ({m})"
-    )
-    assert output.shape == (m, n), f"output shape {output.shape} must match ({m}, {n})"
-
-    # -------- Core grouped GEMM logic --------
-    for i in range(expert_num):
-        start = int(expert_offsets[i].item())
-        end = int(expert_offsets[i + 1].item())
-
-        if start == end:
-            # No tokens assigned to this expert
-            continue
-
-        # Extract tokens for this expert
-        x_i = input_x_mat[start:end, :]  # [mi, k]
-        w_i = weight_mat[i]  # [k, n]
-
-        # Compute GEMM for this expert
-        if envs.VLLM_USE_XCPU_LINEAR:
-            torch_xcpu.ops.mm(x_i, w_i, out=output[start:end, :])
-        else:
-            torch.mm(x_i, w_i, out=output[start:end, :])
-
-
-direct_register_custom_op(
-    op_name="moe_grouped_gemm",
-    op_func=moe_grouped_gemm,
-    mutates_args=["output"],
-)
 
 
 class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
@@ -264,12 +187,12 @@ def fused_moe_compute(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    torch.ops.vllm.moe_grouped_gemm(
+
+    xcpu_ops.moe_grouped_gemm(
         intermediate_output,
         permuted_hidden_states,  # [num_valid_tokens, K]
         w1,  # [num_experts, 2 * intermediate_size, K]
         expert_offsets,  # [num_experts + 1]
-        False,  # trans_a
         True,
         # trans_b: w1 is [num_experts, 2 * intermediate_size, K],
         # need to transpose last 2 dims
@@ -288,16 +211,14 @@ def fused_moe_compute(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    torch.ops.vllm.moe_grouped_gemm(
+
+    xcpu_ops.moe_grouped_gemm(
         expert_output,
-        activated,  # [num_valid_tokens, intermediate_size]
-        w2,  # [num_experts, K, intermediate_size]
-        expert_offsets,  # [num_experts + 1]
-        False,  # trans_a
+        activated,
+        w2,
+        expert_offsets,
         True,
-        # trans_b: w2 is [num_experts, K, intermediate_size],
-        # need to transpose last 2 dims
-    )  # expert_output is [num_valid_tokens, K]
+    )
 
     if topk_reduce:
         workspace_unpermute_and_reduce = torch.empty(
