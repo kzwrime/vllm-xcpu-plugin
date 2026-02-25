@@ -17,7 +17,6 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
@@ -143,14 +142,12 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         total_tokens = num_tokens * topk
         sort_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        send_split_sizes_tensor = torch.empty(
-            self.ep_size, dtype=torch.int32, device=device
-        )
+        expert_count = torch.empty(num_experts, dtype=torch.int32, device=device)
 
         xcpu_ops.moe_prepare_phase1(
             sort_indices,
             sort_indices_back,
-            send_split_sizes_tensor,
+            expert_count,
             topk_ids,
             experts_per_rank,
             self.ep_size,
@@ -166,35 +163,57 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # For [N*k, D], simple indexing `tensor[indices]` is efficient.
         send_hidden_states = hidden_states_source[sort_indices]
 
-        # Flatten and sort metadata
-        send_topk_ids = topk_ids.flatten()[sort_indices]
+        # 5. Exchange Expert Count via alltoall
+        assert num_experts % self.ep_size == 0, (
+            "num_experts must be divisible by ep_size"
+        )
 
-        # 5. Exchange Split Sizes
-        self._send_split_sizes = send_split_sizes_tensor.to(torch.int32)
-        recv_split_sizes_tensor = torch.empty_like(send_split_sizes_tensor)
+        expert_count_per_rank = expert_count.view(self.ep_size, experts_per_rank)
+        self._send_split_sizes = expert_count_per_rank.sum(dim=1, dtype=torch.int32)
 
+        recv_expert_count_flat = torch.empty_like(expert_count)
         torch_mpi_ext.ops.alltoall_out(
-            recv_split_sizes_tensor,
-            send_split_sizes_tensor,
+            recv_expert_count_flat,
+            expert_count,
             self.comm_ptr,
         )
-        self._recv_split_sizes = recv_split_sizes_tensor.to(torch.int32)
 
-        total_recv = int(recv_split_sizes_tensor.sum().item())
+        # 6. Post-process: compute split_sizes and reconstruct topk_ids
+        recv_expert_count_per_rank = recv_expert_count_flat.view(
+            self.ep_size, experts_per_rank
+        )
+        self._recv_split_sizes = recv_expert_count_per_rank.sum(
+            dim=1, dtype=torch.int32
+        )
 
-        # 6. Allocate Recv Buffers
+        total_recv = int(recv_expert_count_flat.sum().item())
+
+        # 7. Reconstruct topk_ids from recv_expert_count_flat
+        #    (deterministic, no communication needed)
+        recv_topk_ids = torch.empty(total_recv, dtype=topk_ids.dtype, device=device)
+        offset = 0
+        for rank in range(self.ep_size):
+            for expert_id in range(experts_per_rank):
+                id = expert_id + self.ep_rank * experts_per_rank
+                count = int(recv_expert_count_per_rank[rank][expert_id].item())
+                if count > 0:
+                    recv_topk_ids[offset : offset + count] = id
+                    offset += count
+
+        expert_num_tokens = recv_expert_count_per_rank.sum(dim=0)
+
+        expert_tokens_meta = mk.ExpertTokensMetadata(
+            expert_num_tokens=expert_num_tokens,
+            expert_num_tokens_cpu=expert_num_tokens.cpu(),
+        )
+
+        # 9. Allocate Recv Buffers and Perform All-to-All for hidden_states only
         recv_hidden_states = torch.empty(
             (total_recv, hidden_dim), dtype=a1.dtype, device=device
         )
-        recv_topk_ids = torch.empty((total_recv,), dtype=topk_ids.dtype, device=device)
 
-        # 7. Perform All-to-All
-        # Note: We issue multiple all_to_all calls.
-        # On CPU/TCP this introduces some latency overhead
-        # vs packing, but keeps logic significantly simpler
-        # and avoids memory copy for packing.
-        send_split_sizes_hs = send_split_sizes_tensor * hidden_dim
-        recv_split_sizes_hs = recv_split_sizes_tensor * hidden_dim
+        send_split_sizes_hs = self._send_split_sizes * hidden_dim
+        recv_split_sizes_hs = self._recv_split_sizes * hidden_dim
         sdispls_hs = torch.nn.functional.pad(
             torch.cumsum(send_split_sizes_hs[:-1], dim=0), (1, 0)
         )
@@ -209,40 +228,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             recvcounts=recv_split_sizes_hs,
             rdispls=rdispls_hs,
             comm_ptr=self.comm_ptr,
-        )
-
-        sdispls = torch.nn.functional.pad(
-            torch.cumsum(send_split_sizes_tensor[:-1], dim=0), (1, 0)
-        )
-        rdispls = torch.nn.functional.pad(
-            torch.cumsum(recv_split_sizes_tensor[:-1], dim=0), (1, 0)
-        )
-        torch_mpi_ext.ops.alltoallv_out(
-            recvbuf=recv_topk_ids,
-            sendbuf=send_topk_ids,
-            sendcounts=send_split_sizes_tensor,
-            sdispls=sdispls,
-            recvcounts=recv_split_sizes_tensor,
-            rdispls=rdispls,
-            comm_ptr=self.comm_ptr,
-        )
-
-        # 8. Calculate Metadata for Expert Computation
-        # We need to reshape 1D arrays back to the format
-        # expected by kernels if necessary,
-        # but standard MoE kernels usually handle flattened lists or need count.
-        # Here we mimic the standard vLLM metadata generation.
-
-        # Since recv_topk_ids is now 1D [total_tokens],
-        # we treat it as topk=1 for the expert counter
-        # The local expert execution will treat these as individual items.
-        expert_num_tokens = count_expert_num_tokens(
-            recv_topk_ids.unsqueeze(1), self.num_local_experts, expert_map
-        )
-
-        expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens,
-            expert_num_tokens_cpu=expert_num_tokens.cpu(),
         )
 
         def _receiver() -> mk.PrepareResultType:
