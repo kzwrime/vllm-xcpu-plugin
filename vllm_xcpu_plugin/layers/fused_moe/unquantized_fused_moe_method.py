@@ -85,6 +85,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 num_dispatchers = all2all_manager.world_size
 
                 prepare_finalize = MpiAlltoallvPrepareAndFinalize(
+                    max_num_tokens=self.moe.max_num_tokens,
                     ep_group=ep_group,
                     num_local_experts=self.moe.num_local_experts,
                     num_dispatchers=num_dispatchers,

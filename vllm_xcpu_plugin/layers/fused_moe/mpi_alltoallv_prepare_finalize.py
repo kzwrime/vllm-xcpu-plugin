@@ -12,15 +12,13 @@ import torch
 import torch.distributed as dist
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
-
-logger = init_logger(__name__)
 
 
 class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
@@ -35,12 +33,14 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def __init__(
         self,
+        max_num_tokens: int,
         ep_group: dist.ProcessGroup,
         num_local_experts: int,
         num_dispatchers: int,
         rank_expert_offset: int,
     ):
         super().__init__()
+        self.max_num_tokens = max_num_tokens
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
@@ -48,6 +48,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
+        self.max_num_tokens_across_ep = max_num_tokens * self.ep_size
 
         # Context storage for finalize phase
         # We need to know where to put the received data back
@@ -69,7 +70,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return mk.FusedMoEActivationFormat.Standard
 
     def max_num_tokens_per_rank(self) -> int | None:
-        return None  # Dynamic sizing
+        return self.max_num_tokens
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return None
