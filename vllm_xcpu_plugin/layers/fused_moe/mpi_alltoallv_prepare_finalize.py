@@ -126,6 +126,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         assert not apply_router_weight_on_input
         import torch_mpi_ext
+
         from torch_xcpu import ops as xcpu_ops
 
         # Input shapes
@@ -145,9 +146,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self._recv_split_sizes = torch.empty(
                 self.ep_size, dtype=torch.int32, device=device
             )
-
-        # Repeat input for each topk choice: [num_tokens * topk, hidden_dim]
-        hidden_states_source = a1.repeat_interleave(topk, dim=0)
 
         experts_per_rank = num_experts // self.ep_size
 
@@ -199,8 +197,10 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         total_recv = int(recv_expert_count_flat.sum().item())
 
         # 6. Call moe_prepare_phase2: compute
-        #      split_sizes + permute + reconstruct + recv_topk_ids
+        #      split_sizes + sdispls_hs + rdispls_hs + permute + reconstruct +
+        #      recv_topk_ids
         # Note: send_hidden_states only contains local tokens (this TP rank's portion)
+        # Note: a1 is the original [num_tokens, hidden_dim] tensor, NOT repeated
         send_hidden_states = torch.empty(
             local_tokens, hidden_dim, dtype=a1.dtype, device=device
         )
@@ -210,6 +210,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         send_split_sizes = torch.empty(self.ep_size, dtype=torch.int32, device=device)
+        sdispls_hs = torch.empty(self.ep_size, dtype=torch.int32, device=device)
+        rdispls_hs = torch.empty(self.ep_size, dtype=torch.int32, device=device)
 
         xcpu_ops.moe_prepare_phase2(
             send_hidden_states,
@@ -217,13 +219,16 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             send_split_sizes,
             self._recv_split_sizes,
             expert_num_tokens,
-            hidden_states_source,
+            sdispls_hs,
+            rdispls_hs,
+            a1,  # Pass original a1, NOT repeated
             sort_indices,
             expert_count,
             recv_expert_count_flat,
             self.ep_rank,
             experts_per_rank,
             self.ep_size,
+            topk,  # Pass topk for index calculation
         )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
@@ -234,13 +239,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # 8. Allocate Recv Buffers and Perform All-to-All for hidden_states
         recv_hidden_states = torch.empty(
             (total_recv, hidden_dim), dtype=a1.dtype, device=device
-        )
-
-        sdispls_hs = torch.nn.functional.pad(
-            torch.cumsum(send_split_sizes[:-1], dim=0), (1, 0)
-        )
-        rdispls_hs = torch.nn.functional.pad(
-            torch.cumsum(self._recv_split_sizes[:-1], dim=0), (1, 0)
         )
 
         torch_mpi_ext.ops.alltoallv_out(
