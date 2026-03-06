@@ -6,12 +6,13 @@ import torch
 
 # Modular kernel interface for CPU MoE
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from torch.nn import functional as F
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
+
+from vllm_xcpu_plugin.custom_ops import XcpuSiluAndMul
 
 
 class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
@@ -208,11 +209,7 @@ def fused_moe_compute(
     )  # intermediate_output is [num_valid_tokens, 2 * intermediate_size]
 
     # Step 3: Activation function (SiluAndMul for SwiGLU)
-    d = intermediate_output.shape[-1] // 2
-    # Apply SiLU to first half and multiply by second half
-    gate = intermediate_output[..., :d]  # [num_valid_tokens, intermediate_size]
-    up = intermediate_output[..., d:]  # [num_valid_tokens, intermediate_size]
-    activated = F.silu(gate) * up  # [num_valid_tokens, intermediate_size]
+    activated = XcpuSiluAndMul.forward_cpu(intermediate_output)
 
     # Step 4: Grouped GEMM (second layer) - compute down projections
     expert_output = torch.empty(

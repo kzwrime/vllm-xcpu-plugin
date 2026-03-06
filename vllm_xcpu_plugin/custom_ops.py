@@ -128,15 +128,15 @@ class XcpuSiluAndMul(SiluAndMul):
         super().__init__()
         if current_platform.is_cpu():
             self._forward_method = self.forward_cpu
-            import torch_xcpu
 
-            self.op = torch_xcpu.ops.silu_and_mul
+    @staticmethod
+    def forward_cpu(x: torch.Tensor) -> torch.Tensor:
+        import torch_xcpu
 
-    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x)
+        torch_xcpu.ops.silu_and_mul(out, x)
         return out
 
 
