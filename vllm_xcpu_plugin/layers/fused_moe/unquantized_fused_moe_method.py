@@ -26,7 +26,7 @@ from vllm.platforms import current_platform
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 from .cpu_groupgemm_moe_v1 import CPUGroupGemmExperts
-from .mpi_alltoallv_prepare_finalize import MpiAlltoallvPrepareAndFinalize
+from .mpi_alltoallv_prepare_finalize_v1 import MpiAlltoallvPrepareAndFinalize
 from .torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
