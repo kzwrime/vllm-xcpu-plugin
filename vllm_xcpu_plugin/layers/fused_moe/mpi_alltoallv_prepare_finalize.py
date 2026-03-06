@@ -12,7 +12,10 @@ import torch
 import torch.distributed as dist
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
-from vllm.logger import logger
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -46,6 +49,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.rank_expert_offset = rank_expert_offset
 
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
         self.max_num_tokens_across_ep = max_num_tokens * self.ep_size
@@ -56,7 +61,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.topk: int = -1
 
         # Communication metadata
-        self._send_split_sizes: torch.Tensor | None = None
+        self._full_send_split_sizes: torch.Tensor | None = None
         self._recv_split_sizes: torch.Tensor | None = None
 
         self._topk_weights: torch.Tensor | None = None
@@ -132,9 +137,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.topk = topk
         self._topk_weights = topk_weights
 
-        # Move pre-allocated arrays to device
-        if self._send_split_sizes is None:
-            self._send_split_sizes = torch.empty(
+        if self._full_send_split_sizes is None:
+            self._full_send_split_sizes = torch.empty(
                 self.ep_size, dtype=torch.int32, device=device
             )
         if self._recv_split_sizes is None:
@@ -147,28 +151,40 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         experts_per_rank = num_experts // self.ep_size
 
-        # 2. PERMUTE LOGIC (Vectorized) - Now using C++ operator
-        # Allocate output tensors for the C++ operator
+        # Calculate local token count for this TP rank
         total_tokens = num_tokens * topk
-        sort_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        avg_size = total_tokens // self.tp_size
+        extras = total_tokens % self.tp_size
+        # tp_start = self.tp_rank * avg_size + min(self.tp_rank, extras)
+        # tp_end = tp_start + avg_size + (1 if self.tp_rank < extras else 0)
+        local_tokens = avg_size + (1 if self.tp_rank < extras else 0)
+
+        # sort_indices_back map origin (m, topk) to stores global sorted positions
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        # sort_indices map local positions to origin (m, topk)
+        sort_indices = torch.empty(local_tokens, dtype=torch.int32, device=device)
+        # expert_count is local to this TP rank
         expert_count = torch.empty(num_experts, dtype=torch.int32, device=device)
 
         xcpu_ops.moe_prepare_phase1(
-            sort_indices,
-            sort_indices_back,
-            expert_count,
+            sort_indices,  # output
+            sort_indices_back,  # output
+            expert_count,  # output
+            self._full_send_split_sizes,  # output
             topk_ids,
             experts_per_rank,
             self.ep_size,
+            hidden_dim,
+            self.tp_rank,
+            self.tp_size,
         )
 
-        # 3. Save state for Finalize
+        # Save state for Finalize
         # sort_indices_back maps original position -> sorted position
         # We'll use this in finalize to do sequential writes
         self._sort_indices_back = sort_indices_back
 
-        # 4. Exchange Expert Count via alltoall (BEFORE phase2 operator)
+        # Exchange Expert Count via alltoall (BEFORE phase2 operator)
         assert num_experts % self.ep_size == 0, (
             "num_experts must be divisible by ep_size"
         )
@@ -184,16 +200,21 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # 6. Call moe_prepare_phase2: compute
         #      split_sizes + permute + reconstruct + recv_topk_ids
-        send_hidden_states = torch.empty_like(hidden_states_source)
+        # Note: send_hidden_states only contains local tokens (this TP rank's portion)
+        send_hidden_states = torch.empty(
+            local_tokens, hidden_dim, dtype=a1.dtype, device=device
+        )
         recv_topk_ids = torch.empty(total_recv, dtype=torch.int32, device=device)
         expert_num_tokens = torch.empty(
             experts_per_rank, dtype=torch.int32, device=device
         )
 
+        send_split_sizes = torch.empty(self.ep_size, dtype=torch.int32, device=device)
+
         xcpu_ops.moe_prepare_phase2(
             send_hidden_states,
             recv_topk_ids,
-            self._send_split_sizes,
+            send_split_sizes,
             self._recv_split_sizes,
             expert_num_tokens,
             hidden_states_source,
@@ -205,11 +226,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self.ep_size,
         )
 
-        # 7. Store split_sizes multiplied by hidden_dim for finalize
-        # In-place multiplication: self._send_split_sizes *= hidden_dim
-        self._send_split_sizes.mul_(hidden_dim)
-        self._recv_split_sizes.mul_(hidden_dim)
-
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens,
             expert_num_tokens_cpu=expert_num_tokens.cpu(),
@@ -220,17 +236,17 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             (total_recv, hidden_dim), dtype=a1.dtype, device=device
         )
 
-        # Use pre-computed split_sizes (already multiplied by hidden_dim)
         sdispls_hs = torch.nn.functional.pad(
-            torch.cumsum(self._send_split_sizes[:-1], dim=0), (1, 0)
+            torch.cumsum(send_split_sizes[:-1], dim=0), (1, 0)
         )
         rdispls_hs = torch.nn.functional.pad(
             torch.cumsum(self._recv_split_sizes[:-1], dim=0), (1, 0)
         )
+
         torch_mpi_ext.ops.alltoallv_out(
             recvbuf=recv_hidden_states,
             sendbuf=send_hidden_states,
-            sendcounts=self._send_split_sizes,
+            sendcounts=send_split_sizes,
             sdispls=sdispls_hs,
             recvcounts=self._recv_split_sizes,
             rdispls=rdispls_hs,
@@ -291,7 +307,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # send_split_sizes (for finalize) == recv_split_sizes (from prepare)
         # Note: these are already multiplied by hidden_dim
         finalize_send_sizes_tensor = self._recv_split_sizes
-        finalize_recv_sizes_tensor = self._send_split_sizes
+        finalize_recv_sizes_tensor = self._full_send_split_sizes
 
         device = output.device
         hidden_dim = output.size(1)
@@ -326,6 +342,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             finalize_send_sizes_tensor,
             finalize_recv_sizes_tensor,
             self.ep_size,
+            self.tp_size,
             self.comm_ptr,
             _finalize_recv_hidden_states,
             _finalize_workspace,
