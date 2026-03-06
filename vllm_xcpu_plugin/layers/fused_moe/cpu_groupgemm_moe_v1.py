@@ -147,6 +147,14 @@ def fused_moe_compute(
 
     assert activation == "silu"
 
+    # Slice inputs to actual valid tokens if expert_num_tokens is provided
+    # (handles static buffer allocation where buffer may be larger than actual data)
+    if expert_num_tokens is not None:
+        num_valid_tokens = int(expert_num_tokens.sum().item())
+        hidden_states = hidden_states[:num_valid_tokens]
+        topk_ids = topk_ids[:num_valid_tokens]
+        topk_weights = topk_weights[:num_valid_tokens]
+
     from torch_xcpu import ops as xcpu_ops
 
     M, topk = topk_weights.shape
@@ -171,6 +179,7 @@ def fused_moe_compute(
         expert_map.to(torch.int32),
         num_experts,
         global_num_experts,
+        M,
     )
 
     if num_valid_tokens == 0:
@@ -230,6 +239,7 @@ def fused_moe_compute(
             sorted_by_expert.to(torch.int32),
             topk_weights=topk_weights,
             workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
+            M=M,
         )
     else:
         xcpu_ops.moe_unpermute(
@@ -237,6 +247,7 @@ def fused_moe_compute(
             expert_output,
             sorted_by_expert.to(torch.int32),
             topk=topk,
+            M=M,
         )
 
 

@@ -41,6 +41,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_local_experts: int,
         num_dispatchers: int,
         rank_expert_offset: int,
+        dp_rank: int,
+        dp_size: int,
     ):
         super().__init__()
         self.max_num_tokens = max_num_tokens
@@ -49,6 +51,8 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.rank_expert_offset = rank_expert_offset
 
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
@@ -205,17 +209,18 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self.comm_ptr,
         )
 
-        total_recv = int(recv_expert_count_flat.sum().item())
-
-        # --- For moe_prepare_phase2 (shape-dependent) ---
-        recv_topk_ids = torch.empty(total_recv, dtype=torch.int32, device=device)
-
-        # --- For alltoallv (shape-dependent) ---
-        recv_hidden_states = torch.empty(
-            (total_recv, hidden_dim), dtype=a1.dtype, device=device
+        static_buffer_size = (
+            self.max_num_tokens * self.dp_size * min(topk, self.num_local_experts)
         )
 
-        ret_topk_ids_shape = (total_recv, 1)
+        recv_topk_ids = torch.empty(
+            static_buffer_size, dtype=torch.int32, device=device
+        )
+        recv_hidden_states = torch.empty(
+            (static_buffer_size, hidden_dim), dtype=a1.dtype, device=device
+        )
+
+        ret_topk_ids_shape = (static_buffer_size, 1)
 
         xcpu_ops.moe_prepare_phase2(
             send_hidden_states,

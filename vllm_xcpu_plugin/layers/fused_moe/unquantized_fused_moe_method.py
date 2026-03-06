@@ -91,6 +91,8 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     num_dispatchers=num_dispatchers,
                     rank_expert_offset=all2all_manager.rank
                     * self.moe.num_local_experts,
+                    dp_rank=self.moe.dp_rank,
+                    dp_size=self.moe.dp_size,
                 )
             else:
                 pass
