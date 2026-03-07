@@ -87,6 +87,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 prepare_finalize = MpiAlltoallvPrepareAndFinalize(
                     max_num_tokens=self.moe.max_num_tokens,
                     ep_group=ep_group,
+                    num_experts=self.moe.num_experts,
                     num_local_experts=self.moe.num_local_experts,
                     num_dispatchers=num_dispatchers,
                     rank_expert_offset=all2all_manager.rank

@@ -38,6 +38,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self,
         max_num_tokens: int,
         ep_group: dist.ProcessGroup,
+        num_experts: int,
         num_local_experts: int,
         num_dispatchers: int,
         rank_expert_offset: int,
@@ -57,6 +58,14 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
+
+        self.num_local_experts_ranks = self._compute_expert_distribution(
+            num_experts, self.ep_size
+        )
+        self.experts_local_rank = self.num_local_experts_ranks[self.ep_rank]
+        assert self.experts_local_rank == num_local_experts, (
+            f"{self.num_local_experts_ranks}"
+        )
 
         # Context storage for finalize phase
         # We need to know where to put the received data back
@@ -79,6 +88,19 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def max_num_tokens_per_rank(self) -> int | None:
         return self.max_num_tokens
+
+    def _compute_expert_distribution(
+        self, num_experts: int, ep_size: int
+    ) -> torch.Tensor:
+        """Compute expert distribution across ranks (deterministic)."""
+        base_experts = num_experts // ep_size
+        extra_experts = num_experts % ep_size
+
+        num_local_experts_ranks = torch.empty(ep_size, dtype=torch.int32)
+        for i in range(ep_size):
+            num_local_experts_ranks[i] = base_experts + (1 if i < extra_experts else 0)
+
+        return num_local_experts_ranks
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return None
@@ -138,8 +160,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.topk = topk
         self._topk_weights = topk_weights
 
-        experts_per_rank = num_experts // self.ep_size
-
         total_tokens = num_tokens * topk
         avg_size = total_tokens // self.tp_size
         extras = total_tokens % self.tp_size
@@ -167,15 +187,15 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_count = torch.empty(num_experts, dtype=torch.int32, device=device)
 
         # --- For alltoall ---
-        recv_expert_count_flat = torch.empty_like(expert_count)
+        recv_expert_count_flat = torch.empty(
+            self.ep_size * self.num_local_experts, dtype=torch.int32, device=device
+        )
 
         # --- For moe_prepare_phase2 (shape-independent) ---
         send_hidden_states = torch.empty(
             local_tokens, hidden_dim, dtype=a1.dtype, device=device
         )
-        expert_num_tokens = torch.empty(
-            experts_per_rank, dtype=torch.int32, device=device
-        )
+        expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
         send_split_sizes = torch.empty(self.ep_size, dtype=torch.int32, device=device)
         sdispls_hs = torch.empty(self.ep_size, dtype=torch.int32, device=device)
         rdispls_hs = torch.empty(self.ep_size, dtype=torch.int32, device=device)
@@ -184,13 +204,19 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # Call operators
         # =============================================================================
 
+        num_local_experts_ranks_prefix_sum = torch.nn.functional.pad(
+            torch.cumsum(self.num_local_experts_ranks, dim=0, dtype=torch.int32), (1, 0)
+        )
+
         xcpu_ops.moe_prepare_phase1(
             sort_indices,
             sort_indices_back,
             expert_count,
             self._full_send_split_sizes,
             topk_ids,
-            experts_per_rank,
+            num_local_experts_ranks_prefix_sum,
+            num_experts,
+            self.ep_rank,
             self.ep_size,
             hidden_dim,
             self.tp_rank,
@@ -199,13 +225,25 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         self._sort_indices_back = sort_indices_back
 
-        assert num_experts % self.ep_size == 0, (
-            "num_experts must be divisible by ep_size"
-        )
-        torch_mpi_ext.ops.alltoall_out(
-            recv_expert_count_flat,
-            expert_count,
-            self.comm_ptr,
+        torch_mpi_ext.ops.alltoallv_out(
+            recvbuf=recv_expert_count_flat,
+            sendbuf=expert_count,
+            sendcounts=self.num_local_experts_ranks,
+            sdispls=num_local_experts_ranks_prefix_sum[:-1],
+            recvcounts=torch.full(
+                (self.ep_size,),
+                self.num_local_experts,
+                dtype=torch.int32,
+                device=device,
+            ),
+            rdispls=torch.arange(
+                start=0,
+                end=self.ep_size * self.num_local_experts,
+                step=self.num_local_experts,
+                dtype=torch.int32,
+                device=device,
+            ),
+            comm_ptr=self.comm_ptr,
         )
 
         static_buffer_size = (
@@ -229,12 +267,14 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_num_tokens,
             sdispls_hs,
             rdispls_hs,
+            num_local_experts_ranks_prefix_sum,
             a1,
             sort_indices,
             expert_count,
             recv_expert_count_flat,
+            num_experts,
+            self.num_local_experts,
             self.ep_rank,
-            experts_per_rank,
             self.ep_size,
             topk,
         )

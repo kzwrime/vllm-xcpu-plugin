@@ -40,6 +40,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self,
         max_num_tokens: int,
         ep_group: dist.ProcessGroup,
+        num_experts: int,
         num_local_experts: int,
         num_dispatchers: int,
         rank_expert_offset: int,
@@ -59,6 +60,14 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
+
+        self.num_local_experts_ranks = self._compute_expert_distribution(
+            num_experts, self.ep_size
+        )
+        self.experts_local_rank = self.num_local_experts_ranks[self.ep_rank]
+        assert self.experts_local_rank == num_local_experts, (
+            f"{self.num_local_experts_ranks}"
+        )
 
         # Context storage for finalize phase
         # We need to know where to put the received data back
@@ -88,6 +97,19 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def max_num_tokens_per_rank(self) -> int | None:
         return self.max_num_tokens
+
+    def _compute_expert_distribution(
+        self, num_experts: int, ep_size: int
+    ) -> torch.Tensor:
+        """Compute expert distribution across ranks (deterministic)."""
+        base_experts = num_experts // ep_size
+        extra_experts = num_experts % ep_size
+
+        num_local_experts_ranks = torch.empty(ep_size, dtype=torch.int32)
+        for i in range(ep_size):
+            num_local_experts_ranks[i] = base_experts + (1 if i < extra_experts else 0)
+
+        return num_local_experts_ranks
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return None
@@ -149,8 +171,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.topk = topk
         self._topk_weights = topk_weights
 
-        experts_per_rank = num_experts // self.ep_size
-
         total_tokens = num_tokens * topk
         avg_size = total_tokens // self.tp_size
         extras = total_tokens % self.tp_size
@@ -172,9 +192,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # --- For fused operator ---
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        expert_num_tokens = torch.empty(
-            experts_per_rank, dtype=torch.int32, device=device
-        )
+        expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
 
         static_buffer_size = (
             self.max_num_tokens * self.dp_size * min(topk, self.num_local_experts)
@@ -193,12 +211,11 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             local_tokens, hidden_dim, dtype=a1.dtype, device=device
         )
 
-        # --- Pre-allocate workspace for small arrays ---
-        # Layout: [sort_indices][expert_count][recv_expert_count]
-        #         [send_split_sizes][sdispls_hs][rdispls_hs]
-        num_experts = self.ep_size * experts_per_rank
-        workspace_size = local_tokens + 2 * num_experts + 3 * self.ep_size
-        workspace = torch.empty(workspace_size, dtype=torch.int32, device=device)
+        # --- Pre-allocate sort_indices (needed for phase2) ---
+        sort_indices = torch.empty(local_tokens, dtype=torch.int32, device=device)
+
+        # Workspace is no longer used internally, pass empty tensor for compatibility
+        workspace = torch.empty(0, dtype=torch.int32, device=device)
 
         ret_topk_ids_shape = (static_buffer_size, 1)
 
@@ -212,13 +229,15 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             recv_topk_ids,
             expert_num_tokens,
             self._recv_split_sizes,
-            self._full_send_split_sizes,  # phase1 输出: 用 expert_count_all 计算 (全局)
-            send_hidden_states,  # 预分配的发送缓冲区
-            workspace,  # 预分配的工作区
+            self._full_send_split_sizes,
+            send_hidden_states,
+            sort_indices,
+            workspace,
             a1,
             topk_ids,
             static_buffer_size,
-            experts_per_rank,
+            num_experts,
+            self.num_local_experts,
             hidden_dim,
             self.ep_size,
             self.ep_rank,
