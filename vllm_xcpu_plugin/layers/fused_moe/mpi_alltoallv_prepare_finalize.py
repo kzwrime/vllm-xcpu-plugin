@@ -57,7 +57,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
-        self.max_num_tokens_across_ep = max_num_tokens * self.ep_size
 
         # Context storage for finalize phase
         # We need to know where to put the received data back
