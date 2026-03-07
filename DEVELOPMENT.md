@@ -14,11 +14,9 @@ torch_ext/torch_xcpu/      # 算子库（独立仓库）
 │   ├── include/           # 头文件（内联实现）
 │   └── ops.py             # Python API
 ├── torch_xcpu_impl/       # C++ 实现
-│   ├── src/               # 源文件
-│   ├── include/           # 头文件
-│   └── Makefile           # 构建脚本
-└── tests/                 # 算子测试
-    └── test_vocab_parallel_embedding.py
+    ├── src/               # 源文件
+    ├── include/           # 头文件
+    └── Makefile           # 构建脚本
 
 torch_ext/torch_mpi_ext/  # MPI 通信库
 ```
@@ -123,6 +121,14 @@ pytest tests/test_vocab_parallel_embedding.py
 **vllm-xcpu-plugin 测试**:
 ```bash
 pytest tests/kernels/core/test_activation.py
+```
+
+**vllm 端到端测试**
+
+注意执行路径。每次都要 source，确保用户临时的修改能生效。此处 vllm 是一个临时软连接。
+
+```bash
+cd ./vllm && source ./scripts/env.sh && source ./scripts/user_env.sh && mpirun -np 4 python3 ./Qwen1.5-MoE-dp2.py
 ```
 
 ## 注意事项
