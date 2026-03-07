@@ -3,6 +3,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
@@ -168,6 +169,8 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             self._forward_method = self.forward_cpu
 
     def forward_cpu(self, input_):
+        # import torch_xcpu
+
         if self.tp_size > 1:
             import torch_xcpu.ops as ops
 
@@ -187,8 +190,18 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             )
         else:
             masked_input = input_
+
         # Get the embeddings.
-        output_parallel = self.quant_method.embedding(self, masked_input.long())
+        if self.quant_method is UnquantizedEmbeddingMethod:
+            # TODO: use torch_xcpu.ops.embedding
+            # output_parallel = torch_xcpu.ops.embedding(
+            #     masked_input.long(), self.weight
+            # )
+            output_parallel = torch.nn.functional.embedding(
+                masked_input.long(), self.weight
+            )
+        else:
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
