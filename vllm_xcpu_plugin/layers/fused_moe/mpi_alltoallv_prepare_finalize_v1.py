@@ -234,7 +234,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             sort_indices,
             workspace,
             a1,
-            topk_ids,
+            topk_ids.to(torch.int32),
             static_buffer_size,
             num_experts,
             self.num_local_experts,
