@@ -95,6 +95,48 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         assert a2_scale is None, "CPU MoE does not support intermediate quantization"
         assert self.quant_dtype is None, "CPU MoE does not support weight quantization"
 
+        # Allocate all intermediate buffers here instead of in fused_moe_compute
+        M_full_padding = hidden_states.shape[0]
+        topk = topk_weights.shape[1]
+        K = hidden_states.shape[-1]
+        num_experts = w1.shape[0]
+        device = hidden_states.device
+        fdtype = hidden_states.dtype
+
+        # Allocate buffers using M_full_padding
+        permuted_hidden_states = torch.empty(
+            (M_full_padding * topk, K), device=device, dtype=fdtype
+        )
+        sorted_by_expert = torch.empty(
+            M_full_padding * topk, device=device, dtype=torch.int32
+        )
+        sorted_by_expert_back = torch.empty(
+            M_full_padding * topk, device=device, dtype=torch.int32
+        )
+        expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
+        intermediate_output = torch.empty(
+            (M_full_padding * topk, w1.shape[1]), device=device, dtype=fdtype
+        )
+        activated = torch.empty(
+            (M_full_padding * topk, w1.shape[1] // 2), device=device, dtype=fdtype)
+
+        # Handle expert_num_tokens: allocate empty tensor if None
+        if expert_tokens_meta is None:
+            _expert_num_tokens = torch.empty(0, device=device, dtype=torch.int32)
+        else:
+            _expert_num_tokens = expert_tokens_meta.expert_num_tokens
+
+        # Handle expert_map default value
+        if expert_map is None:
+            expert_map = torch.arange(w1.shape[0], device=device)
+
+        # Only allocate workspace_unpermute_and_reduce if topk_reduce=True
+        if self.topk_reduce:
+            workspace_unpermute_and_reduce = torch.empty(
+                M_full_padding, K, dtype=topk_weights.dtype, device=device)
+        else:
+            workspace_unpermute_and_reduce = torch.empty(0, device=device)
+
         torch.ops.vllm.fused_moe_compute(
             output=output,
             hidden_states=hidden_states,
@@ -107,11 +149,16 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             expert_map=expert_map,
             a1q_scale=a1q_scale,
             a2_scale=a2_scale,
-            expert_num_tokens=expert_tokens_meta.expert_num_tokens
-            if expert_tokens_meta
-            else None,
+            expert_num_tokens=_expert_num_tokens,
             apply_router_weight_on_input=apply_router_weight_on_input,
             topk_reduce=self.topk_reduce,
+            permuted_hidden_states=permuted_hidden_states,
+            sorted_by_expert=sorted_by_expert,
+            sorted_by_expert_back=sorted_by_expert_back,
+            expert_offsets=expert_offsets,
+            intermediate_output=intermediate_output,
+            activated=activated,
+            workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
         )
 
 
@@ -124,12 +171,19 @@ def fused_moe_compute(
     topk_ids: torch.Tensor,
     activation: str,
     global_num_experts: int,
-    expert_map: torch.Tensor | None,
+    expert_map: torch.Tensor,
     a1q_scale: torch.Tensor | None,
     a2_scale: torch.Tensor | None,
-    expert_num_tokens: torch.Tensor | None,
+    expert_num_tokens: torch.Tensor,
     apply_router_weight_on_input: bool,
     topk_reduce: bool,
+    permuted_hidden_states: torch.Tensor,
+    sorted_by_expert: torch.Tensor,
+    sorted_by_expert_back: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    intermediate_output: torch.Tensor,
+    activated: torch.Tensor,
+    workspace_unpermute_and_reduce: torch.Tensor,
 ) -> None:
     """
     Execute CPU MoE computation using native torch operations.
@@ -150,31 +204,13 @@ def fused_moe_compute(
     # (handles static buffer allocation where buffer may be larger than actual data)
     M_full_padding = hidden_states.shape[0]
     M_valid = M_full_padding
-    if expert_num_tokens is not None:
+    if expert_num_tokens.numel() > 0:
         M_valid = int(expert_num_tokens.sum().item())
 
     from torch_xcpu import ops as xcpu_ops
 
     topk = topk_weights.shape[1]
-    K = hidden_states.shape[-1]
     num_experts = w1.shape[0]
-    device = hidden_states.device
-    fdtype = hidden_states.dtype
-
-    if expert_map is None:
-        expert_map = torch.arange(num_experts, device=device)
-
-    # Allocate buffers using M_full_padding
-    permuted_hidden_states = torch.empty(
-        (M_full_padding * topk, K), device=device, dtype=fdtype
-    )
-    sorted_by_expert = torch.empty(
-        M_full_padding * topk, device=device, dtype=torch.int32
-    )
-    sorted_by_expert_back = torch.empty(
-        M_full_padding * topk, device=device, dtype=torch.int32
-    )
-    expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
 
     num_valid_tokens = xcpu_ops.moe_permute(
         permuted_hidden_states,
@@ -195,12 +231,6 @@ def fused_moe_compute(
 
     # Step 2: Grouped GEMM (first layer) - compute gate_up projections
     # Use moe_grouped_gemm to compute all experts in one pass
-    intermediate_output = torch.empty(
-        (permuted_hidden_states.shape[0], w1.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-
     xcpu_ops.moe_grouped_gemm(
         intermediate_output,     # [:num_valid_tokens, intermediate_size]
         permuted_hidden_states,  # [:num_valid_tokens, K]
@@ -208,16 +238,9 @@ def fused_moe_compute(
         expert_offsets,  # [num_experts + 1]
         True,
         num_valid_tokens,
-        # trans_b: w1 is [num_experts, 2 * intermediate_size, K],
-        # need to transpose last 2 dims
     )  # intermediate_output is [num_valid_tokens, 2 * intermediate_size]
 
     # Step 3: Activation function (SiluAndMul for SwiGLU)
-    activated = torch.empty(
-        (intermediate_output.shape[0], intermediate_output.shape[1] // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
     xcpu_ops.silu_and_mul(
         activated[:num_valid_tokens], intermediate_output[:num_valid_tokens]
     )
@@ -235,9 +258,6 @@ def fused_moe_compute(
     )
 
     if topk_reduce:
-        workspace_unpermute_and_reduce = torch.empty(
-            M_valid, K, dtype=topk_weights.dtype, device=hidden_states.device
-        )
         xcpu_ops.moe_unpermute(
             output,
             permuted_hidden_states,
