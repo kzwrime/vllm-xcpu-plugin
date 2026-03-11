@@ -172,7 +172,7 @@ def fused_moe_compute(
         M_full_padding * topk, device=device, dtype=torch.int32
     )
     sorted_by_expert_back = torch.empty(
-        M_valid * topk, device=device, dtype=torch.int32
+        M_full_padding * topk, device=device, dtype=torch.int32
     )
     expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
 
