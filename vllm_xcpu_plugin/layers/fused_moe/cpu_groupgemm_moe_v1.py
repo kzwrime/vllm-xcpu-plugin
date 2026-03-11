@@ -171,11 +171,15 @@ def fused_moe_compute(
     sorted_by_expert = torch.empty(
         M_full_padding * topk, device=device, dtype=torch.int32
     )
+    sorted_by_expert_back = torch.empty(
+        M_valid * topk, device=device, dtype=torch.int32
+    )
     expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
 
     num_valid_tokens = xcpu_ops.moe_permute(
         permuted_hidden_states,
         sorted_by_expert,
+        sorted_by_expert_back,
         expert_offsets,
         hidden_states,
         topk_ids.to(torch.int32),
@@ -237,19 +241,19 @@ def fused_moe_compute(
         xcpu_ops.moe_unpermute(
             output,
             permuted_hidden_states,
-            sorted_by_expert.to(torch.int32),
+            sorted_by_expert_back.to(torch.int32),
+            M=M_valid,
             topk_weights=topk_weights,
             workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
-            M=M_valid,
             num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
         )
     else:
         xcpu_ops.moe_unpermute(
             output,
             permuted_hidden_states,
-            sorted_by_expert.to(torch.int32),
-            topk=topk,
+            sorted_by_expert_back.to(torch.int32),
             M=M_valid,
+            topk=topk,
             num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
         )
 
