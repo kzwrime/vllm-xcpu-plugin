@@ -10,7 +10,6 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
 
 class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
@@ -128,7 +127,9 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         # Handle expert_map default value
         if expert_map is None:
-            expert_map = torch.arange(w1.shape[0], device=device)
+            expert_map = torch.arange(w1.shape[0], device=device, dtype=torch.int32)
+        else:
+            expert_map = expert_map.to(torch.int32)
 
         # Only allocate workspace_unpermute_and_reduce if topk_reduce=True
         if self.topk_reduce:
@@ -137,7 +138,9 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         else:
             workspace_unpermute_and_reduce = torch.empty(0, device=device)
 
-        torch.ops.vllm.fused_moe_compute(
+        # Call the fused C++ operator from torch_xcpu
+        from torch_xcpu import ops as xcpu_ops
+        xcpu_ops.fused_moe_compute(
             output=output,
             hidden_states=hidden_states,
             w1=w1,
@@ -160,126 +163,3 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             activated=activated,
             workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
         )
-
-
-def fused_moe_compute(
-    output: torch.Tensor,
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str,
-    global_num_experts: int,
-    expert_map: torch.Tensor,
-    a1q_scale: torch.Tensor | None,
-    a2_scale: torch.Tensor | None,
-    expert_num_tokens: torch.Tensor,
-    apply_router_weight_on_input: bool,
-    topk_reduce: bool,
-    permuted_hidden_states: torch.Tensor,
-    sorted_by_expert: torch.Tensor,
-    sorted_by_expert_back: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    intermediate_output: torch.Tensor,
-    activated: torch.Tensor,
-    workspace_unpermute_and_reduce: torch.Tensor,
-) -> None:
-    """
-    Execute CPU MoE computation using native torch operations.
-    The computation follows:
-      Permute -> Grouped GEMM -> Activation -> Grouped GEMM -> Unpermute and reduce.
-    Note: topk_weights and topk_ids should already be computed by router.
-    """
-    assert not apply_router_weight_on_input, (
-        "CPU MoE does not support apply_router_weight_on_input"
-    )
-    # No quantization support
-    assert a1q_scale is None, "CPU MoE does not support input quantization"
-    assert a2_scale is None, "CPU MoE does not support intermediate quantization"
-
-    assert activation == "silu"
-
-    # Slice inputs to actual valid tokens if expert_num_tokens is provided
-    # (handles static buffer allocation where buffer may be larger than actual data)
-    M_full_padding = hidden_states.shape[0]
-    M_valid = M_full_padding
-    if expert_num_tokens.numel() > 0:
-        M_valid = int(expert_num_tokens.sum().item())
-
-    from torch_xcpu import ops as xcpu_ops
-
-    topk = topk_weights.shape[1]
-    num_experts = w1.shape[0]
-
-    num_valid_tokens = xcpu_ops.moe_permute(
-        permuted_hidden_states,
-        sorted_by_expert,
-        sorted_by_expert_back,
-        expert_offsets,
-        hidden_states,
-        topk_ids.to(torch.int32),
-        expert_map.to(torch.int32),
-        num_experts,
-        global_num_experts,
-        M_valid,
-    )
-
-    if num_valid_tokens == 0:
-        output[:M_valid] = 0
-        return
-
-    # Step 2: Grouped GEMM (first layer) - compute gate_up projections
-    # Use moe_grouped_gemm to compute all experts in one pass
-    xcpu_ops.moe_grouped_gemm(
-        intermediate_output,     # [:num_valid_tokens, intermediate_size]
-        permuted_hidden_states,  # [:num_valid_tokens, K]
-        w1,  # [num_experts, 2 * intermediate_size, K]
-        expert_offsets,  # [num_experts + 1]
-        True,
-        num_valid_tokens,
-    )  # intermediate_output is [num_valid_tokens, 2 * intermediate_size]
-
-    # Step 3: Activation function (SiluAndMul for SwiGLU)
-    xcpu_ops.silu_and_mul(
-        activated[:num_valid_tokens], intermediate_output[:num_valid_tokens]
-    )
-
-    # Step 4: Grouped GEMM (second layer) - compute down projections
-    # Reuse permuted_hidden_states as the output buffer for the second grouped_gemm.
-    # The original permuted_hidden_states is no longer needed after this point.
-    xcpu_ops.moe_grouped_gemm(
-        permuted_hidden_states,  # output buffer: [:num_valid_tokens, K]
-        activated,  # input: [:num_valid_tokens, intermediate_size // 2]
-        w2,
-        expert_offsets,
-        True,
-        num_valid_tokens,
-    )
-
-    if topk_reduce:
-        xcpu_ops.moe_unpermute(
-            output,
-            permuted_hidden_states,
-            sorted_by_expert_back.to(torch.int32),
-            M=M_valid,
-            topk_weights=topk_weights,
-            workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
-            num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
-        )
-    else:
-        xcpu_ops.moe_unpermute(
-            output,
-            permuted_hidden_states,
-            sorted_by_expert_back.to(torch.int32),
-            M=M_valid,
-            topk=topk,
-            num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
-        )
-
-
-direct_register_custom_op(
-    op_name="fused_moe_compute",
-    op_func=fused_moe_compute,
-    mutates_args=["output"],
-)
