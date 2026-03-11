@@ -50,19 +50,21 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> FusedMoEPrepareAndFinalize | None:
         prepare_finalize = super().maybe_make_prepare_finalize(routing_tables)
 
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
+        _ep_group = get_ep_group()
+        assert _ep_group is not None
+        assert _ep_group.device_communicator is not None
+        all2all_manager = _ep_group.device_communicator.all2all_manager
 
         assert all2all_manager is not None
 
         if self.moe.moe_parallel_config.use_all2all_kernels:
             if envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU == "torch_all_to_all_single":
-                _ep_group = get_ep_group()
-                assert _ep_group is not None
                 ep_group = (
                     _ep_group.device_communicator.device_group
                     if _ep_group.device_communicator.device_group is not None
                     else _ep_group.device_communicator.cpu_group
                 )
+                assert ep_group is not None
                 num_dispatchers = all2all_manager.world_size
 
                 prepare_finalize = TorchAlltoallSinglePrepareAndFinalize(
@@ -75,13 +77,12 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     tp_size=self.moe.tp_size,
                 )
             elif envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU == "mpi_alltoallv":
-                _ep_group = get_ep_group()
-                assert _ep_group is not None
                 ep_group = (
                     _ep_group.device_communicator.device_group
                     if _ep_group.device_communicator.device_group is not None
                     else _ep_group.device_communicator.cpu_group
                 )
+                assert ep_group is not None
                 num_dispatchers = all2all_manager.world_size
 
                 prepare_finalize = MpiAlltoallvPrepareAndFinalize(
@@ -119,6 +120,8 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # super().process_weights_after_loading(layer)
 
         # Padding the weight for better performance on ROCm
+        assert isinstance(layer.w13_weight.data, torch.Tensor)
+        assert isinstance(layer.w2_weight.data, torch.Tensor)
         layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
         layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
 

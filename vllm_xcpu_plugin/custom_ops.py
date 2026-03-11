@@ -193,6 +193,7 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
 
         # Get the embeddings.
         if self.quant_method is UnquantizedEmbeddingMethod:
+            assert isinstance(self.weight, torch.Tensor)
             # TODO: use torch_xcpu.ops.embedding
             # output_parallel = torch_xcpu.ops.embedding(
             #     masked_input.long(), self.weight

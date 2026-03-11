@@ -19,7 +19,7 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
 
 
 class XcpuTritonAttentionImpl(TritonAttentionImpl):
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
