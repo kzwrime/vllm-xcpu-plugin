@@ -190,7 +190,7 @@ def fused_moe_compute(
     )
 
     if num_valid_tokens == 0:
-        output.zero_()
+        output[:M_valid] = 0
         return
 
     # Step 2: Grouped GEMM (first layer) - compute gate_up projections
