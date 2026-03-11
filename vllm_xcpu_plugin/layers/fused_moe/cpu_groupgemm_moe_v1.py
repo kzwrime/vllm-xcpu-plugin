@@ -148,15 +148,14 @@ def fused_moe_compute(
 
     # Slice inputs to actual valid tokens if expert_num_tokens is provided
     # (handles static buffer allocation where buffer may be larger than actual data)
+    M_full_padding = hidden_states.shape[0]
+    M_valid = M_full_padding
     if expert_num_tokens is not None:
-        num_valid_tokens = int(expert_num_tokens.sum().item())
-        hidden_states = hidden_states[:num_valid_tokens]
-        topk_ids = topk_ids[:num_valid_tokens]
-        topk_weights = topk_weights[:num_valid_tokens]
+        M_valid = int(expert_num_tokens.sum().item())
 
     from torch_xcpu import ops as xcpu_ops
 
-    M, topk = topk_weights.shape
+    topk = topk_weights.shape[1]
     K = hidden_states.shape[-1]
     num_experts = w1.shape[0]
     device = hidden_states.device
@@ -165,8 +164,13 @@ def fused_moe_compute(
     if expert_map is None:
         expert_map = torch.arange(num_experts, device=device)
 
-    permuted_hidden_states = torch.empty((M * topk, K), device=device, dtype=fdtype)
-    sorted_by_expert = torch.empty(M * topk, device=device, dtype=torch.int32)
+    # Allocate buffers using M_full_padding
+    permuted_hidden_states = torch.empty(
+        (M_full_padding * topk, K), device=device, dtype=fdtype
+    )
+    sorted_by_expert = torch.empty(
+        M_full_padding * topk, device=device, dtype=torch.int32
+    )
     expert_offsets = torch.empty(num_experts + 1, device=device, dtype=torch.int32)
 
     num_valid_tokens = xcpu_ops.moe_permute(
@@ -178,7 +182,7 @@ def fused_moe_compute(
         expert_map.to(torch.int32),
         num_experts,
         global_num_experts,
-        M,
+        M_valid,
     )
 
     if num_valid_tokens == 0:
@@ -228,7 +232,7 @@ def fused_moe_compute(
 
     if topk_reduce:
         workspace_unpermute_and_reduce = torch.empty(
-            M, K, dtype=topk_weights.dtype, device=hidden_states.device
+            M_valid, K, dtype=topk_weights.dtype, device=hidden_states.device
         )
         xcpu_ops.moe_unpermute(
             output,
@@ -236,7 +240,7 @@ def fused_moe_compute(
             sorted_by_expert.to(torch.int32),
             topk_weights=topk_weights,
             workspace_unpermute_and_reduce=workspace_unpermute_and_reduce,
-            M=M,
+            M=M_valid,
             num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
         )
     else:
@@ -245,7 +249,7 @@ def fused_moe_compute(
             permuted_hidden_states,
             sorted_by_expert.to(torch.int32),
             topk=topk,
-            M=M,
+            M=M_valid,
             num_valid_tokens=num_valid_tokens,  # Only process num_valid_tokens
         )
 
