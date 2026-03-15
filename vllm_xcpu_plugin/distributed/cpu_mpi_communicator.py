@@ -105,6 +105,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
             logger.info("Using all2all_backend = %s", self.all2all_backend)
 
         self.comm_ptr = self.mpi_group_comm.py2f()
+        self.comm_ptr_wrapper = torch.tensor([self.comm_ptr])
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         # logger.info(f"all_reduce rank: {self.mpi_group_rank}, "

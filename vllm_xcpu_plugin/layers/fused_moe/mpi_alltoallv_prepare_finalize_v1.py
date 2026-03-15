@@ -82,7 +82,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         communicator = get_ep_group().device_communicator
         assert isinstance(communicator, CpuMPICommunicator)
-        self.comm_ptr = communicator.comm_ptr
+        self.comm_ptr_wrapper = communicator.comm_ptr_wrapper
 
         if not envs.VLLM_ENABLE_MOE_DP_CHUNK:
             vllm_config = get_current_vllm_config()
@@ -243,7 +243,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self.ep_rank,
             self.tp_rank,
             self.tp_size,
-            self.comm_ptr,
+            self.comm_ptr_wrapper,
         )
 
         self._sort_indices_back = sort_indices_back
@@ -336,7 +336,7 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             finalize_recv_sizes_tensor,
             self.ep_size,
             self.tp_size,
-            self.comm_ptr,
+            self.comm_ptr_wrapper,
             _finalize_recv_hidden_states,
             _finalize_workspace,
             self.topk,
