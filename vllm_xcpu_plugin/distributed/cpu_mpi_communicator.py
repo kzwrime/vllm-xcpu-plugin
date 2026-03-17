@@ -110,7 +110,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         # logger.info(f"all_reduce rank: {self.mpi_group_rank}, "
         #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
-        torch_mpi_ext.ops.all_reduce_(input_, self.comm_ptr)
+        torch_mpi_ext.ops.all_reduce__wrapper(input_, self.comm_ptr_wrapper)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -133,8 +133,8 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
 
-        torch_mpi_ext.ops.all_gather_into_tensor_out(
-            output_tensor, input_, self.comm_ptr, dim=dim
+        torch_mpi_ext.ops.all_gather_into_tensor_out_wrapper(
+            output_tensor, input_, self.comm_ptr_wrapper, dim=dim
         )
 
         return output_tensor
