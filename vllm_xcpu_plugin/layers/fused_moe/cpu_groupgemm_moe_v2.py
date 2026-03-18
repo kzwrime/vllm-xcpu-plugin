@@ -146,7 +146,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_ids=topk_ids.to(torch.int32),
             activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
