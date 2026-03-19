@@ -1,4 +1,5 @@
 import torch
+import torch_xcpu
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
@@ -13,6 +14,20 @@ from vllm.v1.attention.backends.triton_attn import (
 
 @register_backend(AttentionBackendEnum.TRITON_ATTN)
 class XcpuTritonAttentionBackend(TritonAttentionBackend):
+    use_direct_unified_op: bool = True
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
     @staticmethod
     def get_impl_cls() -> type["XcpuTritonAttentionImpl"]:
         return XcpuTritonAttentionImpl
@@ -81,9 +96,6 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
                 layer,
             )
 
-        # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(1)
-
         if (
             self.kv_sharing_target_layer_name is None
             and key is not None
@@ -97,13 +109,11 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
                 # triton kernel does not support uint8 kv_cache
                 #  (because some explicit casts (e.g. float8_e4m3fnuz)
                 #   are not supported)
-            import torch_xcpu
 
             torch_xcpu.ops.reshape_and_cache(
                 key,
                 value,
-                key_cache,
-                value_cache,
+                kv_cache,
                 attn_metadata.slot_mapping,
             )
 
@@ -129,13 +139,11 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
 
         # descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         # mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
-        import torch_xcpu
 
         torch_xcpu.ops.unified_attention(
-            q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
-            out=output[:num_actual_tokens],
+            q=query,  # query[:num_actual_tokens]
+            kv=kv_cache,
+            out=output,  # output[:num_actual_tokens]
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k,
