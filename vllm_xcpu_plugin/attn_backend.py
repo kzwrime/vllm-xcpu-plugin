@@ -1,5 +1,4 @@
 import torch
-import torch_xcpu
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
@@ -59,6 +58,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        import torch_xcpu
 
         if output_block_scale is not None:
             raise NotImplementedError(
@@ -103,12 +103,12 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            if self.kv_cache_dtype.startswith("fp8"):
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-                # triton kernel does not support uint8 kv_cache
-                #  (because some explicit casts (e.g. float8_e4m3fnuz)
-                #   are not supported)
+            # if self.kv_cache_dtype.startswith("fp8"):
+            #     key_cache = key_cache.view(self.fp8_dtype)
+            #     value_cache = value_cache.view(self.fp8_dtype)
+            #     # triton kernel does not support uint8 kv_cache
+            #     #  (because some explicit casts (e.g. float8_e4m3fnuz)
+            #     #   are not supported)
 
             torch_xcpu.ops.reshape_and_cache(
                 key,
@@ -117,13 +117,13 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
                 attn_metadata.slot_mapping,
             )
 
-        if self.kv_cache_dtype.startswith("fp8"):
-            if key_cache.dtype != self.fp8_dtype:
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-            assert layer._q_scale_float == 1.0, (
-                "A non 1.0 q_scale is not currently supported."
-            )
+        # if self.kv_cache_dtype.startswith("fp8"):
+        #     if key_cache.dtype != self.fp8_dtype:
+        #         key_cache = key_cache.view(self.fp8_dtype)
+        #         value_cache = value_cache.view(self.fp8_dtype)
+        #     assert layer._q_scale_float == 1.0, (
+        #         "A non 1.0 q_scale is not currently supported."
+        #     )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
