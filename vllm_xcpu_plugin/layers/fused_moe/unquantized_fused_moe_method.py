@@ -26,10 +26,17 @@ from vllm.platforms import current_platform
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 from .cpu_groupgemm_moe_v2 import CPUGroupGemmExperts
-from .mpi_alltoallv_prepare_finalize_v1 import MpiAlltoallvPrepareAndFinalize
+from .mpi_alltoallv_prepare_finalize_v1 import MpiAlltoallvPrepareAndFinalizeV1
+from .mpi_alltoallv_prepare_finalize_v2 import MpiAlltoallvPrepareAndFinalizeV2
 from .torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
+
+# Map version strings to implementation classes
+_MPI_ALLTOALLV_VERSIONS = {
+    "v1": MpiAlltoallvPrepareAndFinalizeV1,
+    "v2": MpiAlltoallvPrepareAndFinalizeV2,
+}
 
 
 # --8<-- [start:unquantized_fused_moe]
@@ -85,7 +92,16 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 assert ep_group is not None
                 num_dispatchers = all2all_manager.world_size
 
-                prepare_finalize = MpiAlltoallvPrepareAndFinalize(
+                # Select MPI alltoallv implementation based on environment variable
+                version = envs_xcpu.VLLM_MPI_ALLTOALLV_VERSION
+                mpi_impl_class = _MPI_ALLTOALLV_VERSIONS.get(version)
+                if mpi_impl_class is None:
+                    raise ValueError(
+                        f"Invalid VLLM_MPI_ALLTOALLV_VERSION: {version}. "
+                        f"Must be one of: {list(_MPI_ALLTOALLV_VERSIONS.keys())}"
+                    )
+
+                prepare_finalize = mpi_impl_class(
                     max_num_tokens=self.moe.max_num_tokens,
                     ep_group=ep_group,
                     num_experts=self.moe.num_experts,

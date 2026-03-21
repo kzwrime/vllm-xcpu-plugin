@@ -32,6 +32,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
     "VLLM_ALL2ALL_BACKEND_XCPU": lambda: os.getenv("VLLM_ALL2ALL_BACKEND_XCPU", ""),
+    # MPI alltoallv implementation version: "v1" or "v2"
+    # v1: Uses moe_prepare_fused_v2 with extra padding calculation
+    # v2: Uses moe_prepare_fused with simplified buffer size calculation (default)
+    "VLLM_MPI_ALLTOALLV_VERSION": lambda: os.getenv("VLLM_MPI_ALLTOALLV_VERSION", "v1"),
 }
 
 # end-env-vars-definition

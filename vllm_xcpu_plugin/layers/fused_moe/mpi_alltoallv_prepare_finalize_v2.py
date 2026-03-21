@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
 
-class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
+class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
@@ -194,8 +194,12 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
         expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
 
+        static_buffer_padding_per_dp = (
+            self.num_local_experts + hidden_dim - 1
+        ) // hidden_dim
         static_buffer_size = (
-            self.max_num_tokens * self.dp_size * min(topk, self.num_local_experts)
+            self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
+            + self.ep_size * static_buffer_padding_per_dp
         )
         assert static_buffer_size % self.ep_size == 0
 
@@ -209,8 +213,11 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         # --- Pre-allocate send_hidden_states (shape-dependent) ---
         # Size depends on local_tokens and hidden_dim
         send_hidden_states = torch.empty(
-            local_tokens, hidden_dim, dtype=a1.dtype, device=device
+            local_tokens + self.ep_size, hidden_dim, dtype=a1.dtype, device=device
         )
+        # send_hidden_states = torch.empty(
+        #     local_tokens, hidden_dim, dtype=a1.dtype, device=device
+        # )
 
         # --- Pre-allocate sort_indices (needed for phase2) ---
         sort_indices = torch.empty(local_tokens, dtype=torch.int32, device=device)
@@ -224,13 +231,13 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         # Call fused operator (phase1 + alltoall + phase2 + alltoallv)
         # =============================================================================
 
-        xcpu_ops.moe_prepare_fused(
-            sort_indices_back,
-            recv_hidden_states,
-            recv_topk_ids,
-            expert_num_tokens,
-            self._recv_split_sizes,
-            self._full_send_split_sizes,
+        xcpu_ops.moe_prepare_fused_v2(
+            sort_indices_back,  # output
+            recv_hidden_states,  # output
+            recv_topk_ids,  # output
+            expert_num_tokens,  # output
+            self._recv_split_sizes,  # output
+            self._full_send_split_sizes,  # output
             send_hidden_states,
             sort_indices,
             workspace,
