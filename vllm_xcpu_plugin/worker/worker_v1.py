@@ -1,3 +1,4 @@
+import vllm.envs as envs
 from vllm.logger import logger
 from vllm.platforms import current_platform
 from vllm.v1.worker.cpu_worker import CPUWorker
@@ -71,3 +72,24 @@ class XcpuWorker(CPUWorker):
 
         # Call init_worker_distributed_environment、CPUModelRunner...
         super().init_device()
+
+        # If the EPLB MPI comm backend is requested, verify that MPI is
+        # initialized and that MPI global rank matches torch global rank.
+        if envs.VLLM_EPLB_COMM_BACKEND == "mpi":
+            assert envs_xcpu.VLLM_CPU_USE_MPI, (
+                "VLLM_EPLB_COMM_BACKEND=mpi requires VLLM_CPU_USE_MPI=1"
+            )
+            from mpi4py import MPI  # type: ignore[import]
+
+            mpi_rank = MPI.COMM_WORLD.Get_rank()
+            assert mpi_rank == world_rank_across_dp, (
+                f"[EPLB MPI backend] MPI global rank {mpi_rank} != "
+                f"torch global rank {world_rank_across_dp}. "
+                "Ranks must match for direct MPI<->torch global rank mapping."
+            )
+            logger.info(
+                "[EPLB] MPI backend rank check passed: "
+                "mpi_rank=%d == torch_global_rank=%d",
+                mpi_rank,
+                world_rank_across_dp,
+            )
