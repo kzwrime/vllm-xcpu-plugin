@@ -84,6 +84,21 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         assert isinstance(communicator, CpuMPICommunicator)
         self.comm_ptr_wrapper = communicator.comm_ptr_wrapper
 
+        # Communication metadata tensor:
+        # [ep_size, ep_rank, tp_rank, tp_size, dp_rank, dp_size]
+        self._comm_metadata = torch.tensor(
+            [
+                self.ep_size,
+                self.ep_rank,
+                self.tp_rank,
+                self.tp_size,
+                self.dp_rank,
+                self.dp_size,
+            ],
+            dtype=torch.int64,
+            device="cpu",  # Keep on CPU for C++ access
+        )
+
         if not envs.VLLM_ENABLE_MOE_DP_CHUNK:
             vllm_config = get_current_vllm_config()
             assert (
@@ -240,12 +255,7 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
             num_experts,
             self.num_local_experts,
             hidden_dim,
-            self.ep_size,
-            self.ep_rank,
-            self.tp_rank,
-            self.tp_size,
-            self.dp_rank,
-            self.dp_size,
+            self._comm_metadata,
             self.comm_ptr_wrapper,
         )
 
@@ -337,8 +347,7 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
             self._sort_indices_back,
             finalize_send_sizes_tensor,
             finalize_recv_sizes_tensor,
-            self.ep_size,
-            self.tp_size,
+            self._comm_metadata,
             self.comm_ptr_wrapper,
             _finalize_recv_hidden_states,
             _finalize_workspace,
