@@ -80,8 +80,10 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
             self.mpi_group_size,
         )
 
-        assert self.mpi_group_rank == self.rank
-        assert self.mpi_group_size == self.world_size
+        assert self.mpi_group_rank == self.rank, f"{self.mpi_group_rank}, {self.rank}"
+        assert self.mpi_group_size == self.world_size, (
+            f"{self.mpi_group_size}, {self.world_size}"
+        )
 
         if self.use_all2all:
             self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
