@@ -187,9 +187,6 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         self._topk_weights = topk_weights
 
         total_tokens = num_tokens * topk
-        avg_size = total_tokens // self.tp_size
-        extras = total_tokens % self.tp_size
-        local_tokens = avg_size + (1 if self.tp_rank < extras else 0)
 
         # =============================================================================
         # Allocate tensors (shape-independent first, then shape-dependent)
@@ -228,14 +225,16 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         # --- Pre-allocate send_hidden_states (shape-dependent) ---
         # Size depends on local_tokens and hidden_dim
         send_hidden_states = torch.empty(
-            local_tokens + self.ep_size, hidden_dim, dtype=a1.dtype, device=device
+            total_tokens + self.ep_size, hidden_dim, dtype=a1.dtype, device=device
         )
         # send_hidden_states = torch.empty(
         #     local_tokens, hidden_dim, dtype=a1.dtype, device=device
         # )
 
         # --- Pre-allocate sort_indices (needed for phase2) ---
-        sort_indices = torch.empty(local_tokens, dtype=torch.int32, device=device)
+        sort_indices = torch.empty(
+            total_tokens + self.ep_size, dtype=torch.int32, device=device
+        )
 
         # Workspace is no longer used internally, pass empty tensor for compatibility
         workspace = torch.empty(0, dtype=torch.int32, device=device)
