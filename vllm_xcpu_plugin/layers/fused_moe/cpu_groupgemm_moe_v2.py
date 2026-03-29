@@ -117,7 +117,8 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             (M_full_padding * topk, w1.shape[1]), device=device, dtype=fdtype
         )
         activated = torch.empty(
-            (M_full_padding * topk, w1.shape[1] // 2), device=device, dtype=fdtype)
+            (M_full_padding * topk, w1.shape[1] // 2), device=device, dtype=fdtype
+        )
 
         # Handle expert_num_tokens: allocate empty tensor if None
         if expert_tokens_meta is None:
@@ -134,12 +135,14 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # Only allocate workspace_unpermute_and_reduce if topk_reduce=True
         if self.topk_reduce:
             workspace_unpermute_and_reduce = torch.empty(
-                M_full_padding, K, dtype=topk_weights.dtype, device=device)
+                M_full_padding, K, dtype=topk_weights.dtype, device=device
+            )
         else:
             workspace_unpermute_and_reduce = torch.empty(0, device=device)
 
         # Call the fused C++ operator from torch_xcpu
         from torch_xcpu import ops as xcpu_ops
+
         xcpu_ops.fused_moe_compute(
             output=output,
             hidden_states=hidden_states,

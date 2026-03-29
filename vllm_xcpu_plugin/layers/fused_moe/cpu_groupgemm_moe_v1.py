@@ -202,7 +202,7 @@ def fused_moe_compute(
     )
 
     xcpu_ops.moe_grouped_gemm(
-        intermediate_output,     # [:num_valid_tokens, intermediate_size]
+        intermediate_output,  # [:num_valid_tokens, intermediate_size]
         permuted_hidden_states,  # [:num_valid_tokens, K]
         w1,  # [num_experts, 2 * intermediate_size, K]
         expert_offsets,  # [num_experts + 1]

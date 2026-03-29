@@ -151,7 +151,6 @@ class MpiAlltoallvPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         assert not apply_router_weight_on_input
         import torch_mpi_ext
-
         from torch_xcpu import ops as xcpu_ops
 
         num_tokens, hidden_dim = a1.shape

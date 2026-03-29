@@ -196,9 +196,7 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             import torch_xcpu.ops as ops
 
             assert isinstance(self.weight, torch.Tensor)
-            output_parallel = ops.embedding(
-                self.weight, masked_input.long()
-            )
+            output_parallel = ops.embedding(self.weight, masked_input.long())
             # output_parallel = torch.nn.functional.embedding(
             #     masked_input.long(), self.weight
             # )
