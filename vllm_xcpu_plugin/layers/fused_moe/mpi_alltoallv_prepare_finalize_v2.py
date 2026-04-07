@@ -209,8 +209,16 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         static_buffer_padding_per_dp = (
             self.num_local_experts + hidden_dim - 1
         ) // hidden_dim
+
+        # static_buffer_size = (
+        #     self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
+        #     + self.ep_size * static_buffer_padding_per_dp
+        # )
+        # TODO: 目前因为 TP 并行时，重复 token 按照 expert 切分，而不是 token 切分
+        # 不得不将 dp_size 修改为 ep_size。Decode 时 TP=2，可接受。
+        # PD 分离 Prefill 集群应该按照 token 切分 + allgather
         static_buffer_size = (
-            self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
+            self.ep_size * self.max_num_tokens * min(topk, self.num_local_experts)
             + self.ep_size * static_buffer_padding_per_dp
         )
         assert static_buffer_size % self.ep_size == 0
