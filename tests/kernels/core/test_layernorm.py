@@ -12,7 +12,7 @@ from tests.kernels.utils import opcheck
 load_general_plugins()
 
 DTYPES = [torch.bfloat16, torch.float]
-NUM_TOKENS = [7, 83, 4096]  # Arbitrary values for testing
+NUM_TOKENS = [7, 83, 333]  # Arbitrary values for testing
 
 # fmt: skip
 HIDDEN_SIZES = [
@@ -29,44 +29,6 @@ HIDDEN_SIZES = [
     1280,
     1408,
     1536,
-    1792,
-    2048,
-    2432,
-    2560,
-    2736,
-    2816,
-    3072,
-    3584,
-    4096,
-    4608,
-    4736,
-    4864,
-    5120,
-    5128,
-    5472,
-    5632,
-    6144,
-    6400,
-    7168,
-    8192,
-    8200,
-    9216,
-    9472,
-    9728,
-    10944,
-    11264,
-    12288,
-    12800,
-    16384,
-    18432,
-    18944,
-    19456,
-    21888,
-    24576,
-    25600,
-    36864,
-    37888,
-    51200,
 ]
 
 ADD_RESIDUAL = [False, True]

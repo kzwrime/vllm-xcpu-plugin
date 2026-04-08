@@ -5,6 +5,7 @@ import random
 
 import pytest
 import torch
+from torch_xcpu.model_configs import ALL_MODEL_CONFIGS
 from vllm.model_executor.layers.activation import (
     FatreluAndMul,
     GeluAndMul,
@@ -15,19 +16,44 @@ from vllm.model_executor.layers.activation import (
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
 
-from tests.kernels.allclose_default import get_default_atol
+from tests.kernels.allclose_default import (
+    calc_diff,
+    default_dice_tol,
+    get_default_atol,
+    get_default_rtol,
+)
 from tests.kernels.utils import opcheck
 
 load_general_plugins()
 
 DTYPES = [torch.bfloat16, torch.float]
-NUM_TOKENS = [1, 7, 83, 2048]  # Arbitrary values for testing
-D = [512, 13824]  # Arbitrary values for testing
+NUM_TOKENS = [1, 2, 4, 7, 8, 16, 31, 32, 64, 128, 133, 192, 256, 512, 577, 1024, 2055]
+D = set([512, 13824])  # Arbitrary values for testing
 SEEDS = [0]
 CUDA_DEVICES = ["cpu"]
 # CUDA_DEVICES = [
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
+
+for model_name, config in ALL_MODEL_CONFIGS.items():
+    if config.is_moe:
+        # MoE models: use moe_intermediate_size
+        width = config.moe_intermediate_size
+        assert width is not None, (
+            f"MoE model {model_name} must have moe_intermediate_size defined"
+        )
+        D.add(width)
+    else:
+        # Dense models: consider TP configurations (width is divided by tp_size)
+        base_width = config.intermediate_size
+        if not config.tp_sizes:
+            # No TP config, use base width
+            D.add(base_width)
+        else:
+            for tp_size in config.tp_sizes:
+                width = base_width // tp_size
+                label = f"{model_name}_tp{tp_size}"
+                D.add(width)
 
 
 @pytest.mark.parametrize(
@@ -78,41 +104,30 @@ def test_act_and_mul(
     elif activation == "swigluoai_and_mul":
         layer = SwigluOAIAndMul()
         fn = torch.ops._C.swigluoai_and_mul
+
+    # Compute reference in fp32 for higher precision
+    x_fp32 = x.to(torch.float)
+    layer_fp32 = layer.to(dtype=torch.float)
+    ref_out = layer_fp32.forward_native(x_fp32)
+
     out = layer(x)
-    ref_out = layer.forward_native(x)
-    if activation == "swigluoai_and_mul":
-        rtol = {
-            # For fp16, change the relative tolerance from 1e-3 to 2e-3
-            torch.float16: 2e-3,
-            torch.bfloat16: 2e-2,
-            torch.float: 1.3e-6,
-        }
 
-        def _get_rtol(output) -> float:
-            return rtol[output.dtype]
+    # Print error metrics
+    # max_abs_error = (out.to(torch.float) - ref_out).abs().max().item()
+    # max_rel_error = ((out.to(torch.float) - ref_out).abs() / (ref_out.abs() + 1e-12)).max().item()  # noqa: E501
+    # print(f"  Output: max_abs_error={max_abs_error:.6e}, max_rel_error={max_rel_error:.6e}, diff_out={diff_out:.6e}")  # noqa: E501
 
-        torch.testing.assert_close(
-            out, ref_out, atol=get_default_atol(out), rtol=_get_rtol(out)
-        )
-    else:
-        # Old comment
-        # The SiluAndMul, MulAndSilu, GELU and FatReLU implementations are
-        # equivalent to the native PyTorch implementations, so we can do exact
-        # comparison.
+    # Compare using both assert_close and default_dice_tol
+    # Reference precision is fp32, tolerance based on target (out) dtype
+    atol = get_default_atol(out)
+    rtol = get_default_rtol(out)
+    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
-        rtol = {
-            # For fp16, change the relative tolerance from 1e-3 to 2e-3
-            torch.float16: 2e-3,
-            torch.bfloat16: 2e-2,
-            torch.float: 1.3e-6,
-        }
-
-        def _get_rtol(output) -> float:
-            return rtol[output.dtype]
-
-        torch.testing.assert_close(
-            out, ref_out, atol=get_default_atol(out), rtol=_get_rtol(out)
-        )
+    # Check Dice tolerance
+    diff_out = calc_diff(out.to(torch.float), ref_out)
+    assert diff_out < default_dice_tol, (
+        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    )
 
     d = x.shape[-1] // 2
     output_shape = x.shape[:-1] + (d,)

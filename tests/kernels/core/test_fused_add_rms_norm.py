@@ -16,6 +16,12 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
 
+from tests.kernels.allclose_default import (
+    calc_diff,
+    default_dice_tol,
+    get_default_atol,
+    get_default_rtol,
+)
 from tests.kernels.utils import opcheck
 
 load_general_plugins()
@@ -28,11 +34,17 @@ NUM_TOKENS = [1, 2, 4, 7, 8, 16, 31, 32, 64, 128, 133, 192, 256, 512, 577, 1024,
 
 # Real hidden sizes from framework actual usage
 HIDDEN_SIZES = [
-    1024,   # Qwen3-0.6B
-    2048,   # Qwen3-30B-A3B / DeepSeek-V2-Lite
-    3584,   # DeepSeek-R1-Distill-Qwen-7B
-    6144,   # Qwen3-Coder-480B-A35B
-    7168,   # DeepSeek-V3
+    64,
+    128,
+    160,
+    192,
+    384,
+    768,
+    1024,  # Qwen3-0.6B
+    2048,  # Qwen3-30B-A3B / DeepSeek-V2-Lite
+    3584,  # DeepSeek-R1-Distill-Qwen-7B
+    6144,  # Qwen3-Coder-480B-A35B
+    7168,  # DeepSeek-V3
 ]
 
 SEEDS = [0]
@@ -62,14 +74,44 @@ def test_fused_add_rms_norm(
     x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
     residual = torch.randn_like(x) * scale
 
+    # Compute reference in fp32 for higher precision
+    layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
+    layer_fp32.weight.data = layer.weight.data.to(torch.float)
+    x_fp32 = x.to(torch.float)
+    residual_fp32 = residual.to(torch.float)
+
     # NOTE(woosuk): The reference implementation should be executed first
     # because the custom kernel is in-place.
-    ref_out, ref_residual = layer.forward_native(x, residual)
+    ref_out, ref_residual = layer_fp32.forward_native(x_fp32, residual_fp32)
     out, new_residual = layer(x, residual)
 
-    # LayerNorm operators typically have larger numerical errors
-    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(new_residual, ref_residual, atol=1e-2, rtol=1e-2)
+    # Print error metrics
+    # max_abs_error_out = (out.to(torch.float) - ref_out).abs().max().item()
+    # max_rel_error_out = ((out.to(torch.float) - ref_out).abs() / (ref_out.abs() + 1e-12)).max().item()  # noqa: E501
+    # max_abs_error_residual = (new_residual.to(torch.float) - ref_residual).abs().max().item()  # noqa: E501
+    # max_rel_error_residual = ((new_residual.to(torch.float) - ref_residual).abs() / (ref_residual.abs() + 1e-12)).max().item()  # noqa: E501
+    # print(f"  Output: max_abs_error={max_abs_error_out:.6e}, max_rel_error={max_rel_error_out:.6e}, diff_out={diff_out:.6e}")  # noqa: E501
+    # print(f"  Residual: max_abs_error={max_abs_error_residual:.6e}, max_rel_error={max_rel_error_residual:.6e}, diff_residual={diff_residual:.6e}")  # noqa: E501
+
+    # Compare using both assert_close and default_dice_tol
+    # Reference precision is fp32, tolerance based on target (out) dtype
+    atol = get_default_atol(out)
+    rtol = get_default_rtol(out)
+    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        new_residual.to(torch.float), ref_residual, atol=atol, rtol=rtol
+    )
+
+    # Check Dice tolerance
+    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_residual = calc_diff(new_residual.to(torch.float), ref_residual)
+
+    assert diff_out < default_dice_tol, (
+        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    )
+    assert diff_residual < default_dice_tol, (
+        f"Residual diff {diff_residual} exceeds dice tolerance {default_dice_tol}"
+    )
 
     # Check the custom kernel
     if x.dtype == torch.bfloat16:
