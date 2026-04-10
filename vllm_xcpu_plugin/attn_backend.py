@@ -1,7 +1,6 @@
 from typing import ClassVar
 
 import torch
-import torch_xcpu
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -44,8 +43,8 @@ class XcpuTritonMLABackend(MLACommonBackend):
         return XcpuTritonMLAImpl
 
     @staticmethod
-    def get_builder_cls() -> type["TritonAttentionMetadata"]:
-        return TritonAttentionMetadataBuilder
+    def get_builder_cls() -> type["TritonAttentionMetadata"]:  # type: ignore[override]
+        return TritonAttentionMetadataBuilder  # type: ignore[return-value]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -142,7 +141,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
+        attn_metadata: TritonAttentionMetadata,  # type: ignore[override]
         k_scale: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
@@ -153,7 +152,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
+        attn_metadata: TritonAttentionMetadata,  # type: ignore[override]
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.kv_cache_dtype.startswith("fp8"):
@@ -175,6 +174,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         block_table = attn_metadata.block_table
 
         # Run MQA
+        import torch_xcpu  # noqa: E402
         torch_xcpu.ops.unified_attention(
             q=q,  # [tokens, q_num_heads, kv_lora_rank + qk_rope]
             kv=kv_c_and_k_pe_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope]
@@ -196,7 +196,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
         kv_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
+        attn_metadata: TritonAttentionMetadata,  # type: ignore[override]
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -248,6 +248,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         prefill_output = output
 
         # Write the latent and rope to kv cache
+        import torch_xcpu  # noqa: E402
         if kv_cache is not None:
             torch_xcpu.ops.reshape_and_cache(
                 k_c_normed,  # [tokens, kv_lora_rank]
@@ -285,7 +286,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
-            decode_q = (decode_ql_nope, decode_q_pe)
+            decode_q = (decode_ql_nope, decode_q_pe)  # type: ignore[assignment]
 
             # call decode attn
             attn_out, lse = self._forward_decode(
@@ -344,7 +345,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
-        import torch_xcpu
+        import torch_xcpu  # noqa: E402
 
         if output_block_scale is not None:
             raise NotImplementedError(
