@@ -12,20 +12,6 @@ from vllm.logger import logger
 
 import vllm_xcpu_plugin.envs as envs_xcpu
 
-try:
-    import mpi4py.rc
-
-    mpi4py.rc.initialize = False
-    mpi4py.rc.finalize = False
-    from mpi4py import MPI
-except ImportError:
-    raise ImportError("mpi4py not found.") from None
-
-try:
-    import torch_mpi_ext
-except ImportError:
-    raise ImportError("torch_mpi_ext not found.") from None
-
 
 class CpuMPICommunicator(DeviceCommunicatorBase):
     def __init__(
@@ -36,6 +22,12 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
+
+        import mpi4py.rc
+
+        mpi4py.rc.initialize = False
+        mpi4py.rc.finalize = False
+        from mpi4py import MPI
 
         logger.info("CpuMPICommunicator initializing ...")
 
@@ -110,12 +102,16 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         self.comm_ptr_wrapper = torch.tensor([self.comm_ptr])
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        import torch_mpi_ext
+
         # logger.info(f"all_reduce rank: {self.mpi_group_rank}, "
         #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
         torch_mpi_ext.ops.all_reduce__wrapper(input_, self.comm_ptr_wrapper)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        import torch_mpi_ext
+
         # logger.info(f"all_gather rank: {self.mpi_group_rank}, "
         #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
         if dim < 0:
