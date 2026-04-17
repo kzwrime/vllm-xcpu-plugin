@@ -5,10 +5,12 @@ import os
 from typing import Any
 
 import torch
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
@@ -110,6 +112,23 @@ class McpuWorker(Worker):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def determine_available_memory(self) -> int:
+        available_memory = super().determine_available_memory()
+
+        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
+        if kv_cache_space is None:
+            return available_memory
+
+        kv_cache_space_bytes = kv_cache_space * GiB_bytes
+        logger.info(
+            "Force reset available kv cache memory from %sGiB to "
+            "VLLM_CPU_KVCACHE_SPACE: %sGiB",
+            format_gib(available_memory),
+            format_gib(kv_cache_space_bytes),
+        )
+        self.available_kv_cache_memory_bytes = kv_cache_space_bytes
+        return kv_cache_space_bytes
 
     def shutdown(self):
         return

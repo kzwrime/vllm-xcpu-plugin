@@ -79,13 +79,14 @@ class McpuPlatform(Platform):
         from vllm.utils.mem_constants import GiB_bytes
 
         kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
-        if kv_cache_space is None:
-            device_props = torch.mcpu.get_device_properties(device_id)  # type: ignore
-            return device_props.total_memory
-        else:
-            kv_cache_space *= GiB_bytes
-
+        assert kv_cache_space is not None, (
+            "VLLM_CPU_KVCACHE_SPACE must be set for MCPU backend."
+        )
+        kv_cache_space *= GiB_bytes
         return kv_cache_space
+
+        # device_props = torch.mcpu.get_device_properties(device_id)  # type: ignore
+        # return device_props.total_memory
 
     @classmethod
     def inference_mode(cls):

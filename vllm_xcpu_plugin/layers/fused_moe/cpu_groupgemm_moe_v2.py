@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
-
-# Modular kernel interface for CPU MoE
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
+from vllm.platforms import current_platform
 
 
-class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
+class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
     """
     CPU implementation of FusedMoEPermuteExpertsUnpermute.
     This wraps the existing CPUFusedMOE implementation to conform
@@ -21,31 +25,47 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     def __init__(
         self,
-        layer: torch.nn.Module,
+        moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
         topk_reduce: bool = True,
     ):
-        super().__init__(quant_config)
-        self.layer = layer
+        super().__init__(moe_config=moe_config, quant_config=quant_config)
         self.topk_reduce = topk_reduce
 
-    @property
-    def activation_formats(
-        self,
-    ) -> tuple[mk.FusedMoEActivationFormat, mk.FusedMoEActivationFormat]:
-        return (
-            mk.FusedMoEActivationFormat.Standard,
-            mk.FusedMoEActivationFormat.Standard,
-        )
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
 
-    def supports_chunking(self) -> bool:
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return current_platform.device_name in ("mcpu", "cpu")
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
         return False
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return weight_key is None and activation_key is None
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in [MoEActivation.SILU]
+
+    @staticmethod
+    def _supports_parallel_config(
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> bool:
+        return True
 
     def supports_expert_map(self) -> bool:
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        # CPUFusedMOE already handles weight application and reduction
+        # CPUFusedMOE already handles weight application and reduction.
         return TopKWeightAndReduceNoOP()
 
     def workspace_shapes(
@@ -57,13 +77,14 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # CPU implementation doesn't need intermediate workspaces
-        # It produces the final output directly
+        # CPU implementation does not need intermediate workspaces.
+        # It produces the final output directly.
         workspace13 = (0,)
         workspace2 = (0,)
         output = (M, K)
-        return (workspace13, workspace2, output)
+        return workspace13, workspace2, output
 
     def apply(
         self,
@@ -73,7 +94,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str,
+        activation: MoEActivation,
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
@@ -89,12 +110,16 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
           Permute -> Grouped GEMM -> Activation -> Grouped GEMM -> Unpermute and reduce.
         Note: topk_weights and topk_ids should already be computed by router.
         """
-        # No quantization support
+        activation_name = (
+            activation.value if isinstance(activation, MoEActivation) else activation
+        )
+
+        # No quantization support.
         assert a1q_scale is None, "CPU MoE does not support input quantization"
         assert a2_scale is None, "CPU MoE does not support intermediate quantization"
         assert self.quant_dtype is None, "CPU MoE does not support weight quantization"
 
-        # Allocate all intermediate buffers here instead of in fused_moe_compute
+        # Allocate all intermediate buffers here instead of in fused_moe_compute.
         M_full_padding = hidden_states.shape[0]
         topk = topk_weights.shape[1]
         K = hidden_states.shape[-1]
@@ -102,7 +127,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         device = hidden_states.device
         fdtype = hidden_states.dtype
 
-        # Allocate buffers using M_full_padding
+        # Allocate buffers using M_full_padding.
         permuted_hidden_states = torch.empty(
             (M_full_padding * topk, K), device=device, dtype=fdtype
         )
@@ -120,19 +145,18 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             (M_full_padding * topk, w1.shape[1] // 2), device=device, dtype=fdtype
         )
 
-        # Handle expert_num_tokens: allocate empty tensor if None
         if expert_tokens_meta is None:
-            _expert_num_tokens = torch.empty(0, device=device, dtype=torch.int32)
+            expert_num_tokens = torch.empty(0, device=device, dtype=torch.int32)
         else:
-            _expert_num_tokens = expert_tokens_meta.expert_num_tokens
+            expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
-        # Handle expert_map default value
+        # Handle expert_map default value.
         if expert_map is None:
             expert_map = torch.arange(w1.shape[0], device=device, dtype=torch.int32)
         else:
             expert_map = expert_map.to(torch.int32)
 
-        # Only allocate workspace_unpermute_and_reduce if topk_reduce=True
+        # Only allocate workspace_unpermute_and_reduce if topk_reduce=True.
         if self.topk_reduce:
             workspace_unpermute_and_reduce = torch.empty(
                 M_full_padding, K, dtype=topk_weights.dtype, device=device
@@ -140,7 +164,7 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         else:
             workspace_unpermute_and_reduce = torch.empty(0, device=device)
 
-        # Call the fused C++ operator from torch_xcpu
+        # Call the fused C++ operator from torch_xcpu.
         from torch_xcpu import ops as xcpu_ops
 
         xcpu_ops.fused_moe_compute(
@@ -150,12 +174,12 @@ class CPUGroupGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids.to(torch.int32),
-            activation=activation,
+            activation=activation_name,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             a1q_scale=a1q_scale,
             a2_scale=a2_scale,
-            expert_num_tokens=_expert_num_tokens,
+            expert_num_tokens=expert_num_tokens,
             apply_router_weight_on_input=apply_router_weight_on_input,
             topk_reduce=self.topk_reduce,
             permuted_hidden_states=permuted_hidden_states,
