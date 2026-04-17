@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import faulthandler
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
@@ -9,12 +10,15 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+import vllm_xcpu_plugin.envs as envs_xcpu
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
 
+faulthandler.enable()
 logger = init_logger(__name__)
 
 
@@ -155,8 +159,11 @@ class McpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        # TODO modify
-        return "vllm.distributed.device_communicators.cpu_communicator.CpuCommunicator"  # noqa
+        if envs_xcpu.VLLM_CPU_USE_MPI:
+            return (
+                "vllm_xcpu_plugin.distributed.cpu_mpi_communicator.CpuMPICommunicator"  # noqa
+            )
+        return "vllm_xcpu_plugin.distributed.xcpu_communicator.CpuCommunicator"  # noqa
 
     @classmethod
     def device_count(cls) -> int:

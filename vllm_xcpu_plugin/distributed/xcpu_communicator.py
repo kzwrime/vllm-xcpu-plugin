@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-from typing import Any
-
 import torch
 from torch.distributed import ProcessGroup
 from vllm.distributed.device_communicators.all2all import (
@@ -13,7 +10,6 @@ from vllm.distributed.device_communicators.all2all import (
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from vllm.distributed.utils import pickle
 from vllm.logger import init_logger
 
 import vllm_xcpu_plugin.envs as envs_xcpu
@@ -30,7 +26,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
-        self.dist_module = torch.distributed
+
+        self.get_cpu_view_from_mcpu_tensor = torch.mcpu.get_cpu_view_from_mcpu_tensor  # type: ignore
+        self.get_mcpu_view_from_cpu_tensor = torch.mcpu.get_mcpu_view_from_cpu_tensor  # type: ignore
 
         if self.use_all2all:
             self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
@@ -45,7 +43,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
                     cpu_group=self.cpu_group
                 )
             elif self.all2all_backend == "torch_all_to_all_single":  # type: ignore[has-type]
-                # do nothing
                 self.all2all_manager = All2AllManagerBase(cpu_group=self.cpu_group)
             else:
                 raise ValueError(
@@ -53,8 +50,29 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 )
             logger.info("Using all2all_backend = %s", self.all2all_backend)
 
+    def _requires_cpu_staging(self, tensor: torch.Tensor) -> bool:
+        return tensor.device.type != "cpu"
+
+    def _to_cpu_from_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._requires_cpu_staging(tensor):
+            if self.get_cpu_view_from_mcpu_tensor is not None:
+                return self.get_cpu_view_from_mcpu_tensor(tensor)
+            return tensor.to("cpu")
+        return tensor
+
+    # def _to_device_from_cpu(
+    #     self, tensor: torch.Tensor, device: torch.device
+    # ) -> torch.Tensor:
+    #     if device.type == "cpu":
+    #         return tensor
+    #     return tensor.to(device)
+
     def all_reduce(self, input_):
-        self.dist_module.all_reduce(input_, group=self.device_group)
+        if self._requires_cpu_staging(input_):
+            cpu_input = self._to_cpu_from_device(input_)
+            torch.distributed.all_reduce(cpu_input, group=self.cpu_group)
+            return input_
+        torch.distributed.all_reduce(input_, group=self.cpu_group)
         return input_
 
     def gather(
@@ -73,15 +91,17 @@ class CpuCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Allocate output tensor.
+        cpu_input = self._to_cpu_from_device(input_)
         if self.rank_in_group == dst:
-            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+            gather_list = [
+                self._to_cpu_from_device(torch.empty_like(input_))
+                for _ in range(world_size)
+            ]
         else:
             gather_list = None
 
-        # Gather.
-        self.dist_module.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+        torch.distributed.gather(
+            cpu_input, gather_list, dst=self.ranks[dst], group=self.cpu_group
         )
 
         if self.rank_in_group == dst:
@@ -99,13 +119,13 @@ class CpuCommunicator(DeviceCommunicatorBase):
         # stack-style all-gather has compatibility issues with
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        # Allocate output tensor.
+        cpu_input = self._to_cpu_from_device(input_)
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        # All-gather.
-        self.dist_module.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
+        cpu_output_tensor = self._to_cpu_from_device(output_tensor)
+        torch.distributed.all_gather_into_tensor(
+            cpu_output_tensor, cpu_input, group=self.cpu_group
         )
 
         # Reshape
@@ -118,18 +138,30 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         return output_tensor
 
-    # def send_tensor_dict(
-    #     self,
-    #     tensor_dict: dict[str, torch.Tensor | Any],
-    #     dst: int,
-    # ) -> None:
-    #     return self.dist_module.send_tensor_dict(tensor_dict, dst)
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if not self._requires_cpu_staging(input_):
+            return super().reduce_scatter(input_, dim)
 
-    # def recv_tensor_dict(
-    #     self,
-    #     src: int,
-    # ) -> dict[str, torch.Tensor | Any]:
-    #     return self.dist_module.recv_tensor_dict(src)
+        world_size = self.world_size
+        if world_size == 1:
+            return input_
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
+        if dim < 0:
+            dim += input_.dim()
+
+        input = input_.movedim(0, dim).contiguous()
+        assert input.shape[0] % world_size == 0
+        cpu_input = self._to_cpu_from_device(input)
+        chunk_size = cpu_input.shape[0] // world_size
+        output_shape = (chunk_size,) + cpu_input.shape[1:]
+        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        cpu_output = self._to_cpu_from_device(output)
+        torch.distributed.reduce_scatter_tensor(
+            cpu_output, cpu_input, group=self.cpu_group
+        )
+        return output.movedim(0, dim).contiguous()
 
     def dispatch(  # type: ignore[override]
         self,
@@ -154,102 +186,3 @@ class CpuCommunicator(DeviceCommunicatorBase):
             hidden_states, is_sequence_parallel
         )
         return hidden_states
-
-
-class _CPUSHMDistributed:
-    def __init__(self, communicator: CpuCommunicator):
-        instance_identifier = os.environ["VLLM_DIST_IDENT"]
-        unique_name = communicator.unique_name
-        instance_identifier = f"{instance_identifier}-{unique_name}"
-        self.communicator = communicator
-
-        group_ranks = [str(rank) for rank in self.communicator.ranks]
-        shm_group_identifier = f"[{'-'.join(group_ranks)}]"
-        self.group_name = f"{instance_identifier}-{shm_group_identifier}-cpushm"
-
-        self.handle = self._init_cpu_shm()
-
-    def _init_cpu_shm(self) -> int:
-        handle = torch.ops._C.init_shm_manager(
-            self.group_name,
-            self.communicator.world_size,
-            self.communicator.rank,
-        )
-        torch.distributed.barrier(self.communicator.device_group)
-        torch.ops._C.join_shm_manager(
-            handle,
-            self.group_name,
-        )
-        torch.distributed.barrier(self.communicator.device_group)
-
-        return handle
-
-    def all_reduce(
-        self, input: torch.Tensor, group: ProcessGroup | None = None
-    ) -> None:
-        torch.ops._C.shm_allreduce(self.handle, input)
-
-    def gather(
-        self,
-        input: torch.Tensor,
-        gather_list: list[torch.Tensor] | None,
-        dst: int = -1,
-        group: ProcessGroup | None = None,
-    ) -> None:
-        assert group is not None
-        # Note: different from the torch gather, here we use local dst rank.
-        torch.ops._C.shm_gather(
-            self.handle,
-            input,
-            gather_list,
-            torch.distributed.get_group_rank(group, dst),
-        )
-
-    def all_gather_into_tensor(
-        self,
-        output: torch.Tensor,
-        input: torch.Tensor,
-        group: ProcessGroup | None = None,
-    ) -> None:
-        torch.ops._C.shm_all_gather(self.handle, input, output)
-
-    def send_tensor_dict(
-        self,
-        tensor_dict: dict[str, torch.Tensor | Any],
-        dst: int,
-    ) -> None:
-        key_list = list(tensor_dict.keys())
-        value_list = list(tensor_dict.values())
-        size_list = []
-        for v in value_list:
-            if not isinstance(v, torch.Tensor):
-                raise RuntimeError("CpuCommunicator only supports sending tensors.")
-            size_list.append(v.size())
-        key_size_tensor = torch.frombuffer(
-            pickle.dumps([key_list, size_list]), dtype=torch.uint8
-        )
-        value_list.append(key_size_tensor)
-
-        torch.ops._C.shm_send_tensor_list(self.handle, value_list, dst)
-
-        return None
-
-    def recv_tensor_dict(
-        self,
-        src: int,
-    ) -> dict[str, torch.Tensor | Any]:
-        tensor_list = torch.ops._C.shm_recv_tensor_list(self.handle, src)
-
-        value_list: list[torch.Tensor] = tensor_list[:-1]
-        key_size_tensor = tensor_list[-1]
-
-        key_size = pickle.loads(key_size_tensor.numpy().tobytes())
-        key_list = key_size[0]
-        size_list = key_size[1]
-        assert len(key_list) == len(size_list)
-        assert len(key_list) == len(value_list)
-
-        tensor_dict: dict[str, torch.Tensor] = {}
-        for key, size, t in zip(key_list, size_list, value_list):
-            tensor_dict[key] = t.view(size)
-        return tensor_dict

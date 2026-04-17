@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import os
 from typing import Any
 
 import torch
@@ -67,6 +68,7 @@ class McpuWorker(Worker):
         # os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         # os.environ["LOCAL_RANK"] = str(self.local_rank)
 
+        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
