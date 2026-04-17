@@ -6,7 +6,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-from vllm.platforms import current_platform
 
 
 def rms_norm(
@@ -53,10 +52,7 @@ class XcpuRMSNorm(RMSNorm):
     ) -> None:
         super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
 
-        if current_platform.is_cpu():
-            self._forward_method = self.forward_cpu
-
-    def forward_cpu(
+    def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
@@ -90,10 +86,7 @@ class XcpuRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-        if current_platform.is_cpu():
-            self._forward_method = self.forward_cpu
-
-    def forward_cpu(
+    def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -127,11 +120,9 @@ class XcpuSiluAndMul(SiluAndMul):
 
     def __init__(self):
         super().__init__()
-        if current_platform.is_cpu():
-            self._forward_method = self.forward_cpu
 
     @staticmethod
-    def forward_cpu(x: torch.Tensor) -> torch.Tensor:
+    def forward_oot(x: torch.Tensor) -> torch.Tensor:
         import torch_xcpu
 
         d = x.shape[-1] // 2
@@ -165,11 +156,7 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             prefix,
         )
 
-        if current_platform.is_cpu():
-            self._forward_method = self.forward_cpu
-
-    def forward_cpu(self, input_):
-        # import torch_xcpu
+    def forward_oot(self, input_):
 
         if self.tp_size > 1:
             import torch_xcpu.ops as ops

@@ -1,95 +1,113 @@
-import vllm.envs as envs
-from vllm.logger import logger
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
+from typing import Any
+
+import torch
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.worker.cpu_worker import CPUWorker
+from vllm.profiler.wrapper import TorchProfilerWrapper
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
+from vllm.v1.worker.workspace import init_workspace_manager
 
-import vllm_xcpu_plugin.envs as envs_xcpu
+from .model_runner import McpuModelRunner, McpuModelRunnerV2
+
+logger = init_logger(__name__)
 
 
-class XcpuWorker(CPUWorker):
+class McpuWorker(Worker):
+    """A mcpu worker class."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        is_driver_worker: bool = False,
+    ):
+        super().__init__(
+            vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
+        )
+        device_config = self.device_config
+        print(f"device_config: {device_config}")
+        assert device_config.device_type == "privateuseone"
+
+        # Torch profiler. Enabled and configured through profiler_config.
+        self.profiler: Any | None = None
+        profiler_config = vllm_config.profiler_config
+        if profiler_config.profiler == "torch":
+            worker_name = f"{vllm_config.instance_id}-rank-{self.rank}"
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=worker_name,
+                local_rank=self.local_rank,
+                activities=["CPU", "PrivateUse1"],
+            )
+
     def init_device(self):
-        world_rank_across_dp = (
-            self.parallel_config.data_parallel_rank * self.parallel_config.world_size
-        ) + self.rank
-        world_size_across_dp = self.parallel_config.world_size_across_dp
+        # device = self.device_config.device
+        self.device = torch.device("mcpu:0")
+        torch.accelerator.set_device_index(self.device)
+        torch.accelerator.empty_cache()
+        # self.init_gpu_memory = torch.xpu.get_device_properties(
+        #     self.local_rank
+        # ).total_memory
 
-        logger.info(
-            (
-                "rank: %d, local_rank: %d, world_size: %d, dist_backend: %s, "
-                "self.distributed_init_method: %s, "
-                "world_rank_across_dp: %d, world_size_across_dp: %d"
-            ),
+        # ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
+        # ENV_LOCAL_WORLD_SIZE = os.getenv(
+        #     "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
+        # )
+        # os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
+        # os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
+        # os.environ["LOCAL_RANK"] = str(self.local_rank)
+
+        init_worker_distributed_environment(
+            self.vllm_config,
             self.rank,
-            self.local_rank,
-            self.parallel_config.world_size,
-            current_platform.dist_backend,
             self.distributed_init_method,
-            world_rank_across_dp,
-            world_size_across_dp,
+            self.local_rank,
+            current_platform.dist_backend,
         )
 
-        if envs_xcpu.VLLM_CPU_USE_MPI:
-            import mpi4py.rc
+        # global all_reduce needed for overall oneccl warm up
+        # torch.distributed.all_reduce(torch.zeros(1).xpu())
 
-            mpi4py.rc.initialize = False
-            mpi4py.rc.finalize = False
-            from mpi4py import MPI
+        # Set random seed.
+        set_random_seed(self.model_config.seed)
 
-            if not MPI.Is_initialized():
-                MPI.Init()
-            self.mpi_finalize = MPI.Finalize
-            self.mpi_initialized = True
-            self.mpi_world_comm = MPI.COMM_WORLD
+        # Now take memory snapshot after NCCL is initialized
+        gc.collect()
+        torch.accelerator.empty_cache()
 
-            # mpi_rank = self.mpi_world_comm.Get_rank()
-            # mpi_size = self.mpi_world_comm.Get_size()
+        # take current memory snapshot
+        self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+        self.requested_memory = request_memory(init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+        logger.debug(
+            "worker requested memory: %sGiB", format_gib(self.requested_memory)
+        )
 
-            """
-            Warning: In DP + Dense Model, a global gloo communication group 
-              may not be established; instead, DP-Size gloo communication 
-              groups will be established.
-            vllm/distributed/parallel_state.py:init_distributed_environment()
-              may not adjust the distributed_init_method
-            """
-            # assert mpi_rank == world_rank_across_dp, (
-            #     f"mpi_rank: {mpi_rank} != "
-            #     f"global_world_rank: {world_rank_across_dp}")
-            # assert mpi_size == world_size_across_dp, (
-            #     f"mpi_world_size: {mpi_size} != "
-            #     f"world_size_across_dp: {world_size_across_dp}")
+        # Initialize workspace manager
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
 
-            import socket
+        # Construct the model runner
+        model_runner = (
+            McpuModelRunnerV2 if self.use_v2_model_runner else McpuModelRunner
+        )
+        self.model_runner = model_runner(  # type: ignore
+            self.vllm_config, self.device
+        )
 
-            host_name = socket.gethostname()
-            host_ip = socket.gethostbyname(host_name)
-            logger.info(
-                "rank: %d, %s@%s, MPI.Is_initialized(): %d",
-                self.rank,
-                host_name,
-                host_ip,
-                MPI.Is_initialized(),
-            )
+        if self.rank == 0:
+            # If usage stat is enabled, collect relevant info.
+            report_usage_stats(self.vllm_config)
 
-        # Call init_worker_distributed_environment、CPUModelRunner...
-        super().init_device()
-
-        # If the EPLB MPI comm backend is requested, verify that MPI is
-        # initialized and that MPI global rank matches torch global rank.
-        if envs.VLLM_EPLB_COMM_BACKEND == "mpi":
-            assert envs_xcpu.VLLM_CPU_USE_MPI, (
-                "VLLM_EPLB_COMM_BACKEND=mpi requires VLLM_CPU_USE_MPI=1"
-            )
-            from mpi4py import MPI  # type: ignore[import]
-
-            mpi_rank = MPI.COMM_WORLD.Get_rank()
-            assert mpi_rank == world_rank_across_dp, (
-                f"[EPLB MPI backend] MPI global rank {mpi_rank} != "
-                f"torch global rank {world_rank_across_dp}. "
-                "Ranks must match for direct MPI<->torch global rank mapping."
-            )
-            logger.info(
-                "[EPLB] MPI backend rank check passed: "
-                "mpi_rank=%d == torch_global_rank=%d",
-                mpi_rank,
-                world_rank_across_dp,
-            )
+    def shutdown(self):
+        return

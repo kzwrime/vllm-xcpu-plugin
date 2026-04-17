@@ -16,10 +16,8 @@ vLLM 通过 setuptools entry_points 发现插件：
 
 ```python
 # setup.py
-entry_points={
-    "vllm.general_plugins": [
-        "xcpu_custom_ops = vllm_xcpu_plugin:register_ops"
-    ]
+entry_points = {
+    "vllm.general_plugins": ["xcpu_custom_ops = vllm_xcpu_plugin:register_ops"]
 }
 ```
 

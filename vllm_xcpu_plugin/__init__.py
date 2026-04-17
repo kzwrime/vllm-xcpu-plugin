@@ -5,7 +5,7 @@ from vllm.logger import logger
 
 
 def xcpu_platform_plugin() -> str | None:
-    return "vllm_xcpu_plugin.platform.XcpuPlatform"
+    return "vllm_xcpu_plugin.platform.McpuPlatform"
 
 
 def register_attn_backend():
@@ -16,4 +16,4 @@ def register_attn_backend():
 def register_ops():
     logger.info("register_ops")
     import vllm_xcpu_plugin.custom_ops  # noqa
-    import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
+    # import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
