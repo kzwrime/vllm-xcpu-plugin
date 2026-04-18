@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
 
-class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
+class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
@@ -147,10 +147,16 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig | None = None,  # Not used
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         """
         Synchronous wrapper for prepare_async.
         """
+        if defer_input_quant:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} does not support defer_input_quant=True. "
+                "Please select an MoE kernel that accepts quantized inputs."
+            )
         receiver = self.prepare_async(
             a1,
             topk_weights,
@@ -171,7 +177,13 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig | None = None,
-    ) -> Callable:
+        defer_input_quant: bool = False,
+    ) -> mk.ReceiverType:
+        if defer_input_quant:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} does not support defer_input_quant=True. "
+                "Please select an MoE kernel that accepts quantized inputs."
+            )
 
         assert not apply_router_weight_on_input
         assert a1.shape[0] <= self.max_num_tokens, (
@@ -303,7 +315,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
-        receiver = self.finalize_async(
+        receiver, _ = self.finalize_async(
             output,
             fused_expert_output,
             topk_weights,
@@ -321,7 +333,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
-    ) -> Callable:
+    ) -> tuple[Callable, Callable]:
         from torch_xcpu import ops as xcpu_ops
 
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
@@ -374,4 +386,4 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalize):
         def _receiver():
             pass
 
-        return _receiver
+        return _receiver, lambda: None
