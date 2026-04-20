@@ -126,14 +126,50 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 "XcpuTritonMLA V1 with q_pad_num_heads not yet supported"
             )
 
-    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
-        # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-        tmp = torch.bmm(x, self.W_UV)
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        def get_and_maybe_dequant_weights(layer):  # type: ignore[override]
+            return layer.weight
 
-        # Convert from (N, B, V) to (B, N * V)
-        out.copy_(tmp.transpose(0, 1).reshape_as(out))
+        kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
+        assert kv_b_proj_weight.shape == (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        ), (
+            f"{kv_b_proj_weight.shape=}, "
+            f"{self.kv_lora_rank=}, "
+            f"{self.num_heads=}, "
+            f"{self.qk_nope_head_dim=}, "
+            f"{self.v_head_dim=}"
+        )
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+
+        W_UK, W_UV = kv_b_proj_weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+
+        # Convert from (L, N, V) to (N, L, V)
+        self.W_UV = W_UV.transpose(0, 1).contiguous()
+        # Convert from (L, N, P) to (N, P, L)
+        self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+
+    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+        # # Convert from (B, N, L) to (N, B, L)
+        # x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        # # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+        # tmp = torch.bmm(x, self.W_UV)
+        # # Convert from (N, B, V) to (B, N * V)
+        # out.copy_(tmp.transpose(0, 1).reshape_as(out))
+
+        # x = x.view(-1, self.num_heads, self.kv_lora_rank)
+        # out = out.view(-1, self.num_heads, self.v_head_dim)
+        import torch_xcpu
+
+        torch_xcpu.ops.einsum_mhk_hkn_to_mhn(x, self.W_UV, out)
+        # out = out.view(-1, self.num_heads * self.v_head_dim)
 
     def _forward_prefill(
         self,
@@ -175,6 +211,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # Run MQA
         import torch_xcpu  # noqa: E402
+
         torch_xcpu.ops.unified_attention(
             q=q,  # [tokens, q_num_heads, kv_lora_rank + qk_rope]
             kv=kv_c_and_k_pe_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope]
@@ -249,6 +286,7 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # Write the latent and rope to kv cache
         import torch_xcpu  # noqa: E402
+
         if kv_cache is not None:
             torch_xcpu.ops.reshape_and_cache(
                 k_c_normed,  # [tokens, kv_lora_rank]
@@ -273,19 +311,23 @@ class XcpuTritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             decode_q_nope, decode_q_pe = decode_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-
-            # Convert from (B, N, P) to (N, B, P)
-            decode_q_nope = decode_q_nope.transpose(0, 1)
-
-            # Pads the head_dim if necessary (for the underlying kernel)
-            N, B, P = decode_q_nope.shape
+            B, N, P = decode_q_nope.shape
             _, _, L = self.W_UK_T.shape
 
-            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-            decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
+            # # Convert from (B, N, P) to (N, B, P)
+            # decode_q_nope = decode_q_nope.transpose(0, 1)
+            # # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            # decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
+            # # Convert from (N, B, L) to (B, N, L)
+            # decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
-            # Convert from (N, B, L) to (B, N, L)
-            decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            decode_ql_nope = decode_q_nope.new_empty((B, N, L))
+            import torch_xcpu
+
+            torch_xcpu.ops.einsum_mhk_hkn_to_mhn(
+                decode_q_nope, self.W_UK_T, decode_ql_nope
+            )
+
             decode_q = (decode_ql_nope, decode_q_pe)  # type: ignore[assignment]
 
             # call decode attn
