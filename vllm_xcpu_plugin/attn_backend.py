@@ -26,7 +26,7 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_impl_cls() -> type["XcpuTritonAttentionImpl"]:
@@ -69,7 +69,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
-            return output.fill_(0)
+            return output
 
         assert attn_metadata.use_cascade is False
 

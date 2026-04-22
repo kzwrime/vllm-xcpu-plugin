@@ -179,7 +179,7 @@ class McpuPlatform(Platform):
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
-        return True
+        return False
 
     # @classmethod
     # def insert_blocks_to_device(
