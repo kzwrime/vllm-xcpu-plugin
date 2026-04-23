@@ -188,19 +188,21 @@ class McpuWorker(Worker):
             report_usage_stats(self.vllm_config)
 
     def determine_available_memory(self) -> int:
-        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
-        if kv_cache_space is not None:
-            kv_cache_space_bytes = kv_cache_space * GiB_bytes
-            logger.info(
-                "Force reset available kv cache memory to "
-                "VLLM_CPU_KVCACHE_SPACE: %sGiB",
-                format_gib(kv_cache_space_bytes),
-            )
-            self.available_kv_cache_memory_bytes = kv_cache_space_bytes
-            return kv_cache_space_bytes
-
         available_memory = super().determine_available_memory()
-        return available_memory
+
+        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
+        if kv_cache_space is None:
+            return available_memory
+
+        kv_cache_space_bytes = kv_cache_space * GiB_bytes
+        logger.info(
+            "Force reset available kv cache memory from %sGiB to "
+            "VLLM_CPU_KVCACHE_SPACE: %sGiB",
+            format_gib(available_memory),
+            format_gib(kv_cache_space_bytes),
+        )
+        self.available_kv_cache_memory_bytes = kv_cache_space_bytes
+        return kv_cache_space_bytes
 
     def shutdown(self):
         return
