@@ -46,12 +46,12 @@ class McpuPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
 
-        return AttentionBackendEnum.TORCH_ATTN.get_path()
+        return AttentionBackendEnum.TRITON_ATTN.get_path()
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
         return [
-            AttentionBackendEnum.TORCH_ATTN,
+            AttentionBackendEnum.TRITON_ATTN,
         ]
 
     @classmethod
