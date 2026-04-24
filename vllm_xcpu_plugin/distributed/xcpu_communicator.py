@@ -26,9 +26,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
-
-        self.get_cpu_view_from_mcpu_tensor = torch.mcpu.get_cpu_view_from_mcpu_tensor  # type: ignore
-        self.get_mcpu_view_from_cpu_tensor = torch.mcpu.get_mcpu_view_from_cpu_tensor  # type: ignore
+        self.dist_module = torch.distributed
 
         if self.use_all2all:
             self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
@@ -50,28 +48,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 )
             logger.info("Using all2all_backend = %s", self.all2all_backend)
 
-    def _requires_cpu_staging(self, tensor: torch.Tensor) -> bool:
-        return tensor.device.type != "cpu"
-
-    def _to_cpu_from_device(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self._requires_cpu_staging(tensor):
-            if self.get_cpu_view_from_mcpu_tensor is not None:
-                return self.get_cpu_view_from_mcpu_tensor(tensor)
-            return tensor.to("cpu")
-        return tensor
-
-    # def _to_device_from_cpu(
-    #     self, tensor: torch.Tensor, device: torch.device
-    # ) -> torch.Tensor:
-    #     if device.type == "cpu":
-    #         return tensor
-    #     return tensor.to(device)
-
     def all_reduce(self, input_):
-        if self._requires_cpu_staging(input_):
-            cpu_input = self._to_cpu_from_device(input_)
-            torch.distributed.all_reduce(cpu_input, group=self.cpu_group)
-            return input_
         torch.distributed.all_reduce(input_, group=self.cpu_group)
         return input_
 
@@ -91,17 +68,15 @@ class CpuCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        cpu_input = self._to_cpu_from_device(input_)
+        # Allocate output tensor.
         if self.rank_in_group == dst:
-            gather_list = [
-                self._to_cpu_from_device(torch.empty_like(input_))
-                for _ in range(world_size)
-            ]
+            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
         else:
             gather_list = None
 
-        torch.distributed.gather(
-            cpu_input, gather_list, dst=self.ranks[dst], group=self.cpu_group
+        # Gather.
+        self.dist_module.gather(
+            input_, gather_list, dst=self.ranks[dst], group=self.device_group
         )
 
         if self.rank_in_group == dst:
@@ -119,13 +94,13 @@ class CpuCommunicator(DeviceCommunicatorBase):
         # stack-style all-gather has compatibility issues with
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        cpu_input = self._to_cpu_from_device(input_)
+        # Allocate output tensor.
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        cpu_output_tensor = self._to_cpu_from_device(output_tensor)
-        torch.distributed.all_gather_into_tensor(
-            cpu_output_tensor, cpu_input, group=self.cpu_group
+        # All-gather.
+        self.dist_module.all_gather_into_tensor(
+            output_tensor, input_, group=self.device_group
         )
 
         # Reshape
@@ -137,31 +112,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
         return output_tensor
-
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        if not self._requires_cpu_staging(input_):
-            return super().reduce_scatter(input_, dim)
-
-        world_size = self.world_size
-        if world_size == 1:
-            return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
-        if dim < 0:
-            dim += input_.dim()
-
-        input = input_.movedim(0, dim).contiguous()
-        assert input.shape[0] % world_size == 0
-        cpu_input = self._to_cpu_from_device(input)
-        chunk_size = cpu_input.shape[0] // world_size
-        output_shape = (chunk_size,) + cpu_input.shape[1:]
-        output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-        cpu_output = self._to_cpu_from_device(output)
-        torch.distributed.reduce_scatter_tensor(
-            cpu_output, cpu_input, group=self.cpu_group
-        )
-        return output.movedim(0, dim).contiguous()
 
     def dispatch_router_logits(
         self,
