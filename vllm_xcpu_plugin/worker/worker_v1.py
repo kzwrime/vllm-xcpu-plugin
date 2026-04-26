@@ -62,6 +62,14 @@ class McpuWorker(Worker):
                 activities=["CPU", "PrivateUse1"],
             )
 
+            def _eplb_on_profiler_stop() -> None:
+                eplb = getattr(getattr(self, "model_runner", None), "eplb_state", None)
+                if eplb is not None:
+                    logger.info("Profiler stopped, dumping EPLB statistics window.")
+                    eplb.log_all_statistics(is_profiler_stop=True)
+
+            self.profiler.add_stop_callback(_eplb_on_profiler_stop)
+
     def init_device(self):
         world_rank_across_dp = (
             self.parallel_config.data_parallel_rank * self.parallel_config.world_size
@@ -123,6 +131,26 @@ class McpuWorker(Worker):
                 host_name,
                 host_ip,
                 MPI.Is_initialized(),
+            )
+            if envs.VLLM_EPLB_COMM_BACKEND == "mpi":
+                mpi_rank = self.mpi_world_comm.Get_rank()
+                mpi_size = self.mpi_world_comm.Get_size()
+                assert mpi_rank == world_rank_across_dp, (
+                    f"MPI rank mismatch for EPLB: mpi_rank={mpi_rank}, "
+                    f"torch_world_rank={world_rank_across_dp}"
+                )
+                assert mpi_size == world_size_across_dp, (
+                    f"MPI world size mismatch for EPLB: mpi_size={mpi_size}, "
+                    f"torch_world_size={world_size_across_dp}"
+                )
+                logger.info(
+                    "EPLB MPI backend verified: mpi_rank=%d world_size=%d",
+                    mpi_rank,
+                    mpi_size,
+                )
+        elif envs.VLLM_EPLB_COMM_BACKEND == "mpi":
+            raise RuntimeError(
+                "VLLM_EPLB_COMM_BACKEND=mpi requires VLLM_CPU_USE_MPI=1."
             )
 
         # device = self.device_config.device
