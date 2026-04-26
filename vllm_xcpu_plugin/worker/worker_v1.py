@@ -36,6 +36,8 @@ class McpuWorker(Worker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        import torch_mcpu  # noqa
+
         super().__init__(
             vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
         )
@@ -71,6 +73,8 @@ class McpuWorker(Worker):
             self.profiler.add_stop_callback(_eplb_on_profiler_stop)
 
     def init_device(self):
+        import torch_mcpu  # noqa
+
         world_rank_across_dp = (
             self.parallel_config.data_parallel_rank * self.parallel_config.world_size
         ) + self.rank
