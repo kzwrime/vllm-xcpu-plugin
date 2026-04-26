@@ -15,7 +15,6 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
-from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_xcpu_plugin.envs as envs_xcpu
@@ -193,12 +192,12 @@ class McpuWorker(Worker):
         torch.accelerator.empty_cache()
 
         # take current memory snapshot
-        self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
-        # kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
-        # assert kv_cache_space is not None
-        # self.requested_memory = kv_cache_space * GiB_bytes
-        self.requested_memory = request_memory(init_snapshot, self.cache_config)
+        self.init_snapshot = MemorySnapshot(device=self.device)
+        logger.info("worker init memory snapshot: %r", self.init_snapshot)
+        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
+        assert kv_cache_space is not None
+        self.requested_memory = kv_cache_space * GiB_bytes
+        # self.requested_memory = request_memory(init_snapshot, self.cache_config)
         # logger.debug(
         #     "worker requested memory: %sGiB", format_gib(self.requested_memory)
         # )
