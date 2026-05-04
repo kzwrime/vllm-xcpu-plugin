@@ -11,6 +11,8 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_xcpu_plugin import mcpu_triton_utils as mcpu_tl
+
 if TYPE_CHECKING:
     pass
 
@@ -29,6 +31,15 @@ class McpuModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
+
+        self._postprocess_triton()
+
+    def _postprocess_triton(self) -> None:
+        import vllm.v1.worker.block_table
+
+        vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
+            mcpu_tl.compute_slot_mapping_kernel
+        )
 
 
 class McpuModelRunnerV2(GPUModelRunnerV2):
