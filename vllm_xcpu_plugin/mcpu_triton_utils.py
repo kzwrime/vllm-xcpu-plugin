@@ -40,3 +40,33 @@ def _compute_slot_mapping_kernel_impl(
 
 
 compute_slot_mapping_kernel = _FuncWrapper(_compute_slot_mapping_kernel_impl)
+
+
+def _zero_kv_blocks_kernel_impl(
+    seg_addrs: torch.Tensor,
+    block_ids: torch.Tensor,
+    n_blocks: int,
+    N_SEGS: int,
+    PAGE_SIZE_EL: int,
+    BLOCK_SIZE: int,
+) -> None:
+    torch.ops.mcpu.zero_kv_blocks_kernel_impl(
+        seg_addrs,
+        block_ids,
+        n_blocks,
+        N_SEGS,
+        PAGE_SIZE_EL,
+    )
+
+
+zero_kv_blocks_kernel = _FuncWrapper(_zero_kv_blocks_kernel_impl)
+
+
+def patch_vllm_triton_kernels() -> None:
+    import vllm.v1.worker.block_table
+    import vllm.v1.worker.utils
+
+    vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
+        compute_slot_mapping_kernel
+    )
+    vllm.v1.worker.utils._zero_kv_blocks_kernel = zero_kv_blocks_kernel

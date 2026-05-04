@@ -35,11 +35,7 @@ class McpuModelRunner(GPUModelRunner):
         self._postprocess_triton()
 
     def _postprocess_triton(self) -> None:
-        import vllm.v1.worker.block_table
-
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
-            mcpu_tl.compute_slot_mapping_kernel
-        )
+        mcpu_tl.patch_vllm_triton_kernels()
 
 
 class McpuModelRunnerV2(GPUModelRunnerV2):
@@ -52,6 +48,7 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        mcpu_tl.patch_vllm_triton_kernels()
 
 
 @contextmanager
