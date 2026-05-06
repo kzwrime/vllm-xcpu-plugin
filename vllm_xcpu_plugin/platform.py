@@ -62,6 +62,17 @@ class McpuPlatform(Platform):
         torch.mcpu.set_device(device)  # type: ignore
 
     @classmethod
+    def current_device(cls) -> torch.device:
+        """
+        Return the torch device used for tensors allocated by vLLM.
+
+        vLLM model code calls current_platform.current_device() when creating
+        some modules.  The xcpu backend is registered as PrivateUse1, while the
+        user-facing name is mcpu, so use the canonical torch device type here.
+        """
+        return torch.device(cls.device_type)
+
+    @classmethod
     def get_device_capability(
         cls,
         device_id: int = 0,
@@ -104,7 +115,13 @@ class McpuPlatform(Platform):
 
         cache_config = vllm_config.cache_config
         if not cache_config.user_specified_block_size:
-            cache_config.block_size = 64
+            model_config = vllm_config.model_config
+            is_hybrid_model = model_config is not None and model_config.is_hybrid
+            # Hybrid models (Qwen3.5 in this repo) rely on
+            # HybridAttentionMambaModelConfig to align block_size with
+            # mamba/attention page sizes. Keep the model-side value.
+            if not is_hybrid_model:
+                cache_config.block_size = 64
 
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode

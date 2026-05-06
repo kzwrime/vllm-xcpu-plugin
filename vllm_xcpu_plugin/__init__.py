@@ -16,8 +16,13 @@ def register_attn_backend():
 def register_ops():
     logger.info("register_ops")
     import vllm_xcpu_plugin.custom_ops  # noqa
+    from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
 
+    import vllm_xcpu_plugin.layers.layernorm  # noqa
+    import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
+    import vllm_xcpu_plugin.layers.gdn_linear_attn  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
     import vllm_xcpu_plugin.topk_patch as topk_patch
 
+    maybe_patch_gdn_attention()
     topk_patch.maybe_patch_vllm_topk_softmax()

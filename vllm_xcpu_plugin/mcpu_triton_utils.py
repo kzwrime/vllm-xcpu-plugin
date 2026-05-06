@@ -62,11 +62,47 @@ def _zero_kv_blocks_kernel_impl(
 zero_kv_blocks_kernel = _FuncWrapper(_zero_kv_blocks_kernel_impl)
 
 
+def _prepare_rope_positions_kernel_impl(
+    positions: torch.Tensor,
+    positions_stride: int,
+    prefill_positions: torch.Tensor,
+    prefill_positions_stride0: int,
+    prefill_positions_stride1: int,
+    prefill_delta: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    prefill_lens: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    BLOCK_SIZE: int,
+    NUM_DIMS: int,
+) -> None:
+    torch.ops.mcpu.prepare_rope_positions_kernel_impl(
+        positions,
+        positions_stride,
+        prefill_positions,
+        prefill_positions_stride0,
+        prefill_positions_stride1,
+        prefill_delta,
+        idx_mapping,
+        query_start_loc,
+        prefill_lens,
+        num_computed_tokens,
+        NUM_DIMS,
+    )
+
+
+prepare_rope_positions_kernel = _FuncWrapper(_prepare_rope_positions_kernel_impl)
+
+
 def patch_vllm_triton_kernels() -> None:
     import vllm.v1.worker.block_table
+    import vllm.v1.worker.gpu.mm.rope
     import vllm.v1.worker.utils
 
     vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
         compute_slot_mapping_kernel
     )
     vllm.v1.worker.utils._zero_kv_blocks_kernel = zero_kv_blocks_kernel
+    vllm.v1.worker.gpu.mm.rope._prepare_rope_positions_kernel = (
+        prepare_rope_positions_kernel
+    )
