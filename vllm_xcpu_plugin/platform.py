@@ -27,7 +27,7 @@ class McpuPlatform(Platform):
     device_name = "mcpu"
     device_type: str = "privateuseone"
     dispatch_key: str = "PrivateUse1"
-    simple_compile_backend: str = "eager"
+    # simple_compile_backend: str = "eager"
 
     @classmethod
     def get_attn_backend_cls(
@@ -137,6 +137,11 @@ class McpuPlatform(Platform):
                 "nan_asserts": False,
                 "epilogue_fusion": True,
                 "cpp.dynamic_threads": True,
+                # Inductor combo kernels currently require a SIMD/CUDA
+                # scheduler. mcpu delegates to the C++ CPU scheduler, so keep
+                # this off unless the mcpu backend grows combo-kernel codegen.
+                "combo_kernels": False,
+                "benchmark_combo_kernel": False,
             })
 
     @classmethod
