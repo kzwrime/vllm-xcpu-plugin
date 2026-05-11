@@ -23,6 +23,10 @@ def register_ops():
     import vllm_xcpu_plugin.layers.gdn_linear_attn  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
     import vllm_xcpu_plugin.topk_patch as topk_patch
+    import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
+    import vllm_xcpu_plugin.mla_patch as mla_patch
 
     maybe_patch_gdn_attention()
     topk_patch.maybe_patch_vllm_topk_softmax()
+    grouped_topk_patch.maybe_patch_vllm_grouped_topk()
+    mla_patch.maybe_patch_vllm_mla_attention()
