@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -15,7 +15,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import clear_workspace, init_workspace_manager
 
 import vllm_xcpu_plugin.envs as envs_xcpu
 
@@ -220,6 +220,22 @@ class McpuWorker(Worker):
 
     def determine_available_memory(self) -> int:
         available_memory = super().determine_available_memory()
+
+        if self.vllm_config.compilation_config.mode != CompilationMode.NONE:
+            # The profiling run above may allocate persistent vLLM workspaces
+            # before torch.compile warmup. If left alive, Dynamo can hoist them
+            # as graph inputs, causing Inductor functionalization to generate
+            # large copy-in/copy-back kernels for mutable workspace views. Drop
+            # the profiling workspaces so compile sees fresh graph-local
+            # allocations.
+            logger.info(
+                "Clearing profiling workspaces before compile warmup. "
+                "compilation_mode=%s",
+                self.vllm_config.compilation_config.mode.name,
+            )
+            clear_workspace()
+            gc.collect()
+            torch.accelerator.empty_cache()
 
         kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
         if kv_cache_space is None:
