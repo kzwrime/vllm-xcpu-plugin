@@ -205,14 +205,12 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         # =============================================================================
 
         # --- Communication metadata (persistent, cached) ---
-        if self._full_send_split_sizes is None:
-            self._full_send_split_sizes = torch.empty(
-                self.ep_size, dtype=torch.int32, device=device
-            )
-        if self._recv_split_sizes is None:
-            self._recv_split_sizes = torch.empty(
-                self.ep_size, dtype=torch.int32, device=device
-            )
+        self._full_send_split_sizes = torch.empty(
+            self.ep_size, dtype=torch.int32, device=device
+        )
+        self._recv_split_sizes = torch.empty(
+            self.ep_size, dtype=torch.int32, device=device
+        )
 
         # --- For fused operator ---
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
@@ -382,6 +380,8 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         )
         self._topk_weights = None
         self._sort_indices_back = None
+        self._full_send_split_sizes = None
+        self._recv_split_sizes = None
 
         def _receiver():
             pass
