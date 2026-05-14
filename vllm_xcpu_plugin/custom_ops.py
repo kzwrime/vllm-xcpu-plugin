@@ -1,7 +1,6 @@
 import torch
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -69,42 +68,6 @@ class XcpuRMSNorm(RMSNorm):
             )
         else:
             return rms_norm(x, self.weight.data, self.variance_epsilon)
-
-
-@RotaryEmbedding.register_oot
-class XcpuRotaryEmbedding(RotaryEmbedding):
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-        is_neox_style: bool,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-        )
-
-    def forward_oot(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        self._match_cos_sin_cache_dtype(query)
-
-        import torch_xcpu.ops as ops
-
-        ops.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
-        )
-        return query, key
 
 
 @SiluAndMul.register_oot
