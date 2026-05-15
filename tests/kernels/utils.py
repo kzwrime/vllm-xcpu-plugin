@@ -3,6 +3,7 @@
 """Kernel test utils"""
 
 import itertools
+import os
 import random
 from collections.abc import Sequence
 from numbers import Number
@@ -32,6 +33,24 @@ ALL_OPCHECK_TEST_UTILS: tuple[str, ...] = (
     "test_autograd_registration",
     "test_faketensor",
     "test_aot_dispatch_dynamic",
+)
+
+
+def _parse_device_list(raw: str, default: str) -> list[str]:
+    if not raw:
+        return [default]
+
+    devices = [device.strip() for device in raw.split(",")]
+    devices = [device for device in devices if device]
+    return devices or [default]
+
+
+CUSTOM_OP_TEST_DEVICES: list[str] = _parse_device_list(
+    os.environ.get("TORCH_XCPU_CUSTOM_OP_TEST_DEVICES", "mcpu"),
+    "mcpu",
+)
+CUSTOM_OP_TEST_ENABLE_OPCHECK = (
+    os.environ.get("TORCH_XCPU_CUSTOM_OP_TEST_ENABLE_OPCHECK", "1") == "1"
 )
 
 
@@ -798,6 +817,8 @@ def fp8_allclose(
     Reference implementation of torch.allclose
     """
     torch._refs._check_close_args(name="torch.allclose", a=a, b=b, rtol=rtol, atol=atol)
+    a = a.cpu()
+    b = b.cpu()
 
     return bool(
         torch.all(

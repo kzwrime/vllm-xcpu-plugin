@@ -3,11 +3,16 @@
 
 import pytest
 import torch
+import torch_xcpu  # noqa: F401
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
 
-from tests.kernels.utils import opcheck
+from tests.kernels.utils import (
+    CUSTOM_OP_TEST_DEVICES,
+    CUSTOM_OP_TEST_ENABLE_OPCHECK,
+    opcheck,
+)
 
 load_general_plugins()
 
@@ -33,7 +38,7 @@ HIDDEN_SIZES = [
 
 ADD_RESIDUAL = [False, True]
 SEEDS = [0]
-CUDA_DEVICES = ["cpu"]
+CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 # CUDA_DEVICES = [
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
@@ -58,51 +63,69 @@ def test_rms_norm(
     strided_input: bool,
 ) -> None:
     set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = RMSNorm(hidden_size).to(dtype=dtype)
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
     scale = 1 / (2 * hidden_size)
     last_dim = 2 * hidden_size if strided_input else hidden_size
-    x = torch.randn(num_tokens, last_dim, dtype=dtype)
-    x = x[..., :hidden_size]
-    assert x.is_contiguous() != strided_input
-    x *= scale
-    residual = torch.randn_like(x) * scale if add_residual else None
+    x_base_cpu = torch.randn(num_tokens, last_dim, dtype=dtype, device="cpu")
+    x_cpu = x_base_cpu[..., :hidden_size]
+    assert x_cpu.is_contiguous() != strided_input
+    x_cpu *= scale
+    residual_cpu = torch.randn_like(x_cpu) * scale if add_residual else None
+    x_base = x_base_cpu.to(device)
+    x = x_base[..., :hidden_size]
+    assert x.stride() == x_cpu.stride()
+    residual = residual_cpu.to(device) if residual_cpu is not None else None
 
     # NOTE(woosuk): The reference implementation should be executed first
     # because the custom kernel is in-place.
-    ref_out = layer.forward_native(x, residual)
+    layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float, device="cpu")
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    ref_out = layer_fp32.forward_native(
+        x_cpu.to(torch.float),
+        residual_cpu.to(torch.float) if residual_cpu is not None else None,
+    )
     out = layer(x, residual)
     # NOTE(woosuk): LayerNorm operators (including RMS) typically have larger
     # numerical errors than other operators because they involve reductions.
     # Therefore, we use a larger tolerance.
     if add_residual:
-        torch.testing.assert_close(out[0], ref_out[0], atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(out[1], ref_out[1], atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            out[0].cpu().to(torch.float), ref_out[0], atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            out[1].cpu().to(torch.float), ref_out[1], atol=1e-2, rtol=1e-2
+        )
     else:
-        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            out.cpu().to(torch.float), ref_out, atol=1e-2, rtol=1e-2
+        )
 
     if residual is not None:
         if x.dtype == torch.bfloat16:
             opcheck(
                 torch.ops.torch_xcpu.fused_add_rms_norm_bf16,
                 (x, residual, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
             )
         elif x.dtype == torch.float:
             opcheck(
                 torch.ops.torch_xcpu.fused_add_rms_norm_fp32,
                 (x, residual, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
             )
     else:
         if x.dtype == torch.bfloat16:
             opcheck(
                 torch.ops.torch_xcpu.rms_norm_bf16,
                 (out, x, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
             )
         elif x.dtype == torch.float:
             opcheck(
                 torch.ops.torch_xcpu.rms_norm_fp32,
                 (out, x, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
             )
         else:
             raise RuntimeError(f"Unsupported dtype: {x.dtype}")

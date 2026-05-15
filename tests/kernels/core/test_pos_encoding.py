@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch_xcpu  # noqa: F401
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.plugins import load_general_plugins
@@ -17,7 +18,11 @@ from tests.kernels.allclose_default import (
     get_default_atol,
     get_default_rtol,
 )
-from tests.kernels.utils import opcheck  # 从项目导入 opcheck
+from tests.kernels.utils import (
+    CUSTOM_OP_TEST_DEVICES,
+    CUSTOM_OP_TEST_ENABLE_OPCHECK,
+    opcheck,
+)  # 从项目导入 opcheck
 
 load_general_plugins()
 
@@ -34,7 +39,7 @@ NUM_HEADS = [1, 16]
 BATCH_SIZES = [1, 5]
 SEQ_LENS = [1, 2, 7, 11, 55, 333, 1333]  # Arbitrary values for testing
 SEEDS = [0]
-CUDA_DEVICES = ["cpu"]
+CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 USE_KEY = [True, False]
 
 
@@ -68,6 +73,9 @@ TENSORS_SHAPES_FN = [
 def _test_rotary_embedding_model(
     rope,
     rope_fp32,
+    query_cpu: torch.Tensor,
+    key_cpu: torch.Tensor | None,
+    positions_cpu: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor | None,
     positions: torch.Tensor,
@@ -77,31 +85,34 @@ def _test_rotary_embedding_model(
     use_key: bool,
 ) -> None:
     # Compute reference in fp32 for higher precision
-    query_fp32 = query.to(torch.float32)
-    key_fp32 = key.to(torch.float32) if key is not None else None
+    query_fp32 = query_cpu.to(torch.float32)
+    key_fp32 = key_cpu.to(torch.float32) if key_cpu is not None else None
 
     # NOTE(woosuk): The reference implementation should be executed first
     # because the custom kernel is in-place.
     ref_query, ref_key = rope_fp32.forward_native(
-        positions,
+        positions_cpu,
         query_fp32.clone(),
         key_fp32.clone() if key_fp32 is not None else None,
     )
     out_query, out_key = rope.forward(positions, query, key)
+    out_query_cpu = out_query.cpu()
+    out_key_cpu = out_key.cpu() if out_key is not None else None
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out_query) dtype
-    atol = get_default_atol(out_query)
-    rtol = get_default_rtol(out_query)
+    atol = get_default_atol(out_query_cpu)
+    rtol = get_default_rtol(out_query_cpu)
     torch.testing.assert_close(
-        out_query.to(torch.float32),
+        out_query_cpu.to(torch.float32),
         ref_query,
         atol=atol,
         rtol=rtol,
     )
     if use_key:
+        assert out_key_cpu is not None
         torch.testing.assert_close(
-            out_key.to(torch.float32),
+            out_key_cpu.to(torch.float32),
             ref_key,
             atol=atol,
             rtol=rtol,
@@ -110,12 +121,13 @@ def _test_rotary_embedding_model(
         assert ref_key is None and out_key is None, "expected returned key to be None"
 
     # Check Dice tolerance
-    diff_query = calc_diff(out_query.to(torch.float32), ref_query)
+    diff_query = calc_diff(out_query_cpu.to(torch.float32), ref_query)
     assert diff_query < default_dice_tol, (
         f"Query diff {diff_query} exceeds dice tolerance {default_dice_tol}"
     )
     if use_key:
-        diff_key = calc_diff(out_key.to(torch.float32), ref_key)
+        assert out_key_cpu is not None
+        diff_key = calc_diff(out_key_cpu.to(torch.float32), ref_key)
         assert diff_key < default_dice_tol, (
             f"Key diff {diff_key} exceeds dice tolerance {default_dice_tol}"
         )
@@ -125,11 +137,13 @@ def _test_rotary_embedding_model(
         opcheck(
             torch.ops.torch_xcpu.rotary_embedding_bf16,
             (positions, query, key, head_size, rope.cos_sin_cache, is_neox_style),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rotary_embedding_fp32,
             (positions, query, key, head_size, rope.cos_sin_cache, is_neox_style),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
 
 
@@ -159,7 +173,6 @@ def test_rotary_embedding_basic(
         rotary_dim = head_size
 
     set_random_seed(seed)
-    torch.set_default_device(device)
     if rotary_dim is None:
         rotary_dim = head_size
     rope_parameters = {
@@ -169,7 +182,7 @@ def test_rotary_embedding_basic(
     }
     rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
     rope_fp32 = rope.to(dtype=torch.float32)
-    rope = rope.to(dtype=dtype, device=torch.get_default_device())
+    rope = rope.to(dtype=dtype, device=device)
 
     for tensor_shape_fn in TENSORS_SHAPES_FN:
         for batch_size in BATCH_SIZES:
@@ -182,29 +195,39 @@ def test_rotary_embedding_basic(
                         seq_len=seq_len,
                         num_heads=num_heads,
                     ):
-                        positions = torch.randint(
-                            0, max_position, (batch_size, seq_len)
+                        positions_cpu = torch.randint(
+                            0, max_position, (batch_size, seq_len), device="cpu"
                         )
                         query_shape = tensor_shape_fn(
                             batch_size, seq_len, num_heads, head_size
                         )
-                        query = torch.randn(query_shape, dtype=dtype)
+                        query_base_cpu = torch.randn(
+                            query_shape, dtype=dtype, device="cpu"
+                        )
 
                         # slice tensor if required, noop otherwise
-                        query = query[..., :head_size]
+                        query_cpu = query_base_cpu[..., :head_size]
+                        query = query_base_cpu.to(device)[..., :head_size]
 
-                        key = (
-                            torch.randn(query_shape, dtype=dtype)[..., :head_size]
-                            if use_key
-                            else None
-                        )
+                        if use_key:
+                            key_base_cpu = torch.randn(
+                                query_shape, dtype=dtype, device="cpu"
+                            )
+                            key_cpu = key_base_cpu[..., :head_size]
+                            key = key_base_cpu.to(device)[..., :head_size]
+                        else:
+                            key_cpu = None
+                            key = None
 
                         _test_rotary_embedding_model(
                             rope,
                             rope_fp32,
+                            query_cpu,
+                            key_cpu,
+                            positions_cpu,
                             query,
                             key,
-                            positions,
+                            positions_cpu.to(device),
                             is_neox_style,
                             head_size,
                             dtype,
@@ -298,7 +321,6 @@ def test_rotary_embedding(
         rotary_dim = head_size
 
     set_random_seed(seed)
-    torch.set_default_device(device)
     if rotary_dim is None:
         rotary_dim = head_size
     rope_parameters = {
@@ -308,7 +330,7 @@ def test_rotary_embedding(
     }
     rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
     rope_fp32 = rope.to(dtype=torch.float32)
-    rope = rope.to(dtype=dtype, device=torch.get_default_device())
+    rope = rope.to(dtype=dtype, device=device)
 
     for seq_len in SEQ_LENS:
         with subtests.test(
@@ -317,8 +339,12 @@ def test_rotary_embedding(
         ):
             if contiguous_qkv:
                 # Models using .split() produce contiguous tensors
-                query = torch.randn(seq_len, num_heads, head_size, dtype=dtype)
-                key = torch.randn(seq_len, num_kv_heads, head_size, dtype=dtype)
+                query_cpu = torch.randn(
+                    seq_len, num_heads, head_size, dtype=dtype, device="cpu"
+                )
+                key_cpu = torch.randn(
+                    seq_len, num_kv_heads, head_size, dtype=dtype, device="cpu"
+                )
             else:
                 # Models using .chunk() or with TP sharding produce non-contiguous views
                 # Simulate by creating a combined QKV tensor and slicing
@@ -327,19 +353,32 @@ def test_rotary_embedding(
                 v_proj_size = num_kv_heads
                 total_qkv_size = q_proj_size + k_proj_size + v_proj_size
 
-                qkv = torch.randn(seq_len, total_qkv_size, head_size, dtype=dtype)
+                qkv = torch.randn(
+                    seq_len, total_qkv_size, head_size, dtype=dtype, device="cpu"
+                )
                 q_end = q_proj_size
                 k_end = q_proj_size + k_proj_size
-                query = qkv[:, :q_end, :]
-                key = qkv[:, q_end:k_end, :]
+                query_cpu = qkv[:, :q_end, :]
+                key_cpu = qkv[:, q_end:k_end, :]
+                qkv_device = qkv.to(device)
+                query = qkv_device[:, :q_end, :]
+                key = qkv_device[:, q_end:k_end, :]
+                assert query.stride() == query_cpu.stride()
+                assert key.stride() == key_cpu.stride()
+            if contiguous_qkv:
+                query = query_cpu.to(device)
+                key = key_cpu.to(device)
 
-            positions = torch.randint(0, max_position, (seq_len,))
+            positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
             _test_rotary_embedding_model(
                 rope,
                 rope_fp32,
+                query_cpu,
+                key_cpu if use_key else None,
+                positions_cpu,
                 query,
                 key if use_key else None,
-                positions,
+                positions_cpu.to(device),
                 is_neox_style,
                 head_size,
                 dtype,

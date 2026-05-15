@@ -12,6 +12,7 @@ This test file covers real-world usage from vLLM framework:
 
 import pytest
 import torch
+import torch_xcpu  # noqa: F401
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
@@ -22,7 +23,11 @@ from tests.kernels.allclose_default import (
     get_default_atol,
     get_default_rtol,
 )
-from tests.kernels.utils import opcheck
+from tests.kernels.utils import (
+    CUSTOM_OP_TEST_DEVICES,
+    CUSTOM_OP_TEST_ENABLE_OPCHECK,
+    opcheck,
+)
 
 load_general_plugins()
 
@@ -48,7 +53,7 @@ HIDDEN_SIZES = [
 ]
 
 SEEDS = [0]
-CUDA_DEVICES = ["cpu"]
+CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
@@ -67,23 +72,26 @@ def test_fused_add_rms_norm(
 ) -> None:
     """Test fused_add_rms_norm with real-world framework usage."""
     set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = RMSNorm(hidden_size).to(dtype=dtype)
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
     scale = 1 / (2 * hidden_size)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
-    residual = torch.randn_like(x) * scale
+    x_cpu = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cpu") * scale
+    residual_cpu = torch.randn_like(x_cpu) * scale
 
     # Compute reference in fp32 for higher precision
     layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.to(torch.float)
-    x_fp32 = x.to(torch.float)
-    residual_fp32 = residual.to(torch.float)
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
+    residual_fp32 = residual_cpu.to(torch.float)
 
     # NOTE(woosuk): The reference implementation should be executed first
     # because the custom kernel is in-place.
     ref_out, ref_residual = layer_fp32.forward_native(x_fp32, residual_fp32)
+    x = x_cpu.to(device)
+    residual = residual_cpu.to(device)
     out, new_residual = layer(x, residual)
+    out_cpu = out.cpu()
+    new_residual_cpu = new_residual.cpu()
 
     # Print error metrics
     # max_abs_error_out = (out.to(torch.float) - ref_out).abs().max().item()
@@ -95,16 +103,16 @@ def test_fused_add_rms_norm(
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out) dtype
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(
-        new_residual.to(torch.float), ref_residual, atol=atol, rtol=rtol
+        new_residual_cpu.to(torch.float), ref_residual, atol=atol, rtol=rtol
     )
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
-    diff_residual = calc_diff(new_residual.to(torch.float), ref_residual)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
+    diff_residual = calc_diff(new_residual_cpu.to(torch.float), ref_residual)
 
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
@@ -118,11 +126,13 @@ def test_fused_add_rms_norm(
         opcheck(
             torch.ops.torch_xcpu.fused_add_rms_norm_bf16,
             (x, residual, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif x.dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.fused_add_rms_norm_fp32,
             (x, residual, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     else:
         raise RuntimeError(f"Unsupported dtype: {x.dtype}")

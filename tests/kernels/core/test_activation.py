@@ -5,6 +5,7 @@ import random
 
 import pytest
 import torch
+import torch_xcpu  # noqa: F401
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS
 from vllm.model_executor.layers.activation import (
     FatreluAndMul,
@@ -22,7 +23,11 @@ from tests.kernels.allclose_default import (
     get_default_atol,
     get_default_rtol,
 )
-from tests.kernels.utils import opcheck
+from tests.kernels.utils import (
+    CUSTOM_OP_TEST_DEVICES,
+    CUSTOM_OP_TEST_ENABLE_OPCHECK,
+    opcheck,
+)
 
 load_general_plugins()
 
@@ -30,7 +35,7 @@ DTYPES = [torch.bfloat16, torch.float]
 NUM_TOKENS = [1, 2, 4, 7, 8, 16, 31, 32, 64, 128, 133, 192, 256, 512, 577, 1024, 2055]
 D = set([512, 13824])  # Arbitrary values for testing
 SEEDS = [0]
-CUDA_DEVICES = ["cpu"]
+CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 # CUDA_DEVICES = [
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
@@ -83,8 +88,8 @@ def test_act_and_mul(
     device: str,
 ) -> None:
     set_random_seed(seed)
-    torch.set_default_device(device)
-    x = torch.randn(num_tokens, 2 * d, dtype=dtype)
+    x_cpu = torch.randn(num_tokens, 2 * d, dtype=dtype, device="cpu")
+    x = x_cpu.to(device)
     if activation == "silu_and_mul":
         layer = SiluAndMul()
         fn = torch.ops._C.silu_and_mul
@@ -106,11 +111,12 @@ def test_act_and_mul(
         fn = torch.ops._C.swigluoai_and_mul
 
     # Compute reference in fp32 for higher precision
-    x_fp32 = x.to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
     layer_fp32 = layer.to(dtype=torch.float)
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    out_cpu = out.cpu()
 
     # Print error metrics
     # max_abs_error = (out.to(torch.float) - ref_out).abs().max().item()
@@ -119,12 +125,12 @@ def test_act_and_mul(
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out) dtype
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
     )
@@ -132,12 +138,20 @@ def test_act_and_mul(
     d = x.shape[-1] // 2
     output_shape = x.shape[:-1] + (d,)
     out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    if activation == "silu_and_mul":
+        fn = (
+            torch.ops.torch_xcpu.silu_and_mul_bf16
+            if x.dtype == torch.bfloat16
+            else torch.ops.torch_xcpu.silu_and_mul_fp32
+        )
     if activation == "fatrelu":
-        opcheck(fn, (out, x, threshold))
+        opcheck(fn, (out, x, threshold), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK)
     elif activation == "swigluoai_and_mul":
-        opcheck(fn, (out, x, layer.alpha, layer.limit))
+        opcheck(
+            fn, (out, x, layer.alpha, layer.limit), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK
+        )
     else:
-        opcheck(fn, (out, x))
+        opcheck(fn, (out, x), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK)
 
 
 # @pytest.mark.parametrize(

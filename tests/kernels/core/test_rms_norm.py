@@ -18,6 +18,7 @@ This test file covers real-world usage from vLLM framework:
 
 import pytest
 import torch
+import torch_xcpu  # noqa: F401
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
@@ -29,7 +30,11 @@ from tests.kernels.allclose_default import (
     get_default_atol,
     get_default_rtol,
 )
-from tests.kernels.utils import opcheck
+from tests.kernels.utils import (
+    CUSTOM_OP_TEST_DEVICES,
+    CUSTOM_OP_TEST_ENABLE_OPCHECK,
+    opcheck,
+)
 
 load_general_plugins()
 
@@ -112,7 +117,7 @@ _3D_CONFIGS = [
 ]
 
 SEEDS = [0]
-CUDA_DEVICES = ["cpu"]
+CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +134,9 @@ for model_name, config in ALL_MODEL_CONFIGS.items():
         MODEL_HIDDEN_SIZES.add((config.hidden_size, False))
 
     # DeepSeek-V3 special cases: q_lora_rank and kv_lora_rank
-    if config.q_lora_rank is not None or config.kv_lora_rank is not None:
-        assert config.q_lora_rank is not None and config.kv_lora_rank is not None, (
-            f"Model {model_name} has incomplete MLA config"
-        )
+    if config.q_lora_rank is not None:
         MODEL_HIDDEN_SIZES.add((config.q_lora_rank, False))
+    if config.kv_lora_rank is not None:
         MODEL_HIDDEN_SIZES.add((config.kv_lora_rank, True))  # is_mla_kv_lora = True
 
     # 3D format: [num_tokens, num_heads, head_size]
@@ -184,8 +187,7 @@ def test_rms_norm_2d(
     - Other hidden_sizes: Regular contiguous tensors
     """
     set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = RMSNorm(hidden_size).to(dtype=dtype)
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
     scale = 1 / (2 * hidden_size)
 
@@ -193,19 +195,25 @@ def test_rms_norm_2d(
     if hidden_size == 512:
         # MLA kv_lora: non-contiguous view with stride = 512 + 64 = 576
         mla_head_size = hidden_size + 64
-        combined = torch.randn(num_tokens, mla_head_size, dtype=dtype) * scale
-        x = combined[:, :hidden_size]  # Non-contiguous view
+        combined = (
+            torch.randn(num_tokens, mla_head_size, dtype=dtype, device="cpu") * scale
+        )
+        x_cpu = combined[:, :hidden_size]  # Non-contiguous view
+        x = combined.to(device)[:, :hidden_size]
+        assert x.stride() == x_cpu.stride()
     else:
         # Regular case: contiguous tensor
-        x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+        x_cpu = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cpu") * scale
+        x = x_cpu.to(device)
 
     # Compute reference in fp32 for higher precision
     layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.to(torch.float)
-    x_fp32 = x.to(torch.float)
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    out_cpu = out.cpu()
 
     # Print error metrics
     # max_abs_error = (out.to(torch.float) - ref_out).abs().max().item()
@@ -214,12 +222,12 @@ def test_rms_norm_2d(
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out) dtype
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
     )
@@ -229,11 +237,13 @@ def test_rms_norm_2d(
         opcheck(
             torch.ops.torch_xcpu.rms_norm_bf16,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif x.dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rms_norm_fp32,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     else:
         raise RuntimeError(f"Unsupported dtype: {x.dtype}")
@@ -266,12 +276,11 @@ def test_rms_norm_3d(
     tensor before chunking.
     """
     set_random_seed(seed)
-    torch.set_default_device(device)
 
     # For 3D rms_norm, framework uses weight size = head_size
     # (not num_heads * head_size)
     # The framework applies rms_norm to 3D tensors directly, not reshaped to 2D
-    layer = RMSNorm(head_size).to(dtype=dtype)
+    layer = RMSNorm(head_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
 
     # Create non-contiguous 3D view by chunking a larger combined tensor.
@@ -279,7 +288,9 @@ def test_rms_norm_3d(
     # combined QKV projections.
     if total_size > num_heads:
         # Create a larger combined tensor
-        combined = torch.randn(num_tokens, total_size, head_size, dtype=dtype)
+        combined = torch.randn(
+            num_tokens, total_size, head_size, dtype=dtype, device="cpu"
+        )
         scale = 1 / (2 * head_size)
         combined = combined * scale
 
@@ -289,22 +300,28 @@ def test_rms_norm_3d(
 
         # Extract non-contiguous view using slicing
         # [num_tokens, chunk_idx*num_heads:(chunk_idx+1)*num_heads, head_size]
-        x = combined[:, chunk_idx * num_heads : (chunk_idx + 1) * num_heads, :]
+        x_cpu = combined[:, chunk_idx * num_heads : (chunk_idx + 1) * num_heads, :]
+        x = combined.to(device)[
+            :, chunk_idx * num_heads : (chunk_idx + 1) * num_heads, :
+        ]
+        assert x.stride() == x_cpu.stride()
     else:
         # Contiguous case (total_size == num_heads)
-        x = torch.randn(num_tokens, num_heads, head_size, dtype=dtype)
+        x_cpu = torch.randn(num_tokens, num_heads, head_size, dtype=dtype, device="cpu")
         scale = 1 / (2 * head_size)
-        x = x * scale
+        x_cpu = x_cpu * scale
+        x = x_cpu.to(device)
+
+    # Compute reference in fp32 for higher precision
+    layer_fp32 = RMSNorm(head_size).to(dtype=torch.float)
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
+    ref_out = layer_fp32.forward_native(x_fp32)
 
     # Call RMSNorm layer directly on 3D tensor
     # Framework applies rms_norm to 3D tensors, normalizing along the last dimension
     out = layer(x)
-
-    # Compute reference in fp32 for higher precision
-    layer_fp32 = RMSNorm(head_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.to(torch.float)
-    x_fp32 = x.to(torch.float)
-    ref_out = layer_fp32.forward_native(x_fp32)
+    out_cpu = out.cpu()
 
     # Print error metrics
     # max_abs_error = (out.to(torch.float) - ref_out).abs().max().item()
@@ -313,12 +330,12 @@ def test_rms_norm_3d(
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out) dtype
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
     )
@@ -328,11 +345,13 @@ def test_rms_norm_3d(
         opcheck(
             torch.ops.torch_xcpu.rms_norm_bf16,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif x.dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rms_norm_fp32,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     else:
         raise RuntimeError(f"Unsupported dtype: {x.dtype}")
@@ -364,8 +383,7 @@ def test_rms_norm_2d_model_configs(
     including DeepSeek-V3 q_lora_rank and kv_lora_rank special cases.
     """
     set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = RMSNorm(hidden_size).to(dtype=dtype)
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
     scale = 1 / (2 * hidden_size)
 
@@ -373,27 +391,33 @@ def test_rms_norm_2d_model_configs(
         # MLA kv_lora: non-contiguous view with stride = kv_lora_rank + qk_rope_head_dim
         qk_rope_head_dim = 64  # DeepSeek-V3 rotary_dim
         mla_head_size = hidden_size + qk_rope_head_dim
-        combined = torch.randn(num_tokens, mla_head_size, dtype=dtype) * scale
-        x = combined[:, :hidden_size]  # Non-contiguous view
+        combined = (
+            torch.randn(num_tokens, mla_head_size, dtype=dtype, device="cpu") * scale
+        )
+        x_cpu = combined[:, :hidden_size]  # Non-contiguous view
+        x = combined.to(device)[:, :hidden_size]
+        assert x.stride() == x_cpu.stride()
     else:
         # Regular case: contiguous tensor
-        x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+        x_cpu = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cpu") * scale
+        x = x_cpu.to(device)
 
     # Compute reference in fp32 for higher precision
     layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.to(torch.float)
-    x_fp32 = x.to(torch.float)
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    out_cpu = out.cpu()
 
     # Compare using both assert_close and default_dice_tol
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
     )
@@ -403,11 +427,13 @@ def test_rms_norm_2d_model_configs(
         opcheck(
             torch.ops.torch_xcpu.rms_norm_bf16,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif x.dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rms_norm_fp32,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     else:
         raise RuntimeError(f"Unsupported dtype: {x.dtype}")
@@ -440,12 +466,11 @@ def test_rms_norm_3d_model_configs(
     with realistic num_heads derived from model configurations and TP sizes.
     """
     set_random_seed(seed)
-    torch.set_default_device(device)
 
     config = ALL_MODEL_CONFIGS[model_name]
 
     # For 3D rms_norm, framework uses weight size = head_size
-    layer = RMSNorm(head_size).to(dtype=dtype)
+    layer = RMSNorm(head_size).to(dtype=dtype, device=device)
     layer.weight.data.normal_(mean=1.0, std=0.1)
 
     scale = 1 / (2 * head_size)
@@ -480,27 +505,37 @@ def test_rms_norm_3d_model_configs(
             else:
                 total_size = num_heads + 2 * num_kv_heads_per_rank
 
-        combined = torch.randn(num_tokens, total_size, head_size, dtype=dtype) * scale
-        x = combined[:, :num_heads, :]  # Non-contiguous view
+        combined = (
+            torch.randn(num_tokens, total_size, head_size, dtype=dtype, device="cpu")
+            * scale
+        )
+        x_cpu = combined[:, :num_heads, :]  # Non-contiguous view
+        x = combined.to(device)[:, :num_heads, :]
+        assert x.stride() == x_cpu.stride()
     else:
         # Single token: contiguous (decode mode)
-        x = torch.randn(num_tokens, num_heads, head_size, dtype=dtype) * scale
+        x_cpu = (
+            torch.randn(num_tokens, num_heads, head_size, dtype=dtype, device="cpu")
+            * scale
+        )
+        x = x_cpu.to(device)
 
     # Compute reference in fp32 for higher precision
     layer_fp32 = RMSNorm(head_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.to(torch.float)
-    x_fp32 = x.to(torch.float)
+    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+    x_fp32 = x_cpu.to(torch.float)
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    out_cpu = out.cpu()
 
     # Compare using both assert_close and default_dice_tol
-    atol = get_default_atol(out)
-    rtol = get_default_rtol(out)
-    torch.testing.assert_close(out.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
 
     # Check Dice tolerance
-    diff_out = calc_diff(out.to(torch.float), ref_out)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
     assert diff_out < default_dice_tol, (
         f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
     )
@@ -510,11 +545,13 @@ def test_rms_norm_3d_model_configs(
         opcheck(
             torch.ops.torch_xcpu.rms_norm_bf16,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     elif x.dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rms_norm_fp32,
             (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
     else:
         raise RuntimeError(f"Unsupported dtype: {x.dtype}")
