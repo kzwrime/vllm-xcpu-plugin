@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
 
-class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
+class MpiAlltoallvPrepareAndFinalizeV3(mk.FusedMoEPrepareAndFinalizeModular):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
@@ -224,10 +224,8 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         #     self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
         #     + self.ep_size * static_buffer_padding_per_dp
         # )
-        # Decode 时通信优化，TP 组内重复 token 按照 expert 切分来发送，而不是切分 token
-        # 因此将 dp_size 修改为 ep_size。Decode 时 TP=2，可接受。
         static_buffer_size = (
-            self.ep_size * self.max_num_tokens * min(topk, self.num_local_experts)
+            self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
             + self.ep_size * static_buffer_padding_per_dp
         )
         assert static_buffer_size % self.ep_size == 0
@@ -262,7 +260,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         # Call fused operator (phase1 + alltoall + phase2 + alltoallv)
         # =============================================================================
 
-        xcpu_ops.moe_prepare_fused_v2(
+        xcpu_ops.moe_prepare_fused_v3(
             sort_indices_back,  # output
             recv_hidden_states,  # output
             recv_topk_ids,  # output
@@ -364,7 +362,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
 
         assert self._sort_indices_back is not None
 
-        xcpu_ops.moe_finalize(
+        xcpu_ops.moe_finalize_v3(
             output,
             fused_expert_output,
             self._sort_indices_back,
