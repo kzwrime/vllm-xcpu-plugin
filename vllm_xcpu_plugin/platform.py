@@ -40,10 +40,14 @@ class McpuPlatform(Platform):
         if selected_backend:
             # logger.info("Cannot use %s backend on CPU.", selected_backend)
             logger.info("Using %s backend on MCPU", selected_backend)
+            if attn_selector_config.use_mla:
+                assert selected_backend == AttentionBackendEnum.TRITON_MLA, (
+                    f"MLA is enabled, but selected backend is {selected_backend}."
+                )
             return selected_backend.get_path()
 
         if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on CPU.")
+            return AttentionBackendEnum.TRITON_MLA.get_path()
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
 
