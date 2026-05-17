@@ -42,8 +42,10 @@ class XcpuRMSNormGated(RMSNormGated):
                 f"RMSNormGated only supports activation='swish', "
                 f"got {self.activation!r}"
             )
-        if not x.is_contiguous() or (z is not None and not z.is_contiguous()):
-            _not_implemented("RMSNormGated only supports contiguous input/gate")
+        if x.stride(-1) != 1 or (z is not None and z.stride(-1) != 1):
+            _not_implemented(
+                "RMSNormGated only supports input/gate with contiguous last dimension"
+            )
         return ops.rms_norm_gated(
             x,
             self.weight.data,
