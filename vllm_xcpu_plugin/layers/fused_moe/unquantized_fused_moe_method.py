@@ -21,6 +21,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
+from vllm.platforms.interface import CpuArchEnum
 
 import vllm_xcpu_plugin.envs as envs_xcpu
 
@@ -161,6 +163,30 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             inplace=False,
         )
 
+    def _maybe_prepack_grouped_gemm(self, layer: torch.nn.Module) -> None:
+        if current_platform.get_cpu_architecture() != CpuArchEnum.X86:
+            return
+
+        from torch_xcpu import ops as xcpu_ops
+
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+        assert isinstance(w13_weight, torch.Tensor)
+        assert isinstance(w2_weight, torch.Tensor)
+
+        # fused_moe_compute passes trans_b=True for both grouped GEMMs, so the
+        # weights are interpreted as [num_experts, output_size, input_size].
+        xcpu_ops.prepack_moe_grouped_gemm(
+            w13_weight,
+            trans_b=True,
+            output_size=w13_weight.size(1),
+        )
+        xcpu_ops.prepack_moe_grouped_gemm(
+            w2_weight,
+            trans_b=True,
+            output_size=w2_weight.size(1),
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
 
@@ -174,3 +200,4 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w13=w13,
             w2=w2,
         )
+        self._maybe_prepack_grouped_gemm(layer)
