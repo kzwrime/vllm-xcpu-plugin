@@ -99,17 +99,23 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                         f"Must be one of: {list(_MPI_ALLTOALLV_VERSIONS.keys())}"
                     )
 
-                prepare_finalize = mpi_impl_class(
-                    max_num_tokens=self.moe.max_num_tokens,
-                    ep_group=ep_group,
-                    num_experts=self.moe.num_experts,
-                    num_local_experts=self.moe.num_local_experts,
-                    num_dispatchers=num_dispatchers,
-                    rank_expert_offset=all2all_manager.rank
+                mpi_prepare_finalize_kwargs = {
+                    "max_num_tokens": self.moe.max_num_tokens,
+                    "ep_group": ep_group,
+                    "num_experts": self.moe.num_experts,
+                    "num_local_experts": self.moe.num_local_experts,
+                    "num_dispatchers": num_dispatchers,
+                    "rank_expert_offset": all2all_manager.rank
                     * self.moe.num_local_experts,
-                    dp_rank=self.moe.dp_rank,
-                    dp_size=self.moe.dp_size,
-                )
+                    "dp_rank": self.moe.dp_rank,
+                    "dp_size": self.moe.dp_size,
+                }
+                if version == "v4":
+                    mpi_prepare_finalize_kwargs["is_sequence_parallel"] = (
+                        self.moe.moe_parallel_config.is_sequence_parallel
+                    )
+                    assert self.moe.moe_parallel_config.is_sequence_parallel
+                prepare_finalize = mpi_impl_class(**mpi_prepare_finalize_kwargs)
             else:
                 pass
 

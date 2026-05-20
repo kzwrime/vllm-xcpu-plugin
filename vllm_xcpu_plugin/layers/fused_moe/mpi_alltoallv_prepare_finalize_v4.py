@@ -18,12 +18,20 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 
+import vllm_xcpu_plugin.envs as envs_xcpu
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
+from vllm_xcpu_plugin.layers.fused_moe.mpi_alltoallv_v4_plan import (
+    compute_send_rounds,
+    validate_single_sender_capacity,
+)
+
+logger = init_logger(__name__)
 
 
 class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
@@ -46,18 +54,27 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         rank_expert_offset: int,
         dp_rank: int,
         dp_size: int,
+        is_sequence_parallel: bool = False,
     ):
         super().__init__()
         self.max_num_tokens = max_num_tokens
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
+        self.max_recv_tokens = envs_xcpu.VLLM_XCPU_MOE_MAX_RECV_TOKENS
         self.num_dispatchers_ = num_dispatchers
         self.rank_expert_offset = rank_expert_offset
+        self.is_sequence_parallel = is_sequence_parallel
 
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        if self.is_sequence_parallel:
+            self.max_moe_tokens_per_rank = (
+                self.max_num_tokens + self.tp_size - 1
+            ) // self.tp_size
+        else:
+            self.max_moe_tokens_per_rank = self.max_num_tokens
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
 
@@ -77,10 +94,13 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         # Communication metadata
         self._full_send_split_sizes: torch.Tensor | None = None
         self._recv_split_sizes: torch.Tensor | None = None
+        self._send_count_overall: torch.Tensor | None = None
+        self._send_rounds: list[tuple[int, int]] | None = None
 
         self._topk_weights: torch.Tensor | None = None
 
-        communicator = get_ep_group().device_communicator
+        self.ep_group_coordinator = get_ep_group()
+        communicator = self.ep_group_coordinator.device_communicator
         assert isinstance(communicator, CpuMPICommunicator)
         self.comm_ptr_wrapper = communicator.comm_ptr_wrapper
 
@@ -125,6 +145,99 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
             num_local_experts_ranks[i] = base_experts + (1 if i < extra_experts else 0)
 
         return num_local_experts_ranks
+
+    def _get_static_buffer_size(self, topk: int, hidden_dim: int) -> int:
+        if self.max_recv_tokens > 0:
+            return self.max_recv_tokens
+
+        static_buffer_padding_per_dp = (
+            self.num_local_experts + hidden_dim - 1
+        ) // hidden_dim
+        return (
+            self.dp_size
+            * self.max_moe_tokens_per_rank
+            * min(topk, self.num_local_experts)
+            + self.ep_size * static_buffer_padding_per_dp
+        )
+
+    def _check_single_sender_capacity(
+        self,
+        topk: int,
+        static_buffer_size: int,
+    ) -> None:
+        max_num_local_experts = int(self.num_local_experts_ranks.max().item())
+
+        validate_single_sender_capacity(
+            topk=topk,
+            max_num_local_experts=max_num_local_experts,
+            max_tokens=self.max_moe_tokens_per_rank,
+            max_recv_tokens=static_buffer_size,
+        )
+
+    def _collect_send_count_overall(
+        self,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        topk_ids_cpu = topk_ids.to(device="cpu", dtype=torch.int64).reshape(-1)
+        expert_count = torch.bincount(topk_ids_cpu, minlength=num_experts)
+
+        expert_prefix = torch.empty(self.ep_size + 1, dtype=torch.int64)
+        expert_prefix[0] = 0
+        expert_prefix[1:] = torch.cumsum(
+            self.num_local_experts_ranks.to(dtype=torch.int64), dim=0
+        )
+
+        local_send_counts = torch.empty(self.ep_size, dtype=torch.int64)
+        for rank in range(self.ep_size):
+            start = int(expert_prefix[rank].item())
+            end = int(expert_prefix[rank + 1].item())
+            local_send_counts[rank] = expert_count[start:end].sum()
+
+        gathered = self.ep_group_coordinator.all_gather(local_send_counts, dim=0)
+        send_count_overall = gathered.reshape(self.ep_size, self.ep_size)
+        return send_count_overall
+
+    def compute_send_rounds_for_input(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+    ) -> list[tuple[int, int]]:
+        _, hidden_dim = hidden_states.shape
+        _, topk = topk_ids.shape
+        static_buffer_size = self._get_static_buffer_size(topk, hidden_dim)
+        self._check_single_sender_capacity(topk, static_buffer_size)
+        send_count_overall = self._collect_send_count_overall(topk_ids, num_experts)
+        send_rounds = compute_send_rounds(send_count_overall, static_buffer_size)
+        return send_rounds
+
+    def _check_recv_buffer_capacity(
+        self,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        static_buffer_size: int,
+    ) -> torch.Tensor:
+        send_count_overall = self._collect_send_count_overall(topk_ids, num_experts)
+        send_rounds = compute_send_rounds(send_count_overall, static_buffer_size)
+        self._send_count_overall = send_count_overall
+        self._send_rounds = send_rounds
+
+        recv_counts = send_count_overall.sum(dim=0)
+        max_recv_tokens = int(recv_counts.max().item()) if self.ep_size > 0 else 0
+
+        if max_recv_tokens > static_buffer_size:
+            max_recv_rank = int(recv_counts.argmax().item())
+            raise RuntimeError(
+                "moe_prepare_fused_v4 receive token buffer overflow: "
+                f"limit_tokens={static_buffer_size}, "
+                f"max_recv_tokens={max_recv_tokens}, "
+                f"max_recv_rank={max_recv_rank}, "
+                f"planned_send_rounds={send_rounds}, ep_rank={self.ep_rank}, "
+                f"local_send_tokens={send_count_overall[self.ep_rank].tolist()}"
+            )
+
+        return send_count_overall
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return None
@@ -186,8 +299,9 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
             )
 
         assert not apply_router_weight_on_input
-        assert a1.shape[0] <= self.max_num_tokens, (
-            "Check --max-num-batched-tokens and VLLM_MOE_DP_CHUNK_SIZE"
+        assert a1.shape[0] <= self.max_moe_tokens_per_rank, (
+            "Check --max-num-batched-tokens, VLLM_MOE_DP_CHUNK_SIZE, "
+            "and use_sequence_parallel_moe"
         )
 
         from torch_xcpu import ops as xcpu_ops
@@ -216,19 +330,12 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
         expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
 
-        static_buffer_padding_per_dp = (
-            self.num_local_experts + hidden_dim - 1
-        ) // hidden_dim
+        static_buffer_size = self._get_static_buffer_size(topk, hidden_dim)
+        self._check_single_sender_capacity(topk, static_buffer_size)
 
-        # static_buffer_size = (
-        #     self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
-        #     + self.ep_size * static_buffer_padding_per_dp
-        # )
-        static_buffer_size = (
-            self.dp_size * self.max_num_tokens * min(topk, self.num_local_experts)
-            + self.ep_size * static_buffer_padding_per_dp
+        self._check_recv_buffer_capacity(
+            topk_ids.to(torch.int32), num_experts, static_buffer_size
         )
-        assert static_buffer_size % self.ep_size == 0
 
         recv_topk_ids = torch.empty(
             static_buffer_size, dtype=torch.int32, device=device
@@ -379,6 +486,8 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         self._sort_indices_back = None
         self._full_send_split_sizes = None
         self._recv_split_sizes = None
+        self._send_count_overall = None
+        self._send_rounds = None
 
         def _receiver():
             pass
