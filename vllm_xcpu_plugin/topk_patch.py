@@ -4,6 +4,8 @@ import os
 
 import torch
 
+_TOPK_SOFTMAX_PATCHED = False
+
 
 def _xcpu_topk_softmax(
     topk_weights: torch.Tensor,
@@ -30,12 +32,14 @@ def _xcpu_topk_softmax(
 
 
 def maybe_patch_vllm_topk_softmax() -> None:
+    global _TOPK_SOFTMAX_PATCHED
+
     if not bool(int(os.getenv("VLLM_USE_XCPU_TOPK_SOFTMAX", "0"))):
         return
 
     import vllm._custom_ops as ops
 
-    if getattr(ops, "_xcpu_topk_softmax_patched", False):
+    if _TOPK_SOFTMAX_PATCHED:
         return
 
     original_topk_softmax = ops.topk_softmax
@@ -70,4 +74,4 @@ def maybe_patch_vllm_topk_softmax() -> None:
         )
 
     ops.topk_softmax = _patched_topk_softmax
-    ops._xcpu_topk_softmax_patched = True
+    _TOPK_SOFTMAX_PATCHED = True

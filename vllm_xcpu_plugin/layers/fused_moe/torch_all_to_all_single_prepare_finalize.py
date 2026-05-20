@@ -89,7 +89,7 @@ def unpermute_and_reduce_after_alltoallv(
     output.index_add_(0, row_indices, fused_expert_output)
 
 
-class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
@@ -156,7 +156,8 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
-        quant_config: FusedMoEQuantConfig | None = None,  # Not used
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         """
         Synchronous wrapper for prepare_async.
@@ -169,6 +170,7 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         return receiver()
 
@@ -180,9 +182,11 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
-        quant_config: FusedMoEQuantConfig | None = None,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> Callable:
 
+        del quant_config, defer_input_quant
         assert not apply_router_weight_on_input
 
         # Input shapes

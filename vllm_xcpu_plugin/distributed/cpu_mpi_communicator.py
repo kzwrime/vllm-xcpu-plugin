@@ -83,7 +83,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
                     "Not supported all2all backend %s, fallback to all_to_all_single",
                     self.all2all_backend,
                 )
-                self.all2all_backend = "all_to_all_single"
+                self.all2all_backend = "all_to_all_single"  # type: ignore[assignment]
             if self.all2all_backend == "naive":  # type: ignore[has-type]
                 self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]

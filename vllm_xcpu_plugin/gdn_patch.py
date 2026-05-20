@@ -8,11 +8,15 @@ supported fused ops to torch_xcpu custom operators.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 logger = init_logger(__name__)
+
+_GDN_ATTENTION_PATCHED = False
 
 
 def _xcpu_fused_gdn_gating(
@@ -146,21 +150,34 @@ def _disable_gdn_warmup(self, mixed_qkv: torch.Tensor) -> None:
 
 
 def maybe_patch_gdn_attention() -> None:
+    global _GDN_ATTENTION_PATCHED
+
     from vllm.model_executor.layers.mamba import gdn_linear_attn as gdn
 
-    if getattr(gdn, "_xcpu_gdn_patched", False):
+    if _GDN_ATTENTION_PATCHED:
         return
 
-    gdn.fused_gdn_gating = _xcpu_fused_gdn_gating
-    gdn.fused_sigmoid_gating_delta_rule_update = (
+    _ = (
+        gdn.fused_gdn_gating,
+        gdn.fused_sigmoid_gating_delta_rule_update,
+        gdn.fused_recurrent_gated_delta_rule_packed_decode,
+        gdn.causal_conv1d_fn,
+        gdn.causal_conv1d_update,
+        gdn.GatedDeltaNetAttention._warmup_prefill_kernels,
+    )
+
+    gdn_any = cast(Any, gdn)
+    gdn_attention_cls = cast(Any, gdn.GatedDeltaNetAttention)
+    gdn_any.fused_gdn_gating = _xcpu_fused_gdn_gating
+    gdn_any.fused_sigmoid_gating_delta_rule_update = (
         _xcpu_fused_sigmoid_gating_delta_rule_update
     )
-    gdn.fused_recurrent_gated_delta_rule_packed_decode = (
+    gdn_any.fused_recurrent_gated_delta_rule_packed_decode = (
         _xcpu_fused_recurrent_gated_delta_rule_packed_decode
     )
-    gdn.causal_conv1d_fn = _xcpu_causal_conv1d_fn
-    gdn.causal_conv1d_update = _xcpu_causal_conv1d_update
-    gdn.GatedDeltaNetAttention._warmup_prefill_kernels = _disable_gdn_warmup
+    gdn_any.causal_conv1d_fn = _xcpu_causal_conv1d_fn
+    gdn_any.causal_conv1d_update = _xcpu_causal_conv1d_update
+    gdn_attention_cls._warmup_prefill_kernels = _disable_gdn_warmup
 
-    gdn._xcpu_gdn_patched = True
+    _GDN_ATTENTION_PATCHED = True
     logger.info("Patched GDN attention with xcpu custom ops")

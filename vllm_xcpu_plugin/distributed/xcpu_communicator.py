@@ -33,7 +33,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             if self.all2all_backend == "naive":  # type: ignore[has-type]
                 self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]
-                from vllm.distributed.device_communicators.all2all import (
+                from vllm_xcpu_plugin.distributed.all2all import (
                     All2allvSingleAll2AllManager,
                 )
 

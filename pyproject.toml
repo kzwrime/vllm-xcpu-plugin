@@ -60,3 +60,10 @@ plugins = ['pydantic.mypy']
 ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = [
+    "vllm_xcpu_plugin.layers.fused_moe.cpu_groupgemm_moe",
+    "vllm_xcpu_plugin.layers.fused_moe.cpu_groupgemm_moe_v1",
+]
+ignore_errors = true

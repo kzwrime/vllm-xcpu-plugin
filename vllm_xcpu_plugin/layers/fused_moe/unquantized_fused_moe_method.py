@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any, cast
+
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from torch.nn import Module
@@ -34,7 +36,7 @@ from .torch_all_to_all_single_prepare_finalize import (
 )
 
 # Map version strings to implementation classes
-_MPI_ALLTOALLV_VERSIONS = {
+_MPI_ALLTOALLV_VERSIONS: dict[str, type[Any]] = {
     "v1": MpiAlltoallvPrepareAndFinalizeV1,
     "v2": MpiAlltoallvPrepareAndFinalizeV2,
     "v3": MpiAlltoallvPrepareAndFinalizeV3,
@@ -92,7 +94,10 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
                 # Select MPI alltoallv implementation based on environment variable
                 version = envs_xcpu.VLLM_MPI_ALLTOALLV_VERSION
-                mpi_impl_class = _MPI_ALLTOALLV_VERSIONS.get(version)
+                mpi_impl_class = cast(
+                    type[FusedMoEPrepareAndFinalizeModular] | None,
+                    _MPI_ALLTOALLV_VERSIONS.get(version),
+                )
                 if mpi_impl_class is None:
                     raise ValueError(
                         f"Invalid VLLM_MPI_ALLTOALLV_VERSION: {version}. "

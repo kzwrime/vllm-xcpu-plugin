@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
 
-class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
+class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalizeModular):
     """
     High-performance CPU implementation of Expert Parallel communication.
 
@@ -146,7 +146,8 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
-        quant_config: FusedMoEQuantConfig | None = None,  # Not used
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         """
         Synchronous wrapper for prepare_async.
@@ -159,6 +160,7 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         return receiver()
 
@@ -170,9 +172,11 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
-        quant_config: FusedMoEQuantConfig | None = None,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> Callable:
 
+        del quant_config, defer_input_quant
         assert not apply_router_weight_on_input
         assert a1.shape[0] <= self.max_num_tokens, (
             "Check --max-num-batched-tokens and VLLM_MOE_DP_CHUNK_SIZE"

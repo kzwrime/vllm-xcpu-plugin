@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any, cast
+
 import torch
 
 
@@ -8,11 +10,11 @@ def _xcpu_grouped_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    e_score_correction_bias: torch.Tensor,
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if scoring_func == "softmax":
         scoring_func_idx = 0
@@ -53,21 +55,22 @@ def _xcpu_grouped_topk(
 def maybe_patch_vllm_grouped_topk() -> None:
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
-    if getattr(grouped_topk_router, "_xcpu_grouped_topk_patched", False):
+    grouped_topk_router_any = cast(Any, grouped_topk_router)
+    if getattr(grouped_topk_router_any, "_xcpu_grouped_topk_patched", False):
         return
 
-    original_grouped_topk = grouped_topk_router.grouped_topk
+    original_grouped_topk = grouped_topk_router_any.grouped_topk
 
     def _patched_grouped_topk(
         hidden_states: torch.Tensor,
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
-        e_score_correction_bias: torch.Tensor,
         num_expert_group: int = 0,
         topk_group: int = 0,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device_type = gating_output.device.type
         if device_type in ("mcpu", "privateuseone"):
@@ -83,17 +86,17 @@ def maybe_patch_vllm_grouped_topk() -> None:
                 routed_scaling_factor=routed_scaling_factor,
             )
 
-        original_grouped_topk(
+        return original_grouped_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
             topk=topk,
             renormalize=renormalize,
-            e_score_correction_bias=e_score_correction_bias,
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
         )
 
-    grouped_topk_router.grouped_topk = _patched_grouped_topk
-    grouped_topk_router._xcpu_grouped_topk_patched = True
+    grouped_topk_router_any.grouped_topk = _patched_grouped_topk
+    grouped_topk_router_any._xcpu_grouped_topk_patched = True
