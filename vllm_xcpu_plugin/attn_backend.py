@@ -44,6 +44,20 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+class XcpuTritonAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ) -> TritonAttentionMetadata:
+        attn_metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build
+        )
+        attn_metadata.kv_cache_tensor_layout = "KV_BLOCK"
+        return attn_metadata
+
+
 @register_backend(AttentionBackendEnum.TRITON_MLA)
 class XcpuTritonMLABackend(MLACommonBackend):
     @staticmethod
@@ -410,6 +424,10 @@ MLAAttention.register(XcpuTritonMLAAttention)
 class XcpuTritonAttentionBackend(TritonAttentionBackend):
     use_direct_unified_op: bool = True
     forward_includes_kv_cache_update: bool = False
+
+    @staticmethod
+    def get_builder_cls() -> type["XcpuTritonAttentionMetadataBuilder"]:
+        return XcpuTritonAttentionMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
