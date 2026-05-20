@@ -28,6 +28,7 @@ from .cpu_groupgemm_moe_v2 import CPUGroupGemmExperts
 from .mpi_alltoallv_prepare_finalize_v1 import MpiAlltoallvPrepareAndFinalizeV1
 from .mpi_alltoallv_prepare_finalize_v2 import MpiAlltoallvPrepareAndFinalizeV2
 from .mpi_alltoallv_prepare_finalize_v3 import MpiAlltoallvPrepareAndFinalizeV3
+from .mpi_alltoallv_prepare_finalize_v4 import MpiAlltoallvPrepareAndFinalizeV4
 from .torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
@@ -37,6 +38,7 @@ _MPI_ALLTOALLV_VERSIONS = {
     "v1": MpiAlltoallvPrepareAndFinalizeV1,
     "v2": MpiAlltoallvPrepareAndFinalizeV2,
     "v3": MpiAlltoallvPrepareAndFinalizeV3,
+    "v4": MpiAlltoallvPrepareAndFinalizeV4,
 }
 
 
