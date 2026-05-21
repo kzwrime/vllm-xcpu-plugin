@@ -65,7 +65,7 @@ class XcpuTritonMLABackend(MLACommonBackend):
         return "TRITON_MLA"
 
     @staticmethod
-    def get_impl_cls() -> type["XcpuTritonMLAAttention"]:
+    def get_impl_cls():
         return XcpuTritonMLAAttention
 
     @staticmethod
@@ -183,7 +183,7 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
             forward_context: ForwardContext = get_forward_context()
             attn_metadata = forward_context.attn_metadata
             if isinstance(attn_metadata, dict):
-                attn_metadata = attn_metadata[self.layer_name]
+                attn_metadata = attn_metadata[self.layer_name]  # type: ignore[assignment]
             self_kv_cache = self.kv_cache
             slot_mapping = forward_context.slot_mapping
 
@@ -192,13 +192,13 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
             )
             assert self.attn_backend.accept_output_buffer
             if self.attn_backend.accept_output_buffer:
-                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)  # type: ignore[arg-type]
                 self.forward_impl(
                     q,
                     kv_c_normed,
                     k_pe,
                     self_kv_cache,
-                    attn_metadata,
+                    attn_metadata,  # type: ignore[arg-type]
                     output=output,
                 )
                 return output
@@ -286,7 +286,7 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,  # type: ignore[override]
         output: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
@@ -313,7 +313,7 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
         kv_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,  # type: ignore[override]
+        attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,

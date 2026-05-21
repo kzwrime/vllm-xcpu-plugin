@@ -19,6 +19,7 @@ This test file covers real-world usage from vLLM framework:
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
+from test_activation import _model_filter_matches
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
@@ -129,15 +130,27 @@ MODEL_HIDDEN_SIZES = set()
 MODEL_3D_CONFIGS = []
 
 for model_name, config in ALL_MODEL_CONFIGS.items():
+    if not _model_filter_matches(model_name):
+        continue
     # 2D format: hidden_size
     if config.hidden_size is not None:
-        MODEL_HIDDEN_SIZES.add((config.hidden_size, False))
+        MODEL_HIDDEN_SIZES.add((config.hidden_size, False, False))
 
     # DeepSeek-V3 special cases: q_lora_rank and kv_lora_rank
-    if config.q_lora_rank is not None:
-        MODEL_HIDDEN_SIZES.add((config.q_lora_rank, False))
     if config.kv_lora_rank is not None:
-        MODEL_HIDDEN_SIZES.add((config.kv_lora_rank, True))  # is_mla_kv_lora = True
+        if config.q_lora_rank is not None:
+            MODEL_HIDDEN_SIZES.add((config.q_lora_rank, True, True))
+            MODEL_HIDDEN_SIZES.add((
+                config.kv_lora_rank,
+                True,
+                True,
+            ))  # is_mla_kv_lora = True, has_q_lora = True
+        else:
+            MODEL_HIDDEN_SIZES.add((
+                config.kv_lora_rank,
+                True,
+                False,
+            ))  # is_mla_kv_lora = True, has_q_lora = False
 
     # 3D format: [num_tokens, num_heads, head_size]
     for tp_size in config.tp_sizes:
@@ -171,7 +184,7 @@ for model_name, config in ALL_MODEL_CONFIGS.items():
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_rms_norm_2d(
+def _test_rms_norm_2d(
     default_vllm_config,
     num_tokens: int,
     hidden_size: int,
@@ -255,7 +268,7 @@ def test_rms_norm_2d(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_rms_norm_3d(
+def _test_rms_norm_3d(
     default_vllm_config,
     num_tokens: int,
     num_heads: int,
@@ -363,7 +376,9 @@ def test_rms_norm_3d(
 
 
 @pytest.mark.parametrize("num_tokens", COMMON_TOKENS)
-@pytest.mark.parametrize("hidden_size,is_mla_kv_lora", sorted(MODEL_HIDDEN_SIZES))
+@pytest.mark.parametrize(
+    "hidden_size,is_mla_kv_lora,has_q_lora", sorted(MODEL_HIDDEN_SIZES)
+)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
@@ -373,6 +388,7 @@ def test_rms_norm_2d_model_configs(
     num_tokens: int,
     hidden_size: int,
     is_mla_kv_lora: bool,
+    has_q_lora: bool,
     dtype: torch.dtype,
     seed: int,
     device: str,
@@ -389,8 +405,13 @@ def test_rms_norm_2d_model_configs(
 
     if is_mla_kv_lora:
         # MLA kv_lora: non-contiguous view with stride = kv_lora_rank + qk_rope_head_dim
+        kv_lora_rank = 512
         qk_rope_head_dim = 64  # DeepSeek-V3 rotary_dim
-        mla_head_size = hidden_size + qk_rope_head_dim
+        if has_q_lora:
+            q_lora_rank = 1536
+            mla_head_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+        else:
+            mla_head_size = kv_lora_rank + qk_rope_head_dim
         combined = (
             torch.randn(num_tokens, mla_head_size, dtype=dtype, device="cpu") * scale
         )

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import random
 
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
-from torch_xcpu.model_configs import ALL_MODEL_CONFIGS
+from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.activation import (
     FatreluAndMul,
     GeluAndMul,
@@ -33,6 +34,7 @@ load_general_plugins()
 
 DTYPES = [torch.bfloat16, torch.float]
 NUM_TOKENS = [1, 2, 4, 7, 8, 16, 31, 32, 64, 128, 133, 192, 256, 512, 577, 1024, 2055]
+NUM_TOKENS = COMMON_TOKENS
 D = set([512, 13824])  # Arbitrary values for testing
 SEEDS = [0]
 CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
@@ -40,7 +42,17 @@ CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
 
+
+def _model_filter_matches(model_name: str) -> bool:
+    model_filter = os.getenv("TEST_MODELS")
+    if not model_filter:
+        return True
+    return any(pattern.strip() in model_name for pattern in model_filter.split(","))
+
+
 for model_name, config in ALL_MODEL_CONFIGS.items():
+    if not _model_filter_matches(model_name):
+        continue
     if config.is_moe:
         # MoE models: use moe_intermediate_size
         width = config.moe_intermediate_size
@@ -48,7 +60,10 @@ for model_name, config in ALL_MODEL_CONFIGS.items():
             f"MoE model {model_name} must have moe_intermediate_size defined"
         )
         D.add(width)
-    else:
+        if config.n_shared_experts is not None:
+            D.add(width * config.n_shared_experts)
+
+    if config.intermediate_size is not None:
         # Dense models: consider TP configurations (width is divided by tp_size)
         base_width = config.intermediate_size
         if not config.tp_sizes:
