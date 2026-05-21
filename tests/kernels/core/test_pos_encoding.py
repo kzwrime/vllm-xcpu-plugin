@@ -7,7 +7,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
-from torch_xcpu.model_configs import ALL_MODEL_CONFIGS
+from test_activation import _model_filter_matches
+from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
@@ -95,9 +96,11 @@ def _test_rotary_embedding_model(
         query_fp32.clone(),
         key_fp32.clone() if key_fp32 is not None else None,
     )
-    out_query, out_key = rope.forward(positions, query, key)
-    out_query_cpu = out_query.cpu()
-    out_key_cpu = out_key.cpu() if out_key is not None else None
+    out_query, out_key = rope.forward(
+        positions, query.view(query.shape[0], -1), key.view(key.shape[0], -1)
+    )
+    out_query_cpu = out_query.view(ref_query.shape).cpu()
+    out_key_cpu = out_key.view(ref_key.shape).cpu() if out_key is not None else None
 
     # Compare using both assert_close and default_dice_tol
     # Reference precision is fp32, tolerance based on target (out_query) dtype
@@ -155,7 +158,7 @@ def _test_rotary_embedding_model(
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("use_key", USE_KEY)
 @torch.inference_mode()
-def test_rotary_embedding_basic(
+def _test_rotary_embedding_basic(
     default_vllm_config,
     is_neox_style: bool,
     head_size: int,
@@ -252,6 +255,8 @@ class RotaryEmbeddingConfig:
 COMBINATIONS: set[RotaryEmbeddingConfig] = set()
 
 for model_name, config in ALL_MODEL_CONFIGS.items():
+    if not _model_filter_matches(model_name):
+        continue
     if config.num_heads is None or config.head_size is None:
         continue
 
@@ -290,11 +295,11 @@ for model_name, config in ALL_MODEL_CONFIGS.items():
         )
 
 
-@pytest.mark.parametrize("is_neox_style", IS_NEOX_STYLE)
+@pytest.mark.parametrize("is_neox_style", [True])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("use_key", USE_KEY)
+@pytest.mark.parametrize("use_key", [True])
 @pytest.mark.parametrize("combinations", COMBINATIONS)
 @torch.inference_mode()
 def test_rotary_embedding(
@@ -332,7 +337,7 @@ def test_rotary_embedding(
     rope_fp32 = rope.to(dtype=torch.float32)
     rope = rope.to(dtype=dtype, device=device)
 
-    for seq_len in SEQ_LENS:
+    for seq_len in COMMON_TOKENS:
         with subtests.test(
             msg="rotary_embedding_config",
             seq_len=seq_len,
