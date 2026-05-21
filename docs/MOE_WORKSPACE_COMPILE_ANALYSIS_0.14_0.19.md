@@ -145,7 +145,7 @@ else:
 `_current_workspaces[ubatch_id]` 中切片：
 
 ```python
-current_workspace[offset:offset + actual_bytes].view(dtype).reshape(shape)
+current_workspace[offset : offset + actual_bytes].view(dtype).reshape(shape)
 ```
 
 如果 `_current_workspaces[ubatch_id]` 为空，则会分配一块新的 workspace；如果已经存在，则复用已有 tensor。
@@ -327,8 +327,7 @@ def determine_available_memory(self) -> int:
         # the profiling workspaces so compile sees fresh graph-local
         # allocations.
         logger.info(
-            "Clearing profiling workspaces before compile warmup. "
-            "compilation_mode=%s",
+            "Clearing profiling workspaces before compile warmup. compilation_mode=%s",
             self.vllm_config.compilation_config.mode.name,
         )
         clear_workspace()
