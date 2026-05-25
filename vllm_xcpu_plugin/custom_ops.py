@@ -146,14 +146,20 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             import torch_xcpu.ops as ops
 
             assert isinstance(self.weight, torch.Tensor)
-            output_parallel = ops.embedding(self.weight, masked_input.long())
+            if self.tp_size > 1:
+                output_parallel = ops.fused_embedding_masked_fill(
+                    self.weight, masked_input, input_mask
+                )
+            else:
+                output_parallel = ops.embedding(self.weight, masked_input)
             # output_parallel = torch.nn.functional.embedding(
             #     masked_input.long(), self.weight
             # )
         else:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not isinstance(self.quant_method,
+                                               UnquantizedEmbeddingMethod):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         from vllm.distributed import tensor_model_parallel_all_reduce
