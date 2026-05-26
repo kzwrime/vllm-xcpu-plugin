@@ -128,6 +128,11 @@ class McpuPlatform(Platform):
             if not is_hybrid_model:
                 cache_config.block_size = 64
 
+        # Align block_size to envs.BLOCK_SIZE_ALIGN
+        block_size_align = envs_xcpu.BLOCK_SIZE_ALIGN
+        cache_config.block_size = (
+            (cache_config.block_size + block_size_align - 1) // block_size_align
+        ) * block_size_align
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 

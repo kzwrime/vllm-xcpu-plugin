@@ -41,6 +41,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_MOE_MAX_RECV_TOKENS": lambda: int(
         os.getenv("VLLM_XCPU_MOE_MAX_RECV_TOKENS", "0")
     ),
+    # Reset block size alignment
+    "BLOCK_SIZE_ALIGN": lambda: int(os.getenv("BLOCK_SIZE_ALIGN", "16")),
 }
 
 # end-env-vars-definition
