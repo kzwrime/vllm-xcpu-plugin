@@ -92,6 +92,7 @@ def _test_fused_add_rms_norm(
     x = x_cpu.to(device)
     residual = residual_cpu.to(device)
     out, new_residual = layer(x, residual)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
     new_residual_cpu = new_residual.cpu()
 
@@ -182,6 +183,7 @@ def test_fused_add_rms_norm(
     x = x_cpu.to(device)
     residual = residual_cpu.to(device)
     out, new_residual = layer(x, residual)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
     new_residual_cpu = new_residual.cpu()
 

@@ -99,6 +99,7 @@ def _test_rotary_embedding_model(
     out_query, out_key = rope.forward(
         positions, query.view(query.shape[0], -1), key.view(key.shape[0], -1)
     )
+    torch.accelerator.synchronize()
     out_query_cpu = out_query.view(ref_query.shape).cpu()
     out_key_cpu = out_key.view(ref_key.shape).cpu() if out_key is not None else None
 

@@ -226,6 +226,7 @@ def _test_rms_norm_2d(
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
 
     # Print error metrics
@@ -334,6 +335,7 @@ def _test_rms_norm_3d(
     # Call RMSNorm layer directly on 3D tensor
     # Framework applies rms_norm to 3D tensors, normalizing along the last dimension
     out = layer(x)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
 
     # Print error metrics
@@ -430,6 +432,7 @@ def test_rms_norm_2d_model_configs(
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
 
     # Compare using both assert_close and default_dice_tol
@@ -548,6 +551,7 @@ def test_rms_norm_3d_model_configs(
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
 
     # Compare using both assert_close and default_dice_tol

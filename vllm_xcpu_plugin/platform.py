@@ -186,7 +186,12 @@ class McpuPlatform(Platform):
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
-        torch.accelerator.empty_cache()
+        # This method is used by vLLM's DeviceMemoryProfiler around model
+        # loading. On mcpu, empty_cache() is a destructive allocator operation:
+        # it synchronizes and releases cached protected pages, which can block
+        # worker startup after the model weights have been loaded. We only need
+        # allocator accounting here, so avoid releasing the cache while sampling.
+        torch.accelerator.synchronize(device)
         torch.accelerator.reset_peak_memory_stats(device)
         return torch.accelerator.max_memory_allocated(device)
 

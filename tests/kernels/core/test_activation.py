@@ -131,6 +131,7 @@ def test_act_and_mul(
     ref_out = layer_fp32.forward_native(x_fp32)
 
     out = layer(x)
+    torch.accelerator.synchronize()
     out_cpu = out.cpu()
 
     # Print error metrics
