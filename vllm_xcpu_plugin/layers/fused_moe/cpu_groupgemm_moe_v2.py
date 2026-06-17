@@ -150,10 +150,7 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         else:
             expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
-        # Handle expert_map default value.
-        if expert_map is None:
-            expert_map = torch.arange(w1.shape[0], device=device, dtype=torch.int32)
-        else:
+        if expert_map is not None:
             expert_map = expert_map.to(torch.int32)
 
         # Only allocate workspace_unpermute_and_reduce if topk_reduce=True.
