@@ -28,5 +28,6 @@ def register_ops():
 
     maybe_patch_gdn_attention()
     topk_patch.maybe_patch_vllm_topk_softmax()
+    topk_patch.maybe_patch_vllm_topk_topp_sampler()
     grouped_topk_patch.maybe_patch_vllm_grouped_topk()
     mla_patch.maybe_patch_vllm_mla_attention()
