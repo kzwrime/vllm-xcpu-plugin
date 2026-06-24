@@ -67,6 +67,10 @@ class McpuPlatform(Platform):
         torch.mcpu.set_device(device)  # type: ignore
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        torch.mcpu.manual_seed_all(seed)
+
+    @classmethod
     def current_device(cls) -> torch.device:
         """
         Return the torch device used for tensors allocated by vLLM.
