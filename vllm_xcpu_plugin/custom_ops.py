@@ -158,8 +158,9 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
         else:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
-        if self.tp_size > 1 and not isinstance(self.quant_method,
-                                               UnquantizedEmbeddingMethod):
+        if self.tp_size > 1 and not isinstance(
+            self.quant_method, UnquantizedEmbeddingMethod
+        ):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         from vllm.distributed import tensor_model_parallel_all_reduce
