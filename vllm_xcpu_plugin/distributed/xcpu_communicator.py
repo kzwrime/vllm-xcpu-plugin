@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+from typing import Any, cast
+
 import torch
 from torch.distributed import ProcessGroup
 from vllm.distributed.device_communicators.all2all import (
     All2AllManagerBase,
-    NaiveAll2AllManager,
 )
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
@@ -15,6 +17,13 @@ from vllm.logger import init_logger
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 logger = init_logger(__name__)
+
+_all2all_module = importlib.import_module(
+    "vllm.distributed.device_communicators.all2all"
+)
+NaiveAll2AllManager = cast(Any, getattr(_all2all_module, "NaiveAll2AllManager", None))
+if NaiveAll2AllManager is None:
+    NaiveAll2AllManager = cast(Any, _all2all_module.AgRsAll2AllManager)
 
 
 class CpuCommunicator(DeviceCommunicatorBase):

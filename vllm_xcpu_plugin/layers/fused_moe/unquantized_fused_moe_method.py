@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from typing import Any, cast
 
 import torch
@@ -164,14 +165,19 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
 
-        self.kernel = mk.FusedMoEKernel(
+        kernel_cls = cast(Any, mk.FusedMoEKernel)
+        kernel_kwargs = {}
+        if "inplace" in inspect.signature(kernel_cls).parameters:
+            kernel_kwargs["inplace"] = False
+
+        self.kernel = kernel_cls(
             MoEPrepareAndFinalizeNoDPEPModular(),
             CPUGroupGemmExperts(
                 moe_config=self.moe,
                 quant_config=self.moe_quant_config,
                 topk_reduce=self.topk_reduce,
             ),
-            inplace=False,
+            **kernel_kwargs,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

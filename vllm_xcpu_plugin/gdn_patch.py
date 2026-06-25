@@ -144,15 +144,20 @@ def _xcpu_fused_recurrent_gated_delta_rule_packed_decode(
     )
 
 
-def _disable_gdn_warmup(self, mixed_qkv: torch.Tensor) -> None:
-    del self, mixed_qkv
+# TODO: may be we should enable warmup in vllm v0.23.0
+def _disable_gdn_warmup(
+    self,
+    mixed_qkv: torch.Tensor,
+    v_dim: int = 0,
+) -> None:
+    del self, mixed_qkv, v_dim
     return None
 
 
 def maybe_patch_gdn_attention() -> None:
     global _GDN_ATTENTION_PATCHED
 
-    from vllm.model_executor.layers.mamba import gdn_linear_attn as gdn
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
     if _GDN_ATTENTION_PATCHED:
         return
@@ -163,11 +168,9 @@ def maybe_patch_gdn_attention() -> None:
         gdn.fused_recurrent_gated_delta_rule_packed_decode,
         gdn.causal_conv1d_fn,
         gdn.causal_conv1d_update,
-        gdn.GatedDeltaNetAttention._warmup_prefill_kernels,
     )
 
     gdn_any = cast(Any, gdn)
-    gdn_attention_cls = cast(Any, gdn.GatedDeltaNetAttention)
     gdn_any.fused_gdn_gating = _xcpu_fused_gdn_gating
     gdn_any.fused_sigmoid_gating_delta_rule_update = (
         _xcpu_fused_sigmoid_gating_delta_rule_update
@@ -177,7 +180,13 @@ def maybe_patch_gdn_attention() -> None:
     )
     gdn_any.causal_conv1d_fn = _xcpu_causal_conv1d_fn
     gdn_any.causal_conv1d_update = _xcpu_causal_conv1d_update
-    gdn_attention_cls._warmup_prefill_kernels = _disable_gdn_warmup
+
+    for cls_name in ("QwenGatedDeltaNetAttention", "GatedDeltaNetAttention"):
+        gdn_attention_cls = cast(Any, getattr(gdn, cls_name, None))
+        if gdn_attention_cls is not None and hasattr(
+            gdn_attention_cls, "_warmup_prefill_kernels"
+        ):
+            gdn_attention_cls._warmup_prefill_kernels = _disable_gdn_warmup
 
     _GDN_ATTENTION_PATCHED = True
     logger.info("Patched GDN attention with xcpu custom ops")
