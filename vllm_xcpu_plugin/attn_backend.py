@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 from vllm.config import (
@@ -18,12 +20,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionLayer,
     AttentionType,
-    is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
@@ -54,12 +58,13 @@ class XcpuTritonAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
-        attn_metadata.kv_cache_tensor_layout = "KV_BLOCK"
         return attn_metadata
 
 
 @register_backend(AttentionBackendEnum.TRITON_MLA)
 class XcpuTritonMLABackend(MLACommonBackend):
+    accept_output_buffer: bool = True
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA"
@@ -179,29 +184,28 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
         assert self.use_direct_call
-        if self.use_direct_call:
-            forward_context: ForwardContext = get_forward_context()
-            attn_metadata = forward_context.attn_metadata
-            if isinstance(attn_metadata, dict):
-                attn_metadata = attn_metadata[self.layer_name]  # type: ignore[assignment]
-            self_kv_cache = self.kv_cache
-            slot_mapping = forward_context.slot_mapping
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]  # type: ignore[assignment]
+        self_kv_cache = self.kv_cache
+        slot_mapping = forward_context.slot_mapping
 
-            assert isinstance(slot_mapping, dict), (
-                f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
-            )
-            assert self.attn_backend.accept_output_buffer
-            if self.attn_backend.accept_output_buffer:
-                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)  # type: ignore[arg-type]
-                self.forward_impl(
-                    q,
-                    kv_c_normed,
-                    k_pe,
-                    self_kv_cache,
-                    attn_metadata,  # type: ignore[arg-type]
-                    output=output,
-                )
-                return output
+        assert isinstance(slot_mapping, dict), (
+            f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
+        )
+        attn_backend = cast(Any, self.attn_backend)
+        assert attn_backend.accept_output_buffer
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)  # type: ignore[arg-type]
+        self.forward_impl(
+            q,
+            kv_c_normed,
+            k_pe,
+            self_kv_cache,
+            attn_metadata,  # type: ignore[arg-type]
+            output=output,
+        )
+        return output
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # we currently do not have quantized bmm's which are needed for
