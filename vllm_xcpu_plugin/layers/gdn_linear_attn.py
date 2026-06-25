@@ -1,5 +1,7 @@
 import torch
-from vllm.model_executor.layers.mamba.gdn_linear_attn import ChunkGatedDeltaRule
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    ChunkGatedDeltaRule,
+)
 
 
 @ChunkGatedDeltaRule.register_oot

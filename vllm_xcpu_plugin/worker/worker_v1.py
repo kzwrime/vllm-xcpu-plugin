@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -70,6 +71,10 @@ class McpuWorker(Worker):
                     eplb.log_all_statistics(is_profiler_stop=True)
 
             self.profiler.add_stop_callback(_eplb_on_profiler_stop)
+
+    def _maybe_get_memory_pool_context(self, tag: str):
+        del tag
+        return nullcontext()
 
     def init_device(self):
         import torch_mcpu  # noqa

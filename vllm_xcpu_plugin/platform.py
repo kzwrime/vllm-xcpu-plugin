@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import faulthandler
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import vllm.envs as envs
@@ -64,11 +64,11 @@ class McpuPlatform(Platform):
         """
         Set the device for the current platform.
         """
-        torch.mcpu.set_device(device)  # type: ignore
+        cast(Any, torch).mcpu.set_device(device)
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
-        torch.mcpu.manual_seed_all(seed)
+        cast(Any, torch).mcpu.manual_seed_all(seed)
 
     @classmethod
     def current_device(cls) -> torch.device:

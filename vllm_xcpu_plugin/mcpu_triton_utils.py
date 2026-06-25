@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import Any, cast
 
 import torch
 
@@ -250,15 +251,16 @@ def patch_vllm_triton_kernels() -> None:
     vllm.v1.worker.gpu.mm.rope._prepare_rope_positions_kernel = (
         prepare_rope_positions_kernel
     )
-    vllm.v1.worker.gpu.spec_decode.eagle.speculator._prepare_eagle_inputs_kernel = (
-        prepare_eagle_inputs_kernel
+    eagle_speculator = cast(
+        Any, vllm.v1.worker.gpu.spec_decode.eagle.speculator
     )
-    vllm.v1.worker.gpu.spec_decode.eagle.speculator._prepare_eagle_docode_kernel = (
-        prepare_eagle_docode_kernel
+    eagle_speculator._prepare_eagle_inputs_kernel = prepare_eagle_inputs_kernel
+    eagle_speculator._prepare_eagle_docode_kernel = prepare_eagle_docode_kernel
+    eagle_speculator._update_eagle_inputs_kernel = update_eagle_inputs_kernel
+
+    rejection_sampler = cast(
+        Any, vllm.v1.worker.gpu.spec_decode.rejection_sampler
     )
-    vllm.v1.worker.gpu.spec_decode.eagle.speculator._update_eagle_inputs_kernel = (
-        update_eagle_inputs_kernel
-    )
-    vllm.v1.worker.gpu.spec_decode.rejection_sampler._strict_rejection_sample_kernel = (
+    rejection_sampler._strict_rejection_sample_kernel = (
         strict_rejection_sample_kernel
     )
