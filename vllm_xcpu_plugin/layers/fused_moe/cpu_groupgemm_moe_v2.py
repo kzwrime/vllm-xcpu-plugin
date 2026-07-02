@@ -83,7 +83,7 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         # It produces the final output directly.
         workspace13 = (0,)
         workspace2 = (0,)
-        output = (M, K)
+        output = (M, K) if self.topk_reduce else (M * topk, K)
         return workspace13, workspace2, output
 
     def apply(
@@ -126,6 +126,12 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         num_experts = w1.shape[0]
         device = hidden_states.device
         fdtype = hidden_states.dtype
+
+        if not self.topk_reduce and topk != 1:
+            raise ValueError(
+                "CPU MoE without expert-side top-k reduction expects the "
+                f"prepare/finalize path to flatten routing to topk=1, got {topk}"
+            )
 
         # Allocate buffers using M_full_padding.
         permuted_hidden_states = torch.empty(
