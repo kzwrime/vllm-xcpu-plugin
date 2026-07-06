@@ -119,7 +119,7 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             prefix,
         )
 
-    def forward_oot(self, input_):
+    def forward(self, input_):
 
         if self.tp_size > 1:
             import torch_xcpu.ops as ops
