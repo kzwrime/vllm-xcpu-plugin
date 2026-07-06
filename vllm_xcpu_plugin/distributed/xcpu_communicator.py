@@ -58,7 +58,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             logger.info("Using all2all_backend = %s", self.all2all_backend)
 
     def all_reduce(self, input_):
-        torch.distributed.all_reduce(input_, group=self.cpu_group)
+        torch.distributed.all_reduce(input_, group=self.device_group)
         return input_
 
     def gather(
