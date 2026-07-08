@@ -42,6 +42,12 @@ def _xcpu_causal_conv1d_fn(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
+    metadata: object | None = None,
     **_: object,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -56,6 +62,12 @@ def _xcpu_causal_conv1d_fn(
         has_initial_state=has_initial_state,
         activation=activation,
         pad_slot_id=pad_slot_id,
+        block_idx_first_scheduled_token=block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+        initial_state_idx=initial_state_idx,
+        num_computed_tokens=num_computed_tokens,
+        block_size_to_align=block_size_to_align,
+        metadata=metadata,
     )
 
 
@@ -70,6 +82,8 @@ def _xcpu_causal_conv1d_update(
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
     **_: object,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -85,6 +99,8 @@ def _xcpu_causal_conv1d_update(
         query_start_loc=query_start_loc,
         max_query_len=max_query_len,
         pad_slot_id=pad_slot_id,
+        block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+        initial_state_idx=initial_state_idx,
     )
 
 
