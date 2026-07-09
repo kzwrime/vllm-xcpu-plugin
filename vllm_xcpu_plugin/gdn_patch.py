@@ -88,6 +88,34 @@ def _xcpu_causal_conv1d_update(
     )
 
 
+def _xcpu_fused_post_conv_prep(
+    conv_output: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_k_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    apply_l2norm: bool = True,
+    output_g_exp: bool = False,
+) -> torch.Tensor:
+    import torch_xcpu
+
+    return torch_xcpu.ops.fused_post_conv_prep(
+        conv_output=conv_output,
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        apply_l2norm=apply_l2norm,
+        output_g_exp=output_g_exp,
+    )
+
+
 def _xcpu_fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -98,7 +126,14 @@ def _xcpu_fused_sigmoid_gating_delta_rule_update(
     v: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
-    **kwargs: object,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    inplace_final_state: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    is_kda: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     import torch_xcpu
 
@@ -112,7 +147,14 @@ def _xcpu_fused_sigmoid_gating_delta_rule_update(
         v=v,
         beta=beta,
         threshold=threshold,
-        **kwargs,
+        scale=scale,
+        initial_state=initial_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        is_kda=is_kda,
     )
 
 
@@ -164,6 +206,7 @@ def maybe_patch_gdn_attention() -> None:
 
     _ = (
         gdn.fused_gdn_gating,
+        gdn.fused_post_conv_prep,
         gdn.fused_sigmoid_gating_delta_rule_update,
         gdn.fused_recurrent_gated_delta_rule_packed_decode,
         gdn.causal_conv1d_fn,
@@ -172,6 +215,7 @@ def maybe_patch_gdn_attention() -> None:
 
     gdn_any = cast(Any, gdn)
     gdn_any.fused_gdn_gating = _xcpu_fused_gdn_gating
+    gdn_any.fused_post_conv_prep = _xcpu_fused_post_conv_prep
     gdn_any.fused_sigmoid_gating_delta_rule_update = (
         _xcpu_fused_sigmoid_gating_delta_rule_update
     )

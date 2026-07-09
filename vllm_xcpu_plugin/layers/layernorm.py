@@ -37,7 +37,7 @@ class XcpuRMSNormGated(RMSNormGated):
     ) -> torch.Tensor:
         import torch_xcpu.ops as ops
 
-        if self.activation != "swish":
+        if self.activation not in ["silu", "swish"]:
             _not_implemented(
                 f"RMSNormGated only supports activation='swish', "
                 f"got {self.activation!r}"
