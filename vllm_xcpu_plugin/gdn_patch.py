@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 logger = init_logger(__name__)
 
@@ -42,6 +42,7 @@ def _xcpu_causal_conv1d_fn(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int = NULL_BLOCK_ID,
     **_: object,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -56,6 +57,7 @@ def _xcpu_causal_conv1d_fn(
         has_initial_state=has_initial_state,
         activation=activation,
         pad_slot_id=pad_slot_id,
+        null_block_id=null_block_id,
     )
 
 
@@ -69,7 +71,7 @@ def _xcpu_causal_conv1d_update(
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
-    pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int = NULL_BLOCK_ID,
     **_: object,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -84,7 +86,7 @@ def _xcpu_causal_conv1d_update(
         num_accepted_tokens=num_accepted_tokens,
         query_start_loc=query_start_loc,
         max_query_len=max_query_len,
-        pad_slot_id=pad_slot_id,
+        null_block_id=null_block_id,
     )
 
 
