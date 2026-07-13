@@ -115,7 +115,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        import torch_mpi_ext
+        from torch_xcpu import ops as xcpu_ops
 
         # logger.info(f"all_gather rank: {self.mpi_group_rank}, "
         #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
@@ -136,7 +136,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
 
-        torch_mpi_ext.ops.all_gather_into_tensor_out_wrapper(
+        xcpu_ops.all_gather_into_tensor_out_v2(
             output_tensor, input_, self.comm_ptr_wrapper, dim=dim
         )
 
