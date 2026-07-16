@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -444,6 +445,20 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # TODO: update for kv transfer
+        cache_layout = get_kv_cache_layout()
+        if cache_layout != "NHD":
+            raise ValueError(f"cache_layout={cache_layout} is not supported.")
+        if include_num_layers_dimension:
+            return (0, 1, 2, 3, 4, 5)
+        else:
+            stride_order = (0, 1, 2, 3, 4)
+        return stride_order
 
     @staticmethod
     def get_impl_cls() -> type["XcpuTritonAttentionImpl"]:
