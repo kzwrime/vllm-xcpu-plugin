@@ -11,8 +11,6 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_xcpu_plugin import mcpu_triton_utils as mcpu_tl
-
 if TYPE_CHECKING:
     pass
 
@@ -32,11 +30,6 @@ class McpuModelRunner(GPUModelRunner):
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
 
-        self._postprocess_triton()
-
-    def _postprocess_triton(self) -> None:
-        mcpu_tl.patch_vllm_triton_kernels()
-
 
 class McpuModelRunnerV2(GPUModelRunnerV2):
     """A model runner for XPU devices."""
@@ -48,7 +41,6 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
-        mcpu_tl.patch_vllm_triton_kernels()
 
 
 @contextmanager

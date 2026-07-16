@@ -2,6 +2,10 @@
 
 vLLM 自定义操作插件示例，展示如何通过 plugin 机制扩展 vLLM 算子。
 
+## 维护者文档
+
+- [Triton 兼容性与新算子接入指南](docs/TRITON_COMPATIBILITY_GUIDE.md)：Fake Triton 用法、新 kernel 接入流程、`torch.compile` 注意事项与排障原理。
+
 ## 项目结构
 
 ```
