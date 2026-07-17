@@ -277,6 +277,88 @@ def _prepare_pos_seq_lens(launch: KernelLaunch) -> None:
     )
 
 
+def _prepare_rope_positions(launch: KernelLaunch) -> None:
+    """Dispatch V2 M-RoPE/XD-RoPE position preparation to torch_mcpu.
+
+    The Triton kernel writes only the query-token interval for every active
+    request.  In particular, ``positions`` deliberately has a padded last
+    column and is therefore non-contiguous in dimension zero; preserve its
+    explicit row stride instead of requiring a contiguous tensor.
+    """
+    args = launch.arguments
+    positions = args["positions_ptr"]
+    prefill_positions = args["prefill_positions_ptr"]
+    num_reqs = args["idx_mapping_ptr"].numel()
+    num_dims = args["NUM_DIMS"]
+    _expect_grid(launch, (num_reqs,))
+    _expect(args["BLOCK_SIZE"] == 1024, "RoPE BLOCK_SIZE must be 1024")
+    _expect(num_dims > 0, "RoPE NUM_DIMS must be positive")
+    _expect(positions.ndim == 2, "RoPE positions must be 2D")
+    _expect(prefill_positions.ndim == 2, "RoPE prefill positions must be 2D")
+    _expect(positions.shape[0] == num_dims, "RoPE positions NUM_DIMS mismatch")
+    _expect(
+        prefill_positions.shape[0] >= num_dims,
+        "RoPE prefill positions do not cover NUM_DIMS",
+    )
+    _expect(
+        args["positions_stride"] == positions.stride(0),
+        "RoPE positions stride mismatch",
+    )
+    # ``prefill_positions`` is [max_num_reqs * NUM_DIMS, max_model_len].
+    # The Triton ABI groups its rows by request, so stride0 is NUM_DIMS rows
+    # and stride1 is one row -- neither is the Tensor's dimension-1 stride.
+    _expect(
+        args["prefill_positions_stride1"] == prefill_positions.stride(0),
+        "RoPE prefill positions stride1 mismatch",
+    )
+    _expect(
+        args["prefill_positions_stride0"]
+        == num_dims * args["prefill_positions_stride1"],
+        "RoPE prefill positions stride0 must span NUM_DIMS rows",
+    )
+    _expect(
+        prefill_positions.stride(1) == 1,
+        "RoPE prefill positions columns must have unit stride",
+    )
+    _expect(
+        args["query_start_loc_ptr"].numel() == num_reqs + 1,
+        "RoPE query_start_loc size mismatch",
+    )
+    torch.ops.mcpu.prepare_rope_positions_kernel_impl(
+        positions,
+        args["positions_stride"],
+        prefill_positions,
+        args["prefill_positions_stride0"],
+        args["prefill_positions_stride1"],
+        args["prefill_delta_ptr"],
+        args["idx_mapping_ptr"],
+        args["query_start_loc_ptr"],
+        args["prefill_lens_ptr"],
+        args["num_computed_tokens_ptr"],
+        num_dims,
+    )
+
+
+def _scatter_num_accepted(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    idx_mapping = args["idx_mapping_ptr"]
+    num_sampled = args["num_sampled_ptr"]
+    num_accepted = args["num_accepted_ptr"]
+    _expect_grid(launch, (idx_mapping.numel(),))
+    _expect(idx_mapping.ndim == 1, "num-accepted idx_mapping must be 1D")
+    _expect(num_sampled.ndim == 1, "num-accepted num_sampled must be 1D")
+    _expect(num_accepted.ndim == 1, "num-accepted output must be 1D")
+    _expect(
+        num_sampled.numel() == idx_mapping.numel(),
+        "num-accepted input size mismatch",
+    )
+    torch.ops.mcpu.vllm_scatter_num_accepted(
+        idx_mapping,
+        num_sampled,
+        num_accepted,
+    )
+
+
 def _get_num_sampled_and_rejected(launch: KernelLaunch) -> None:
     args = launch.arguments
     _expect_grid(launch, (args["idx_mapping_ptr"].numel(),))
@@ -542,6 +624,22 @@ _KERNELS: tuple[
         "5e42c1095fe391474d4cac66c76dba29259a62ff2a20ce5cf0ce5df7d52accef",
         "41458ec9cbc4829bfd42e070efdc5be7d1c6fd0a884d674324a6d0496296a096",
         _prepare_pos_seq_lens,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.mm.rope",
+        "_prepare_rope_positions_kernel",
+        "65158c5c27896b717e28c9b6727aa95285969e1221526faa531c0cf5b766bd34",
+        "7b68271fdc1121235ae9233ae2da4fa18745e1bb8c65e69373649a8545e4e81d",
+        _prepare_rope_positions,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.model_states.mamba_hybrid",
+        "_scatter_num_accepted_kernel",
+        "20bca6b80f9d2a5d6a51a88bf683256fd9d15efe05a1592da25d7d2f31d5b107",
+        "5619eaf2ab8f252bf3562bd92a9c78da16e96c5daada7a8c8aed720983daa19e",
+        _scatter_num_accepted,
         (),
     ),
     (
