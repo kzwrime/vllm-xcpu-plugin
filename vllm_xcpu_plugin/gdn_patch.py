@@ -72,10 +72,17 @@ def _xcpu_causal_conv1d_update(
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     null_block_id: int = NULL_BLOCK_ID,
-    **_: object,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    validate_data: bool = False,
+    **kwargs: object,
 ) -> torch.Tensor:
     import torch_xcpu
 
+    if kwargs:
+        raise TypeError(
+            f"unsupported causal_conv1d_update kwargs: {sorted(kwargs)}"
+        )
     return torch_xcpu.ops.causal_conv1d_update(
         x=x,
         conv_state=conv_state,
@@ -87,6 +94,9 @@ def _xcpu_causal_conv1d_update(
         query_start_loc=query_start_loc,
         max_query_len=max_query_len,
         null_block_id=null_block_id,
+        block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+        initial_state_idx=initial_state_idx,
+        validate_data=validate_data,
     )
 
 

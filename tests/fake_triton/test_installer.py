@@ -90,6 +90,20 @@ targets = {
         "_post_update_num_computed_tokens_kernel",
         "_expand_idx_mapping_kernel",
     ],
+    "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator": [
+        "_prepare_prefill_inputs_kernel",
+        "_prepare_decode_inputs_kernel",
+        "_update_draft_inputs_kernel",
+    ],
+    "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils": [
+        "_compute_block_stats_kernel",
+        "_rejection_kernel",
+        "_resample_kernel",
+        "_insert_resampled_kernel",
+    ],
+    "vllm.v1.worker.gpu.spec_decode.rejection_sampler": [
+        "_flatten_sampled_kernel",
+    ],
     "vllm.v1.worker.gpu.structured_outputs": [
         "_apply_grammar_bitmask_kernel"
     ],
@@ -107,6 +121,17 @@ targets = {
     ],
     "vllm.v1.worker.gpu.sample.prompt_logprob": [
         "_prompt_logprobs_token_ids_kernel"
+    ],
+    "vllm.v1.sample.rejection_sampler": [
+        "expand_kernel",
+        "rejection_greedy_sample_kernel",
+        "sample_recovered_tokens_kernel",
+        "rejection_random_sample_kernel",
+    ],
+    "vllm.v1.spec_decode.utils": [
+        "eagle_prepare_next_token_padded_kernel",
+        "eagle_prepare_inputs_padded_kernel",
+        "eagle_step_slot_mapping_metadata_kernel",
     ],
 }
 
@@ -147,7 +172,7 @@ print(json.dumps({
     assert payload == {
         "has_triton": True,
         "marker": True,
-        "count": 22,
+        "count": 37,
         "failed_closed": True,
     }
 
@@ -161,8 +186,12 @@ import torch
 
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    _compute_block_stats_kernel,
+)
 from vllm.v1.worker.gpu.structured_outputs import _apply_grammar_bitmask_kernel
-from vllm_xcpu_plugin.fake_triton.runtime import get_registry
+from vllm.v1.sample.rejection_sampler import expand_kernel
+from vllm_xcpu_plugin.fake_triton.runtime import InvalidLaunchError, get_registry
 from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
 
 register_vllm_kernels()
@@ -198,11 +227,79 @@ _compute_slot_mapping_kernel[(2,)](
     PAD_ID=-1,
     BLOCK_SIZE=1024,
 )
+expand_input = torch.tensor([0.5, 0.0, 0.25], device="mcpu")
+cu_num_tokens = torch.tensor([2, 2, 5], dtype=torch.int32, device="mcpu")
+expanded = torch.empty(5, device="mcpu")
+expand_kernel[(3,)](
+    expanded,
+    expand_input,
+    cu_num_tokens,
+    0,
+    1,
+    MAX_NUM_TOKENS=128,
+)
+invalid_max_rejected = False
+try:
+    expand_kernel[(3,)](
+        expanded,
+        expand_input,
+        cu_num_tokens,
+        0,
+        1,
+        MAX_NUM_TOKENS=0,
+    )
+except InvalidLaunchError:
+    invalid_max_rejected = True
+block_target = torch.tensor([[1.0, 3.0, 2.0]], device="mcpu")
+dummy_draft = torch.empty((1, 1, 1), device="mcpu")
+block_argmax = torch.full((1, 1), -1, dtype=torch.int64, device="mcpu")
+block_target_max = torch.full((1, 1), -1.0, device="mcpu")
+block_target_sumexp = torch.full((1, 1), -1.0, device="mcpu")
+block_draft_max = torch.full((1, 1), -7.0, device="mcpu")
+block_draft_sumexp = torch.full((1, 1), -7.0, device="mcpu")
+block_mapping = torch.tensor([0], dtype=torch.int32, device="mcpu")
+block_pos = torch.tensor([0], dtype=torch.int32, device="mcpu")
+block_temp = torch.tensor([1.0], device="mcpu")
+_compute_block_stats_kernel[(1, 1)](
+    block_argmax,
+    block_argmax.stride(0),
+    block_target_max,
+    block_target_max.stride(0),
+    block_target_sumexp,
+    block_target_sumexp.stride(0),
+    block_draft_max,
+    block_draft_max.stride(0),
+    block_draft_sumexp,
+    block_draft_sumexp.stride(0),
+    block_target,
+    block_target.stride(0),
+    dummy_draft,
+    dummy_draft.stride(0),
+    dummy_draft.stride(1),
+    block_mapping,
+    block_pos,
+    block_temp,
+    3,
+    1,
+    BLOCK_SIZE=8192,
+    HAS_DRAFT_LOGITS=False,
+)
 torch.mcpu.synchronize()
 registry = get_registry()
 print(json.dumps({
     "has_triton": HAS_TRITON,
     "registrations": len(registry.registrations()),
+    "expand_launches": registry.launch_counts()[
+        "vllm.v1.sample.rejection_sampler.expand_kernel"
+    ],
+    "expanded": expanded.cpu().tolist(),
+    "invalid_max_rejected": invalid_max_rejected,
+    "block_stats_launches": registry.launch_counts()[
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils."
+        "_compute_block_stats_kernel"
+    ],
+    "block_target_max": block_target_max.cpu().tolist(),
+    "block_draft_max": block_draft_max.cpu().tolist(),
     "grammar_launches": registry.launch_counts()[
         "vllm.v1.worker.gpu.structured_outputs._apply_grammar_bitmask_kernel"
     ],
@@ -229,9 +326,54 @@ print(json.dumps({
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
         "has_triton": True,
-        "registrations": 22,
+        "registrations": 39,
+        "expand_launches": 1,
+        "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],
+        "invalid_max_rejected": True,
+        "block_stats_launches": 1,
+        "block_target_max": [[3.0]],
+        "block_draft_max": [[-7.0]],
         "grammar_launches": 1,
         "v1_slot_launches": 1,
         "v1_slots": [40, 45, -1, -1],
         "masked": [True, True],
+    }
+
+
+def test_topk_topp_patch_updates_preimported_rejection_sampler_alias():
+    repo = Path(__file__).parents[2]
+    code = """
+import json
+import os
+
+os.environ["VLLM_USE_XCPU_TOPK_TOPP_SAMPLER"] = "1"
+
+import vllm.v1.sample.ops.topk_topp_sampler as topk_topp_sampler
+import vllm.v1.sample.rejection_sampler as rejection_sampler
+from vllm_xcpu_plugin.topk_patch import maybe_patch_vllm_topk_topp_sampler
+
+old_alias = rejection_sampler.apply_top_k_top_p
+maybe_patch_vllm_topk_topp_sampler()
+
+print(json.dumps({
+    "definition_patched":
+        topk_topp_sampler.apply_top_k_top_p is not old_alias,
+    "alias_patched":
+        rejection_sampler.apply_top_k_top_p
+        is topk_topp_sampler.apply_top_k_top_p,
+}))
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "definition_patched": True,
+        "alias_patched": True,
     }

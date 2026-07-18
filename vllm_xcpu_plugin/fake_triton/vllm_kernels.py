@@ -263,6 +263,121 @@ def _prepare_prefill_inputs(launch: KernelLaunch) -> None:
     )
 
 
+def _autoregressive_prepare_prefill_inputs(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["idx_mapping_ptr"].numel()
+    max_num_reqs = args["max_num_reqs"]
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        args["BLOCK_SIZE"] == 1024,
+        "autoregressive prefill BLOCK_SIZE must be 1024",
+    )
+    _expect(num_reqs > 0, "autoregressive prefill requires requests")
+    _expect(max_num_reqs >= num_reqs, "max_num_reqs is smaller than active batch")
+    _expect(
+        args["query_start_loc_ptr"].numel() >= num_reqs + 1,
+        "autoregressive prefill query_start_loc is too short",
+    )
+    _expect(
+        args["draft_query_start_loc_ptr"].numel() >= max_num_reqs + 1,
+        "autoregressive draft query_start_loc is too short",
+    )
+    torch.ops.mcpu.vllm_autoregressive_prepare_prefill_inputs(
+        args["last_token_indices_ptr"],
+        args["draft_current_step_ptr"],
+        args["draft_input_ids_ptr"],
+        args["draft_positions_ptr"],
+        args["draft_query_start_loc_ptr"],
+        args["draft_seq_lens_ptr"],
+        args["target_input_ids_ptr"],
+        args["target_positions_ptr"],
+        args["idx_mapping_ptr"],
+        args["last_sampled_ptr"],
+        args["next_prefill_tokens_ptr"],
+        args["num_sampled_ptr"],
+        args["num_rejected_ptr"],
+        args["query_start_loc_ptr"],
+        args["seq_lens_ptr"],
+        max_num_reqs,
+    )
+
+
+def _autoregressive_prepare_decode_inputs(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["draft_tokens_ptr"].shape[0]
+    _expect_grid(launch, (num_reqs + 1,))
+    _expect(
+        args["BLOCK_SIZE"] == 1024,
+        "autoregressive decode BLOCK_SIZE must be 1024",
+    )
+    _expect(
+        args["draft_tokens_stride"] == args["draft_tokens_ptr"].stride(0),
+        "autoregressive draft token stride mismatch",
+    )
+    _expect(
+        args["max_num_reqs"] >= num_reqs,
+        "max_num_reqs is smaller than active decode batch",
+    )
+    torch.ops.mcpu.vllm_autoregressive_prepare_decode_inputs(
+        args["draft_tokens_ptr"],
+        args["draft_tokens_stride"],
+        args["target_seq_lens_ptr"],
+        args["num_rejected_ptr"],
+        args["input_ids_ptr"],
+        args["positions_ptr"],
+        args["query_start_loc_ptr"],
+        args["seq_lens_ptr"],
+        args["max_model_len"],
+        args["max_num_reqs"],
+        args["ADVANCE_DRAFT_POSITIONS"],
+    )
+
+
+def _autoregressive_update_draft_inputs(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["draft_tokens_ptr"].numel()
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        args["BLOCK_SIZE"] == 1024,
+        "autoregressive update BLOCK_SIZE must be 1024",
+    )
+    _expect(
+        args["output_draft_tokens_stride"]
+        == args["output_draft_tokens_ptr"].stride(0),
+        "output draft token stride mismatch",
+    )
+    _expect(
+        args["next_input_hidden_states_stride"]
+        == args["next_input_hidden_states_ptr"].stride(0),
+        "next input hidden state stride mismatch",
+    )
+    _expect(
+        args["hidden_states_stride"] == args["hidden_states_ptr"].stride(0),
+        "hidden state stride mismatch",
+    )
+    _expect(
+        args["hidden_size"] == args["hidden_states_ptr"].shape[1],
+        "hidden_size mismatch",
+    )
+    torch.ops.mcpu.vllm_autoregressive_update_draft_inputs(
+        args["output_draft_tokens_ptr"],
+        args["output_draft_tokens_stride"],
+        args["next_input_hidden_states_ptr"],
+        args["next_input_hidden_states_stride"],
+        args["input_ids_ptr"],
+        args["positions_ptr"],
+        args["seq_lens_ptr"],
+        args["draft_tokens_ptr"],
+        args["current_draft_step_ptr"],
+        args["hidden_states_ptr"],
+        args["hidden_states_stride"],
+        args["hidden_size"],
+        args["max_model_len"],
+        args["num_speculative_steps"],
+        args["ADVANCE_DRAFT_POSITIONS"],
+    )
+
+
 def _prepare_pos_seq_lens(launch: KernelLaunch) -> None:
     args = launch.arguments
     _expect_grid(launch, (args["idx_mapping_ptr"].numel() + 1,))
@@ -392,6 +507,347 @@ def _expand_idx_mapping(launch: KernelLaunch) -> None:
         args["expanded_idx_mapping_ptr"].numel(),
         args["cu_num_logits_ptr"],
         args["BLOCK_SIZE"],
+    )
+
+
+def _rejection_sampler_expand(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    input_tensor = args["input_ptr"]
+    output = args["output_ptr"]
+    cu_num_tokens = args["cu_num_tokens_ptr"]
+    batch_size = input_tensor.numel()
+    _expect_grid(launch, (batch_size,))
+    _expect(output.ndim == 1, "rejection sampler expand output must be 1D")
+    _expect(input_tensor.ndim == 1, "rejection sampler expand input must be 1D")
+    _expect(cu_num_tokens.ndim == 1, "cu_num_tokens must be 1D")
+    _expect(cu_num_tokens.numel() == batch_size, "cu_num_tokens size mismatch")
+    _expect(output.dtype == input_tensor.dtype, "expand dtype mismatch")
+    _expect(args["MAX_NUM_TOKENS"] > 0, "MAX_NUM_TOKENS must be positive")
+    torch.ops.mcpu.vllm_rejection_sampler_expand(
+        output,
+        input_tensor,
+        cu_num_tokens,
+        args["replace_from"],
+        args["replace_to"],
+        args["MAX_NUM_TOKENS"],
+    )
+
+
+def _rejection_compute_block_stats(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    target_logits = args["target_logits_ptr"]
+    vocab_size = args["vocab_size"]
+    block_size = args["BLOCK_SIZE"]
+    num_logits = target_logits.shape[0]
+    num_blocks = (vocab_size + block_size - 1) // block_size
+    _expect_grid(launch, (num_logits, num_blocks))
+    _expect(block_size == 8192, "rejection block stats BLOCK_SIZE must be 8192")
+    _expect(
+        args["target_logits_stride"] == target_logits.stride(0),
+        "target logits stride mismatch",
+    )
+    draft_logits = args["draft_logits_ptr"]
+    _expect(
+        args["draft_logits_stride_0"] == draft_logits.stride(0)
+        and args["draft_logits_stride_1"] == draft_logits.stride(1),
+        "draft logits stride mismatch",
+    )
+    for tensor_name, stride_name in (
+        ("target_local_argmax_ptr", "target_local_argmax_stride"),
+        ("target_local_max_ptr", "target_local_max_stride"),
+        ("target_local_sumexp_ptr", "target_local_sumexp_stride"),
+        ("draft_local_max_ptr", "draft_local_max_stride"),
+        ("draft_local_sumexp_ptr", "draft_local_sumexp_stride"),
+    ):
+        _expect(
+            args[stride_name] == args[tensor_name].stride(0),
+            f"{tensor_name} stride mismatch",
+        )
+    torch.ops.mcpu.vllm_rejection_compute_block_stats(
+        args["target_local_argmax_ptr"],
+        args["target_local_max_ptr"],
+        args["target_local_sumexp_ptr"],
+        args["draft_local_max_ptr"],
+        args["draft_local_sumexp_ptr"],
+        target_logits,
+        draft_logits if args["HAS_DRAFT_LOGITS"] else None,
+        args["expanded_idx_mapping_ptr"],
+        args["expanded_local_pos_ptr"],
+        args["temp_ptr"],
+        vocab_size,
+        args["num_speculative_steps"],
+        block_size,
+    )
+
+
+def _rejection_v2(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["idx_mapping_ptr"].numel()
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        launch.metadata.get("num_warps") == 1,
+        "rejection kernel requires num_warps=1",
+    )
+    _expect(not args["SYNTHETIC_MODE"], "synthetic rejection mode unsupported")
+    vocab_num_blocks = args["vocab_num_blocks"]
+    _expect(vocab_num_blocks > 0, "vocab_num_blocks must be positive")
+    _expect(
+        args["PADDED_VOCAB_NUM_BLOCKS"]
+        == 1 << (vocab_num_blocks - 1).bit_length(),
+        "invalid PADDED_VOCAB_NUM_BLOCKS",
+    )
+    for tensor_name, stride_name in (
+        ("sampled_ptr", "sampled_stride"),
+        ("target_logits_ptr", "target_logits_stride"),
+        ("target_local_argmax_ptr", "target_local_argmax_stride"),
+        ("target_local_max_ptr", "target_local_max_stride"),
+        ("target_local_sumexp_ptr", "target_local_sumexp_stride"),
+        ("draft_local_max_ptr", "draft_local_max_stride"),
+        ("draft_local_sumexp_ptr", "draft_local_sumexp_stride"),
+    ):
+        _expect(
+            args[stride_name] == args[tensor_name].stride(0),
+            f"{tensor_name} stride mismatch",
+        )
+    draft_logits = args["draft_logits_ptr"]
+    _expect(
+        args["draft_logits_stride_0"] == draft_logits.stride(0)
+        and args["draft_logits_stride_1"] == draft_logits.stride(1),
+        "draft logits stride mismatch",
+    )
+    torch.ops.mcpu.vllm_rejection(
+        args["sampled_ptr"],
+        args["rejected_steps_ptr"],
+        args["target_rejected_logsumexp_ptr"],
+        args["draft_rejected_logsumexp_ptr"],
+        args["target_logits_ptr"],
+        args["target_local_argmax_ptr"],
+        args["target_local_max_ptr"],
+        args["target_local_sumexp_ptr"],
+        args["draft_sampled_ptr"],
+        draft_logits if args["HAS_DRAFT_LOGITS"] else None,
+        args["draft_local_max_ptr"],
+        args["draft_local_sumexp_ptr"],
+        args["cu_num_logits_ptr"],
+        args["idx_mapping_ptr"],
+        args["temp_ptr"],
+        args["seed_ptr"],
+        args["pos_ptr"],
+        vocab_num_blocks,
+    )
+
+
+def _rejection_resample(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    vocab_size = args["vocab_size"]
+    block_size = args["BLOCK_SIZE"]
+    num_reqs = args["rejected_step_ptr"].numel()
+    num_blocks = (vocab_size + block_size - 1) // block_size
+    _expect_grid(launch, (num_reqs, num_blocks))
+    _expect(block_size == 1024, "resample BLOCK_SIZE must be 1024")
+    for tensor_name, stride_name in (
+        ("resampled_local_argmax_ptr", "resampled_local_argmax_stride"),
+        ("resampled_local_max_ptr", "resampled_local_max_stride"),
+        ("target_logits_ptr", "target_logits_stride"),
+    ):
+        _expect(
+            args[stride_name] == args[tensor_name].stride(0),
+            f"{tensor_name} stride mismatch",
+        )
+    draft_logits = args["draft_logits_ptr"]
+    _expect(
+        args["draft_logits_stride_0"] == draft_logits.stride(0)
+        and args["draft_logits_stride_1"] == draft_logits.stride(1),
+        "draft logits stride mismatch",
+    )
+    torch.ops.mcpu.vllm_rejection_resample(
+        args["resampled_local_argmax_ptr"],
+        args["resampled_local_max_ptr"],
+        args["target_logits_ptr"],
+        args["target_rejected_logsumexp_ptr"],
+        draft_logits if args["HAS_DRAFT_LOGITS"] else None,
+        args["draft_rejected_logsumexp_ptr"],
+        args["rejected_step_ptr"],
+        args["cu_num_logits_ptr"],
+        args["expanded_idx_mapping_ptr"],
+        args["draft_sampled_ptr"],
+        args["temp_ptr"],
+        args["seed_ptr"],
+        args["pos_ptr"],
+        vocab_size,
+        block_size,
+        args["USE_FP64"],
+    )
+
+
+def _rejection_insert(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["num_sampled_ptr"].numel()
+    num_blocks = args["resample_num_blocks"]
+    _expect_grid(launch, (num_reqs,))
+    _expect(num_blocks > 0, "resample_num_blocks must be positive")
+    _expect(
+        args["PADDED_RESAMPLE_NUM_BLOCKS"]
+        == 1 << (num_blocks - 1).bit_length(),
+        "invalid PADDED_RESAMPLE_NUM_BLOCKS",
+    )
+    for tensor_name, stride_name in (
+        ("sampled_ptr", "sampled_stride"),
+        ("resampled_local_argmax_ptr", "resampled_local_argmax_stride"),
+        ("resampled_local_max_ptr", "resampled_local_max_stride"),
+    ):
+        _expect(
+            args[stride_name] == args[tensor_name].stride(0),
+            f"{tensor_name} stride mismatch",
+        )
+    torch.ops.mcpu.vllm_rejection_insert(
+        args["sampled_ptr"],
+        args["num_sampled_ptr"],
+        args["resampled_local_argmax_ptr"],
+        args["resampled_local_max_ptr"],
+        args["cu_num_logits_ptr"],
+        args["expanded_idx_mapping_ptr"],
+        args["temp_ptr"],
+        num_blocks,
+    )
+
+
+def _rejection_flatten(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["num_sampled_ptr"].numel()
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        launch.metadata.get("num_warps") == 1,
+        "flatten sampled requires num_warps=1",
+    )
+    _expect(
+        args["sampled_stride"] == args["sampled_ptr"].stride(0),
+        "flatten sampled stride mismatch",
+    )
+    torch.ops.mcpu.vllm_rejection_flatten(
+        args["flat_sampled_ptr"],
+        args["sampled_ptr"],
+        args["num_sampled_ptr"],
+        args["cu_num_logits_ptr"],
+    )
+
+
+def _rejection_greedy(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    _expect_grid(launch, (args["cu_num_draft_tokens_ptr"].numel(),))
+    _expect(not args["SYNTHETIC_MODE"], "synthetic rejection sampling unsupported")
+    torch.ops.mcpu.vllm_rejection_greedy(
+        args["output_token_ids_ptr"],
+        args["cu_num_draft_tokens_ptr"],
+        args["draft_token_ids_ptr"],
+        args["target_argmax_ptr"],
+        args["bonus_token_ids_ptr"],
+        args["is_greedy_ptr"],
+        args["max_spec_len"],
+    )
+
+
+def _sample_recovered(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    _expect(
+        len(launch.grid) == 2
+        and launch.grid[0] == args["cu_num_draft_tokens_ptr"].numel()
+        and launch.grid[1] > 0,
+        "invalid recovered-token grid",
+    )
+    _expect(args["BLOCK_SIZE"] == 8192, "recovered BLOCK_SIZE must be 8192")
+    torch.ops.mcpu.vllm_sample_recovered(
+        args["output_token_ids_ptr"],
+        args["cu_num_draft_tokens_ptr"],
+        args["draft_token_ids_ptr"],
+        args["draft_probs_ptr"],
+        args["target_probs_ptr"],
+        args["inv_q_ptr"],
+        args["vocab_size"],
+    )
+
+
+def _rejection_random(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    _expect_grid(launch, (args["cu_num_draft_tokens_ptr"].numel(),))
+    _expect(not args["SYNTHETIC_MODE"], "synthetic rejection sampling unsupported")
+    torch.ops.mcpu.vllm_rejection_random(
+        args["output_token_ids_ptr"],
+        args["cu_num_draft_tokens_ptr"],
+        args["draft_token_ids_ptr"],
+        args["draft_probs_ptr"],
+        args["target_probs_ptr"],
+        args["bonus_token_ids_ptr"],
+        args["recovered_token_ids_ptr"],
+        args["uniform_probs_ptr"],
+        args["is_greedy_ptr"],
+        args["max_spec_len"],
+        args["vocab_size"],
+    )
+
+
+def _eagle_prepare_next_token_padded(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["num_reqs"]
+    num_tokens = args["num_sampled_tokens_per_req"]
+    _expect_grid(launch, (num_reqs,))
+    _expect(num_tokens > 0, "num_sampled_tokens_per_req must be positive")
+    _expect(
+        args["stride_sampled_token_ids"]
+        == args["sampled_token_ids_ptr"].stride(0),
+        "sampled_token_ids stride mismatch",
+    )
+    _expect(
+        args["BLOCK_SIZE_TOKENS"] == 1 << (num_tokens - 1).bit_length(),
+        "BLOCK_SIZE_TOKENS must be the next power of two",
+    )
+    torch.ops.mcpu.vllm_eagle_prepare_next_token_padded(
+        args["sampled_token_ids_ptr"],
+        args["discard_request_mask_ptr"],
+        args["backup_next_token_ids_ptr"],
+        args["next_token_ids_ptr"],
+        args["valid_sampled_tokens_count_ptr"],
+        args["vocab_size"],
+        num_tokens,
+        num_reqs,
+    )
+
+
+def _eagle_prepare_inputs_padded(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    _expect_grid(launch, (args["num_reqs"],))
+    torch.ops.mcpu.vllm_eagle_prepare_inputs_padded(
+        args["cu_num_draft_tokens_ptr"],
+        args["valid_sampled_tokens_count_ptr"],
+        args["query_start_loc_gpu_ptr"],
+        args["token_indices_to_sample_ptr"],
+        args["num_rejected_tokens_gpu_ptr"],
+        args["num_reqs"],
+    )
+
+
+def _eagle_step_slot_mapping_metadata(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    _expect_grid(launch, (args["out_slot_mapping_ptr"].numel(),))
+    _expect(
+        args["block_table_stride"] == args["block_table_ptr"].stride(0),
+        "EAGLE block-table stride mismatch",
+    )
+    _expect(
+        args["n_blocks_per_req"] == args["block_table_ptr"].shape[1],
+        "EAGLE n_blocks_per_req mismatch",
+    )
+    torch.ops.mcpu.vllm_eagle_step_slot_mapping_metadata(
+        args["positions_ptr"],
+        args["block_table_ptr"],
+        args["seq_lens_ptr"],
+        args["out_clamped_positions_ptr"],
+        args["out_slot_mapping_ptr"],
+        args["block_size"],
+        args["max_model_len"],
+        args["n_blocks_per_req"],
+        args["PAD_ID"],
+        args["batch_size"],
     )
 
 
@@ -619,6 +1075,30 @@ _KERNELS: tuple[
         (),
     ),
     (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "_prepare_prefill_inputs_kernel",
+        "fc094fbcf36c318670ece79a9cbbde4013966270c30bbba5c435c5778b8e57cc",
+        "ed7370baed785629709f3a261987fe0118a40852c162e799bf5ebf6fb32ed68e",
+        _autoregressive_prepare_prefill_inputs,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "_prepare_decode_inputs_kernel",
+        "ac1dcb4ec4b02e6651b540fc1fce1b7a54c2b14f0ed2bfe40378a46a51a6f465",
+        "37e3c10b0abdfb8ba5e74337038cfbc91ffae15c4607e21b4d20554414bbd7a5",
+        _autoregressive_prepare_decode_inputs,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "_update_draft_inputs_kernel",
+        "4a61e8fbc62acf6639ef943db78daa82232c4682e7cf319ea2036ace56965522",
+        "fec4868f0636b79a8882919a16186c294ada21359a3b52655e4109cd6430beba",
+        _autoregressive_update_draft_inputs,
+        (),
+    ),
+    (
         "vllm.v1.worker.gpu.input_batch",
         "_prepare_pos_seq_lens_kernel",
         "5e42c1095fe391474d4cac66c76dba29259a62ff2a20ce5cf0ce5df7d52accef",
@@ -664,6 +1144,102 @@ _KERNELS: tuple[
         "c716f4fadb06c80d28adbb03307d989bf62f7ef9ae6694549650fdc2a7983045",
         "a91a97bdb0a7d9f6ad5095f72509905e256570d914a116741ad0c93ee51d4128",
         _expand_idx_mapping,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        "_flatten_sampled_kernel",
+        "0256a6b5405bc8f62f2cd2dff4c83f613d9c2c8e1c74ac0f9dc477341f576778",
+        "bba626cce7c4642ff2c2c1f6839fe7010e03368c201ba370a4dab9ca713d16a7",
+        _rejection_flatten,
+        ("num_warps",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_compute_block_stats_kernel",
+        "8711ce7138a352828b6b7c63b2483feb544cb19c4a12dc6c6c11fb6e51bf8b76",
+        "f7df3922cbf844c774e1d7746d88d1b93dd75a99b0232d955c69d91ef553aea8",
+        _rejection_compute_block_stats,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_rejection_kernel",
+        "78c0b5afba1b38ef304e162fa22717b4a64d317e8c978709dcf5323655decbfd",
+        "c45d1cb9fe170a6824d201b8aea5ed7f07c8ff8fa891fc34fb3017b1db1b0bd3",
+        _rejection_v2,
+        ("num_warps",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_resample_kernel",
+        "e9de8491b468f126ce8f9a26be89b0640a4001bdb08512f2a725ded22789c77c",
+        "9a45ff4a0621bf611ac1d60d2c8cbc684553c2f228700db4d39fb86152a002ff",
+        _rejection_resample,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_insert_resampled_kernel",
+        "e4daecaefc15bbc4b02c6ee7541dc1acd0ad582afcd617efb325d0d084a2273b",
+        "31af6f6b1e71365896c70a7da6263928ffc9a30877b62a608cd452b0f9681ac8",
+        _rejection_insert,
+        (),
+    ),
+    (
+        "vllm.v1.sample.rejection_sampler",
+        "expand_kernel",
+        "6bc6d69deac4b0bf8aa07bcc879e80f1e3e8ab45ee003b90b56b5756c84e1910",
+        "e915db20eca855654152e1b0db836f032483d3cb477487cbf305b2a5e21e4b00",
+        _rejection_sampler_expand,
+        (),
+    ),
+    (
+        "vllm.v1.sample.rejection_sampler",
+        "rejection_greedy_sample_kernel",
+        "8f96dd95137ff29dd09be620021f72c79162376ba6b8e75077aae69ff1696d9f",
+        "5cb68da8498b1d54a330aee377d9cdc4e7122bb34a74e53b0169903a927e3bc2",
+        _rejection_greedy,
+        (),
+    ),
+    (
+        "vllm.v1.sample.rejection_sampler",
+        "sample_recovered_tokens_kernel",
+        "2b93b033709712e066b19d1dc1873a11468c36b2be448c5deec72745aa8f3755",
+        "00fbf642aff31227f9dca2537c92deccaa0bed7a5c35bb94af548146d8e4d40a",
+        _sample_recovered,
+        (),
+    ),
+    (
+        "vllm.v1.sample.rejection_sampler",
+        "rejection_random_sample_kernel",
+        "f75f9429eafb383840ff75eaa550d27491ea09cafb029244c8292e09f23e8a86",
+        "61d2450a512a6a2211a01b17f242f2001b70f55ef270cfa75adc524da4253347",
+        _rejection_random,
+        (),
+    ),
+    (
+        "vllm.v1.spec_decode.utils",
+        "eagle_prepare_next_token_padded_kernel",
+        "466d87c788c9dcf9a842cabe2777ecb85460a64bba6929902740cebd6313a37b",
+        "3622acaef3e6e01bda16622d695a1913cce1353a08feddeff9592e0310d53cb8",
+        _eagle_prepare_next_token_padded,
+        (),
+    ),
+    (
+        "vllm.v1.spec_decode.utils",
+        "eagle_prepare_inputs_padded_kernel",
+        "499c9ce7d993134d799f89d9f895d2070bc4aed5851ee4dfa033fbf5c850b4da",
+        "0503ad7b03daa8bba43ea18b80e27d3b64ea733466ed612b079a5c8d0c13e088",
+        _eagle_prepare_inputs_padded,
+        (),
+    ),
+    (
+        "vllm.v1.spec_decode.utils",
+        "eagle_step_slot_mapping_metadata_kernel",
+        "fecbccb0286df45eb67a092836a29357f75b3e445a249738dd95739728bb82d8",
+        "972738fccc9dc1fe972bd1afc1e7dfe689fc453ab8c176e6e4d405a17e617add",
+        _eagle_step_slot_mapping_metadata,
         (),
     ),
     (

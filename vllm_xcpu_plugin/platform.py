@@ -28,7 +28,7 @@ class McpuPlatform(Platform):
     device_type: str = "privateuseone"
     dispatch_key: str = "PrivateUse1"
     dist_backend: str = "cpu:gloo,mcpu:mcpu"
-    # simple_compile_backend: str = "eager"
+    simple_compile_backend: str = "eager"
 
     @classmethod
     def get_attn_backend_cls(

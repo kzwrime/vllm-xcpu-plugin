@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import sys
+from typing import Any, cast
 
 import torch
 
@@ -112,4 +114,16 @@ def maybe_patch_vllm_topk_topp_sampler() -> None:
         return original_apply_top_k_top_p(logits, k, p)
 
     topk_topp_sampler.apply_top_k_top_p = _patched_apply_top_k_top_p
+    for module_name in (
+        "vllm.v1.sample.rejection_sampler",
+        "vllm.v1.worker.gpu.sample.sampler",
+        "vllm.v1.worker.gpu.sample.states",
+    ):
+        module = sys.modules.get(module_name)
+        if (
+            module is not None
+            and getattr(module, "apply_top_k_top_p", None)
+            is original_apply_top_k_top_p
+        ):
+            cast(Any, module).apply_top_k_top_p = _patched_apply_top_k_top_p
     _TOPK_TOPP_SAMPLER_PATCHED = True
