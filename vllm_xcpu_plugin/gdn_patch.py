@@ -80,9 +80,7 @@ def _xcpu_causal_conv1d_update(
     import torch_xcpu
 
     if kwargs:
-        raise TypeError(
-            f"unsupported causal_conv1d_update kwargs: {sorted(kwargs)}"
-        )
+        raise TypeError(f"unsupported causal_conv1d_update kwargs: {sorted(kwargs)}")
     return torch_xcpu.ops.causal_conv1d_update(
         x=x,
         conv_state=conv_state,

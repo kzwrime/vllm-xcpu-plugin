@@ -342,8 +342,7 @@ def _autoregressive_update_draft_inputs(launch: KernelLaunch) -> None:
         "autoregressive update BLOCK_SIZE must be 1024",
     )
     _expect(
-        args["output_draft_tokens_stride"]
-        == args["output_draft_tokens_ptr"].stride(0),
+        args["output_draft_tokens_stride"] == args["output_draft_tokens_ptr"].stride(0),
         "output draft token stride mismatch",
     )
     _expect(
@@ -592,8 +591,7 @@ def _rejection_v2(launch: KernelLaunch) -> None:
     vocab_num_blocks = args["vocab_num_blocks"]
     _expect(vocab_num_blocks > 0, "vocab_num_blocks must be positive")
     _expect(
-        args["PADDED_VOCAB_NUM_BLOCKS"]
-        == 1 << (vocab_num_blocks - 1).bit_length(),
+        args["PADDED_VOCAB_NUM_BLOCKS"] == 1 << (vocab_num_blocks - 1).bit_length(),
         "invalid PADDED_VOCAB_NUM_BLOCKS",
     )
     for tensor_name, stride_name in (
@@ -687,8 +685,7 @@ def _rejection_insert(launch: KernelLaunch) -> None:
     _expect_grid(launch, (num_reqs,))
     _expect(num_blocks > 0, "resample_num_blocks must be positive")
     _expect(
-        args["PADDED_RESAMPLE_NUM_BLOCKS"]
-        == 1 << (num_blocks - 1).bit_length(),
+        args["PADDED_RESAMPLE_NUM_BLOCKS"] == 1 << (num_blocks - 1).bit_length(),
         "invalid PADDED_RESAMPLE_NUM_BLOCKS",
     )
     for tensor_name, stride_name in (
@@ -793,8 +790,7 @@ def _eagle_prepare_next_token_padded(launch: KernelLaunch) -> None:
     _expect_grid(launch, (num_reqs,))
     _expect(num_tokens > 0, "num_sampled_tokens_per_req must be positive")
     _expect(
-        args["stride_sampled_token_ids"]
-        == args["sampled_token_ids_ptr"].stride(0),
+        args["stride_sampled_token_ids"] == args["sampled_token_ids_ptr"].stride(0),
         "sampled_token_ids stride mismatch",
     )
     _expect(

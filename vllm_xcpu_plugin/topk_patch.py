@@ -122,8 +122,7 @@ def maybe_patch_vllm_topk_topp_sampler() -> None:
         module = sys.modules.get(module_name)
         if (
             module is not None
-            and getattr(module, "apply_top_k_top_p", None)
-            is original_apply_top_k_top_p
+            and getattr(module, "apply_top_k_top_p", None) is original_apply_top_k_top_p
         ):
             cast(Any, module).apply_top_k_top_p = _patched_apply_top_k_top_p
     _TOPK_TOPP_SAMPLER_PATCHED = True
