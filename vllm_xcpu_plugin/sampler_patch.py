@@ -61,12 +61,11 @@ def maybe_patch_vllm_temperature() -> None:
     ) -> None:
         if not _is_xcpu_device(logits):
             return original(logits, expanded_idx_mapping, temperature)
-        torch.ops.mcpu.vllm_temperature_kernel(
-            logits,
-            expanded_idx_mapping,
-            temperature,
-            logits.shape[1],
-        )
+
+        import torch_xcpu
+
+        torch_xcpu.ops.vllm_temperature_kernel(
+            logits, expanded_idx_mapping, temperature)
 
     gumbel_module.apply_temperature = apply_temperature
     states_module.apply_temperature = apply_temperature
