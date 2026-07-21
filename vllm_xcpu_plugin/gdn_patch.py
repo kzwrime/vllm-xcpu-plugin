@@ -144,6 +144,7 @@ def _xcpu_fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     import torch_xcpu
 
@@ -165,6 +166,7 @@ def _xcpu_fused_sigmoid_gating_delta_rule_update(
         num_accepted_tokens=num_accepted_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         is_kda=is_kda,
+        out=out,
     )
 
 
