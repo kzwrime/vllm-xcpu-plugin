@@ -106,6 +106,7 @@ class KernelRegistration:
         default_factory=lambda: frozenset({1, 2, 3})
     )
     owner: str = "torch_mcpu"
+    source_version: str = "unversioned"
 
 
 class KernelRegistry:
@@ -129,17 +130,28 @@ class KernelRegistry:
         allowed_metadata: Sequence[str] = (),
         allowed_grid_dims: Sequence[int] = (1, 2, 3),
         owner: str = "torch_mcpu",
+        source_version: str = "unversioned",
     ) -> None:
         expected_signature_hash = expected_signature_hash or kernel.signature_hash
         if kernel.source_hash != expected_source_hash:
             raise KernelVersionError(
                 f"{kernel.qualname}: source fingerprint mismatch; "
-                f"expected {expected_source_hash}, got {kernel.source_hash}"
+                f"expected {expected_source_hash}, got {kernel.source_hash}. "
+                f"The XCPU replacement was reviewed against {source_version}. "
+                "Manually review the upstream Triton source diff and semantic "
+                "changes, update the XCPU implementation and differential tests, "
+                "then update only this kernel's hashes and source_version in "
+                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
         if kernel.signature_hash != expected_signature_hash:
             raise KernelVersionError(
                 f"{kernel.qualname}: signature fingerprint mismatch; "
-                f"expected {expected_signature_hash}, got {kernel.signature_hash}"
+                f"expected {expected_signature_hash}, got {kernel.signature_hash}. "
+                f"The XCPU replacement was reviewed against {source_version}. "
+                "Manually review the upstream Triton signature and semantics, "
+                "update the adapter and differential tests, then update this "
+                "kernel's hashes and source_version in "
+                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
         unknown_metadata = set(allowed_metadata) - _TRITON_LAUNCH_METADATA
         if unknown_metadata:
@@ -157,6 +169,7 @@ class KernelRegistry:
             allowed_metadata=frozenset(allowed_metadata),
             allowed_grid_dims=grid_dims,
             owner=owner,
+            source_version=source_version,
         )
         previous = self._registrations.get(kernel.qualname)
         if previous is not None and previous != registration:
@@ -181,7 +194,12 @@ class KernelRegistry:
             or kernel.signature_hash != registration.expected_signature_hash
         ):
             raise KernelVersionError(
-                f"{kernel.qualname}: decorated kernel changed after registration"
+                f"{kernel.qualname}: decorated kernel changed after registration. "
+                "The XCPU replacement was reviewed against "
+                f"{registration.source_version}; manually review the upstream "
+                "change, update the implementation and differential tests, then "
+                "update only this kernel's hashes and source_version in "
+                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
 
         kernel_kwargs = dict(kwargs)

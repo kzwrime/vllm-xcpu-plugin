@@ -57,12 +57,18 @@ def test_unknown_kernel_fails_closed(kernel_and_registry):
 
 def test_source_version_mismatch_is_rejected(kernel_and_registry):
     kernel, registry = kernel_and_registry
-    with pytest.raises(KernelVersionError, match="source fingerprint mismatch"):
+    with pytest.raises(KernelVersionError) as exc_info:
         registry.register(
             kernel,
             lambda launch: None,
             expected_source_hash="wrong",
+            source_version="v0.19.0",
         )
+    message = str(exc_info.value)
+    assert "source fingerprint mismatch" in message
+    assert "v0.19.0" in message
+    assert "Manually review" in message
+    assert "source_version" in message
 
 
 def test_launch_metadata_is_explicitly_allowlisted(kernel_and_registry):

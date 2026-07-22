@@ -35,7 +35,7 @@
 
 ### 2.1 固定并审计 vLLM 参考版本
 
-先记录目标 vLLM commit，并阅读以下内容：
+先为这个 kernel 人工记录本次语义审计对应的产品版本，并阅读以下内容：
 
 1. Triton kernel 函数体；
 2. 所有 launch 位置；
@@ -53,6 +53,10 @@
 - grid 是否属于算法语义，而不只是性能参数。
 
 不要根据 kernel 名称或旧版本实现推断语义。例如 bitmask 方向、padding 值、optional pointer 和 constexpr 取值都可能随 vLLM 升级而改变。
+
+`source_version` 是人工审计结论，不得从 Git tag、当前 branch 名或 commit
+祖先关系自动推导。XCPU 的 vLLM 开发分支通过 cherry-pick 和手工移植组成，
+版本线不保证线性；Git ref 只能辅助定位源码，不能替代这项人工标记。
 
 ### 2.2 在 `torch_mcpu` 中定义 dispatcher operator
 
@@ -151,6 +155,7 @@ adapter 不应：
         "_example_kernel",
         "<source hash>",
         "<signature hash>",
+        "v0.24.0",  # 仅这一条 kernel 的人工审计版本
         _example_kernel,
         ("num_warps",),  # 没有 metadata 时使用 ()
     ),
@@ -176,6 +181,21 @@ PY
 ```
 
 哈希只能在完成源码和语义 review 后写入。vLLM 升级导致哈希变化时，禁止仅运行脚本刷新哈希；必须重新检查函数体、签名和所有 launch 点。
+
+`_MANIFEST_BASELINE_VERSION` 只说明清单最初建立时的背景版本，不参与注册，
+也不是任何 kernel 的默认值。每条 `_KERNELS` 记录必须直接写自己的
+`source_version` 字面量。某个 kernel 完成新版本审计后，只修改它自己的
+版本、source hash 和 signature hash；禁止通过修改 baseline 批量放行。
+
+绕过 Fake Triton 的替代路径登记在
+`vllm_xcpu_plugin/upstream_compatibility.py`。attention、causal-conv、GDN/FLA、
+Gumbel/temperature、top-k/top-p、grouped-topk 和 topk-softmax 的上游
+Triton kernel 或语义入口都必须在真正安装 patch 前通过同样的指纹检查。
+报错后需要更新 XCPU 实现和差分测试，再单独推进对应记录的版本与哈希。
+复合算子按插件真正发生替换的边界登记。例如 ChunkGatedDeltaRule 检查
+`forward_native` 和公开 FLA wrapper，不把 `solve_tril`、`wy_fast`、
+`chunk_delta_h` 等仅由 native wrapper 间接调用的内部 kernel 分别登记，
+避免纯内部调度或性能重构被误报为多个独立替代算子漂移。
 
 如果 launch 使用 `num_warps`、`num_stages` 等 metadata，必须在注册项中逐个 allowlist。当前 runtime 支持的 metadata 集合见 `_TRITON_LAUNCH_METADATA`，未声明的 metadata 会被拒绝。
 
@@ -291,7 +311,8 @@ Fake Triton 只替换 kernel launch，不替换 wrapper。wrapper 中以下操�
 3. 检查 constexpr、metadata、padding 和 optional 参数；
 4. 更新 `torch_mcpu` 实现与差分测试；
 5. 更新 adapter 校验；
-6. 最后更新 source/signature hash 和 `_VLLM_VERSION`；
+6. 最后只更新该 kernel 自己的 source/signature hash 和 `source_version`，
+   不修改 `_MANIFEST_BASELINE_VERSION`；
 7. 重跑算子、插件、eager E2E 和 compile E2E。
 
 ### 3.7 不要把 Fake Language 占位对象当作任意兼容答案

@@ -213,8 +213,13 @@ def maybe_patch_gdn_attention() -> None:
 
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
     if _GDN_ATTENTION_PATCHED:
         return
+    verify_upstream_compatibility(("conv", "gdn"))
 
     _ = (
         gdn.fused_gdn_gating,

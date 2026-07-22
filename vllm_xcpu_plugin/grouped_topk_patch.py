@@ -59,6 +59,12 @@ def maybe_patch_vllm_grouped_topk() -> None:
     if getattr(grouped_topk_router_any, "_xcpu_grouped_topk_patched", False):
         return
 
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("grouped_topk",))
+
     original_grouped_topk = grouped_topk_router_any.grouped_topk
 
     def _patched_grouped_topk(

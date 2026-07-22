@@ -49,6 +49,12 @@ def maybe_patch_vllm_temperature() -> None:
     if _TEMPERATURE_PATCHED:
         return
 
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("sample",))
+
     import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
     import vllm.v1.worker.gpu.sample.states as states_module
 
@@ -65,7 +71,8 @@ def maybe_patch_vllm_temperature() -> None:
         import torch_xcpu
 
         torch_xcpu.ops.vllm_temperature_kernel(
-            logits, expanded_idx_mapping, temperature)
+            logits, expanded_idx_mapping, temperature
+        )
 
     gumbel_module.apply_temperature = apply_temperature
     states_module.apply_temperature = apply_temperature
@@ -79,6 +86,12 @@ def maybe_patch_vllm_gumbel_sample() -> None:
         return
     if _GUMBEL_SAMPLE_PATCHED:
         return
+
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("sample",))
 
     import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
 

@@ -45,6 +45,12 @@ def maybe_patch_vllm_topk_softmax() -> None:
     if _TOPK_SOFTMAX_PATCHED:
         return
 
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("topk_softmax",))
+
     original_topk_softmax = ops.topk_softmax
 
     def _patched_topk_softmax(
@@ -88,6 +94,12 @@ def maybe_patch_vllm_topk_topp_sampler() -> None:
 
     if _TOPK_TOPP_SAMPLER_PATCHED:
         return
+
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("topk_topp",))
 
     import vllm.v1.sample.ops.topk_topp_sampler as topk_topp_sampler
 

@@ -17,6 +17,11 @@ def xcpu_platform_plugin() -> str | None:
 
 def register_attn_backend():
     logger.info("register_attn_backend")
+    from vllm_xcpu_plugin.upstream_compatibility import (
+        verify_upstream_compatibility,
+    )
+
+    verify_upstream_compatibility(("attention",))
     import vllm_xcpu_plugin.attn_backend  # noqa
 
 
@@ -28,6 +33,10 @@ def register_ops():
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
 
+    # This validates the upstream conv/GDN kernels before either the wrapper
+    # patch or the ChunkGatedDeltaRule OOT replacement is installed.
+    maybe_patch_gdn_attention()
+
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa
@@ -37,7 +46,6 @@ def register_ops():
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
     import vllm_xcpu_plugin.mla_patch as mla_patch
 
-    maybe_patch_gdn_attention()
     topk_patch.maybe_patch_vllm_topk_softmax()
     topk_patch.maybe_patch_vllm_topk_topp_sampler()
     sampler_patch.maybe_patch_vllm_temperature()

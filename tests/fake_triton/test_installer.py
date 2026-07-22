@@ -289,6 +289,10 @@ registry = get_registry()
 print(json.dumps({
     "has_triton": HAS_TRITON,
     "registrations": len(registry.registrations()),
+    "source_versions": sorted({
+        registration.source_version
+        for registration in registry.registrations().values()
+    }),
     "expand_launches": registry.launch_counts()[
         "vllm.v1.sample.rejection_sampler.expand_kernel"
     ],
@@ -327,6 +331,7 @@ print(json.dumps({
     assert payload == {
         "has_triton": True,
         "registrations": 39,
+        "source_versions": ["v0.24.0"],
         "expand_launches": 1,
         "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],
         "invalid_max_rejected": True,
