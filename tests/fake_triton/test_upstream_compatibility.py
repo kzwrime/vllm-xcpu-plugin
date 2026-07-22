@@ -67,11 +67,17 @@ def test_manifest_has_explicit_mixed_source_versions():
             for target in compatibility.UPSTREAM_OPERATORS
             if target.category == category
         }
-        for category in {"attention", "grouped_topk", "topk_topp"}
+        for category in {
+            "attention",
+            "grouped_topk",
+            "topk_softmax",
+            "topk_topp",
+        }
     }
     assert versions == {
         "attention": {"v0.24.0", "v0.25.0"},
         "grouped_topk": {"v0.19.0"},
+        "topk_softmax": {"v0.25.0"},
         "topk_topp": {"v0.24.0"},
     }
 

@@ -295,10 +295,10 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "topk_softmax",
         "vllm._custom_ops",
         "topk_softmax",
-        "14d7ced88919482fdcf2cf5814d4a284b5dab648d7ee44b29a9003c3957a8dda",
-        "ed53df8fd3c107c4f089b84d26d17e1ca9e083a39a9c5b67022f0a9323585db0",
+        "008c94acb29fefc4c51cfe8e66f4a1648fec11f26e19835a97869ee03b1c336b",
+        "80b417a27ce012f9dc87534716e4e18d2630b91cc13382c677a3e8fcf24460dc",
         "torch_xcpu.ops.topk_softmax",
-        source_version="v0.19.0",
+        source_version="v0.25.0",
     ),
 )
 

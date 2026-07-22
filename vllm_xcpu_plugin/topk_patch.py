@@ -17,6 +17,7 @@ def _xcpu_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     if e_score_correction_bias is not None:
         raise NotImplementedError(
@@ -31,6 +32,7 @@ def _xcpu_topk_softmax(
         token_expert_indices,
         gating_output,
         renormalize,
+        is_padding=is_padding,
     )
 
 
@@ -60,6 +62,7 @@ def maybe_patch_vllm_topk_softmax() -> None:
         gating_output: torch.Tensor,
         renormalize: bool = False,
         e_score_correction_bias: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> None:
         device_type = gating_output.device.type
         if device_type in ("mcpu", "privateuseone"):
@@ -70,6 +73,7 @@ def maybe_patch_vllm_topk_softmax() -> None:
                 gating_output,
                 renormalize,
                 e_score_correction_bias,
+                is_padding,
             )
             return
 
@@ -80,6 +84,7 @@ def maybe_patch_vllm_topk_softmax() -> None:
             gating_output,
             renormalize,
             e_score_correction_bias,
+            is_padding,
         )
 
     ops.topk_softmax = _patched_topk_softmax
