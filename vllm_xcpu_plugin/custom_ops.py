@@ -1,10 +1,15 @@
 import torch
-from vllm.model_executor.layers.activation import SigmoidMul, SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
+
+try:
+    from vllm.model_executor.layers.activation import SigmoidMul
+except ImportError:
+    SigmoidMul = None  # type: ignore[assignment,misc]
 
 
 def rms_norm(
@@ -39,18 +44,20 @@ def fused_add_rms_norm(
     return x, residual
 
 
-@SigmoidMul.register_oot
-class XcpuSigmoidMul(SigmoidMul):
-    @staticmethod
-    def forward_oot(
-        input: torch.Tensor,
-        gate: torch.Tensor,
-    ) -> torch.Tensor:
-        import torch_xcpu
+if SigmoidMul is not None:
 
-        output = torch.empty_like(input)
-        torch_xcpu.ops.fused_sigmoid_mul(output, input, gate)
-        return output
+    @SigmoidMul.register_oot
+    class XcpuSigmoidMul(SigmoidMul):
+        @staticmethod
+        def forward_oot(
+            input: torch.Tensor,
+            gate: torch.Tensor,
+        ) -> torch.Tensor:
+            import torch_xcpu
+
+            output = torch.empty_like(input)
+            torch_xcpu.ops.fused_sigmoid_mul(output, input, gate)
+            return output
 
 
 @RMSNorm.register_oot

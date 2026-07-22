@@ -103,10 +103,10 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "attention",
         "vllm.v1.attention.ops.triton_unified_attention",
         "kernel_unified_attention",
-        "4ff326919f52090048207bd78e2450faaefc95922d72b7ddc5027fb81e707df8",
-        "816e074f1653c6c8c0ba3c60395daa0cbd18b64a38a90edb474b37b7917ae668",
+        "16c1a25c5b632c385717cf8d76b3bdc71abc1c2012b925f2a1e427bdf2d42275",
+        "edefe3f15b40eca1cd7814d025601582962cc7436639f0d0431a45a51544c30e",
         "torch_xcpu.ops.unified_attention",
-        source_version="v0.24.0",
+        source_version="v0.25.0",
     ),
     _operator(
         "attention",
@@ -135,14 +135,17 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "torch_xcpu.ops.reshape_and_cache",
         source_version="v0.24.0",
     ),
+    # v0.25 added an explicit head stride for packed/strided diff-KV cache
+    # views. XCPU backends still publish their platform-specific legacy cache
+    # layouts; this audit does not claim packed diff-KV layout support.
     _operator(
         "attention",
         "vllm.v1.attention.ops.triton_reshape_and_cache_flash",
         "reshape_and_cache_kernel_flash_diffkv",
-        "8d0bcd2b5fee695f2715e6953ad1cf3155f7fef3da273e92364a508e2f3efcf9",
-        "3952a2a5548c91ab2e666943487fb0d58ad0339e697dcf347751c9fa1988d711",
+        "2c5205b8393f541e9b0238b93622347edf01880623be5632bf0d0cce464be4ff",
+        "feac593fbac5937165ee6fae9e806f8e7603a607d75acfbaad8562f9a3cd09a3",
         "torch_xcpu.ops.reshape_and_cache",
-        source_version="v0.24.0",
+        source_version="v0.25.0",
     ),
     _operator(
         "conv",
@@ -247,10 +250,10 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "sample",
         "vllm.v1.worker.gpu.sample.gumbel",
         "gumbel_block_argmax",
-        "f9d0dc452804d8cf2b95a5c384b1ac2be9d7b90356a303a67c499319a319dc3f",
+        "3d1a2df4886837e9ffb79610021e8e9df19d185602488db43dcfaab15c8f6c7f",
         "c8860dbf8e5f8870e636e585b95b2d98d7dbdb5506f7fe004fca10cc0c9ccc42",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="v0.24.0",
+        source_version="v0.25.0",
     ),
     _operator(
         "sample",

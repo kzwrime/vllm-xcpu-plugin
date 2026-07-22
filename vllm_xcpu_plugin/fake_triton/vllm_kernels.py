@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +16,8 @@ from .runtime import InvalidLaunchError, KernelLaunch, get_registry
 # Never use it as a registration default or bulk-update it during a port. Each
 # kernel below owns its literal source_version and may advance independently.
 _MANIFEST_BASELINE_VERSION = "v0.24.0"
+
+logger = logging.getLogger(__name__)
 
 
 def _expect(condition: bool, message: str) -> None:
@@ -139,6 +142,14 @@ def _compute_slot_mapping(launch: KernelLaunch) -> None:
     num_reqs = args["query_start_loc_ptr"].numel() - 1
     _expect_grid(launch, (num_reqs + 1,))
     _expect(args["BLOCK_SIZE"] == 1024, "slot mapping BLOCK_SIZE must be 1024")
+    _expect(
+        args["KV_CACHE_BLOCK_SIZE"] == args["block_size"],
+        "XCPU slot mapping requires matching KV-cache and kernel block sizes",
+    )
+    _expect(
+        args["BLOCKS_PER_KV_BLOCK"] == 1,
+        "XCPU slot mapping requires one kernel block per KV-cache block",
+    )
     torch.ops.mcpu.vllm_compute_slot_mapping_kernel(
         args["num_tokens"],
         args["max_num_tokens"],
@@ -1015,9 +1026,9 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.block_table",
         "_compute_slot_mapping_kernel",
-        "393b36f4c4e3d151ca01aebae0ddd7aa1e9660efc68798af438f22e8abbe393a",
-        "790656ce797bc0221c490834c23cb70ca4df7e6047514cfcfce27c8b7465edc5",
-        "v0.24.0",
+        "80be96b2bf56f10d060d32779de2bac5577db68b0cdd345b7a91437158858027",
+        "5eb4c7a44f8ce37b48472fd97ca0bd19e4f87a7f5a3b22b3ab6ef39f53a699cd",
+        "v0.25.0",
         _compute_slot_mapping,
         (),
     ),
@@ -1033,9 +1044,9 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.input_batch",
         "_combine_sampled_and_draft_tokens_kernel",
-        "2300cccbb1ef0a8d8c502b1a0a4b3124aff5c04c5d519af601c105220dd41ccc",
+        "87a15b332c59f4be05844b8b761960f1bbaa0a4182aa29215fec36c1aa871b22",
         "4ef7c5370798e1bd7a972572d12a64e4c4463d6ed04dab404ccb55867a3b1e9e",
-        "v0.24.0",
+        "v0.25.0",
         _combine_sampled_and_draft,
         (),
     ),
@@ -1340,7 +1351,14 @@ _KERNELS: tuple[
 
 
 def register_vllm_kernels() -> None:
-    """Register vLLM kernels validated against the pinned source revision."""
+    """Register available vLLM kernels and validate them when launched.
+
+    vLLM imports every plugin during CLI construction, including kernels for
+    optional features that the current server will never use. Deferring the
+    fingerprint check keeps unrelated upstream drift from blocking startup;
+    :meth:`KernelRegistry.dispatch` still fails closed before a mismatched
+    replacement can execute.
+    """
     registry = get_registry()
     for (
         module_name,
@@ -1352,7 +1370,16 @@ def register_vllm_kernels() -> None:
         metadata,
     ) in _KERNELS:
         module = importlib.import_module(module_name)
-        kernel = getattr(module, name)
+        try:
+            kernel = getattr(module, name)
+        except AttributeError:
+            logger.warning(
+                "Skipping unavailable optional Fake Triton kernel %s.%s; "
+                "a replacement will be required before that path can run",
+                module_name,
+                name,
+            )
+            continue
         registry.register(
             kernel,
             adapter,
@@ -1361,4 +1388,5 @@ def register_vllm_kernels() -> None:
             allowed_metadata=metadata,
             owner="torch_mcpu",
             source_version=source_version,
+            defer_version_check=True,
         )

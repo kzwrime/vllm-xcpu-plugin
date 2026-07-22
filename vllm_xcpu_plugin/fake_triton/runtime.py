@@ -131,9 +131,10 @@ class KernelRegistry:
         allowed_grid_dims: Sequence[int] = (1, 2, 3),
         owner: str = "torch_mcpu",
         source_version: str = "unversioned",
+        defer_version_check: bool = False,
     ) -> None:
         expected_signature_hash = expected_signature_hash or kernel.signature_hash
-        if kernel.source_hash != expected_source_hash:
+        if not defer_version_check and kernel.source_hash != expected_source_hash:
             raise KernelVersionError(
                 f"{kernel.qualname}: source fingerprint mismatch; "
                 f"expected {expected_source_hash}, got {kernel.source_hash}. "
@@ -143,7 +144,10 @@ class KernelRegistry:
                 "then update only this kernel's hashes and source_version in "
                 "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
-        if kernel.signature_hash != expected_signature_hash:
+        if (
+            not defer_version_check
+            and kernel.signature_hash != expected_signature_hash
+        ):
             raise KernelVersionError(
                 f"{kernel.qualname}: signature fingerprint mismatch; "
                 f"expected {expected_signature_hash}, got {kernel.signature_hash}. "

@@ -71,6 +71,20 @@ def test_source_version_mismatch_is_rejected(kernel_and_registry):
     assert "source_version" in message
 
 
+def test_deferred_version_mismatch_fails_when_launched(kernel_and_registry):
+    kernel, registry = kernel_and_registry
+    registry.register(
+        kernel,
+        lambda launch: None,
+        expected_source_hash="wrong",
+        source_version="v0.24.0",
+        defer_version_check=True,
+    )
+
+    with pytest.raises(KernelVersionError, match="changed after registration"):
+        kernel[(1,)](object(), 1)
+
+
 def test_launch_metadata_is_explicitly_allowlisted(kernel_and_registry):
     kernel, registry = kernel_and_registry
     registry.register(
