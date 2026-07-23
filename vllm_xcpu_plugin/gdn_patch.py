@@ -109,7 +109,7 @@ def _xcpu_fused_post_conv_prep(
     head_v_dim: int,
     apply_l2norm: bool = True,
     output_g_exp: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     import torch_xcpu
 
     return torch_xcpu.ops.fused_post_conv_prep(
