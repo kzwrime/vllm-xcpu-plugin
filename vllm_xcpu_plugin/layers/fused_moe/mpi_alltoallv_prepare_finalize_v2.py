@@ -10,9 +10,7 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -99,13 +97,6 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
             device="cpu",  # Keep on CPU for C++ access
         )
 
-        if not envs.VLLM_ENABLE_MOE_DP_CHUNK:
-            vllm_config = get_current_vllm_config()
-            assert (
-                vllm_config.scheduler_config.max_num_batched_tokens
-                <= self.max_num_tokens
-            )
-
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -187,7 +178,8 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
 
         assert not apply_router_weight_on_input
         assert a1.shape[0] <= self.max_num_tokens, (
-            "Check --max-num-batched-tokens and VLLM_MOE_DP_CHUNK_SIZE"
+            f"MoE input has {a1.shape[0]} tokens, exceeding the configured "
+            f"--max-num-batched-tokens={self.max_num_tokens}"
         )
 
         from torch_xcpu import ops as xcpu_ops
