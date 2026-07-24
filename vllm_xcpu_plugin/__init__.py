@@ -53,15 +53,14 @@ def register_ops():
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa
+    import vllm_xcpu_plugin.layers.fused_moe.moe_runner  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa
     import vllm_xcpu_plugin.topk_patch as topk_patch
     import vllm_xcpu_plugin.sampler_patch as sampler_patch
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
     import vllm_xcpu_plugin.mla_patch as mla_patch
 
-    install_optional_patch(
-        "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
-    )
+    install_optional_patch("MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax)
     topk_patch.maybe_patch_vllm_topk_topp_sampler()
     sampler_patch.maybe_patch_vllm_temperature()
     sampler_patch.maybe_patch_vllm_gumbel_sample()
