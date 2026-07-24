@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
 )
+from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
 from vllm.v1.attention.backends.registry import (
     AttentionBackendEnum,
     register_backend,
@@ -39,7 +40,6 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -90,7 +90,21 @@ class XcpuTritonMLABackend(MLACommonBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
+        kv_cache_shape = TritonMLABackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size
+        )
+        if kv_cache_shape != (num_blocks, block_size, head_size):
+            raise ValueError(f"Unsupported kv cache layout = {kv_cache_shape}")
+        return kv_cache_shape
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        stride_order = TritonMLABackend.get_kv_cache_stride_order()
+        if stride_order != (0, 1, 2):
+            raise ValueError(f"Unsupported kv cache stride order = {stride_order}")
+        return stride_order
 
 
 class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
@@ -444,21 +458,23 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        kv_cache_shape = TritonAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size
+        )
+        if kv_cache_shape != (num_blocks, num_kv_heads, block_size, 2 * head_size):
+            raise ValueError(f"Unsupported kv cache layout = {kv_cache_shape}")
+        return kv_cache_shape
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # TODO: update for kv transfer
-        cache_layout = get_kv_cache_layout()
-        if cache_layout != "NHD":
-            raise ValueError(f"cache_layout={cache_layout} is not supported.")
-        if include_num_layers_dimension:
-            return (0, 1, 2, 3, 4, 5)
-        else:
-            stride_order = (0, 1, 2, 3, 4)
-        return stride_order
+        stride_order = TritonAttentionBackend.get_kv_cache_stride_order()
+        if stride_order not in [(0, 2, 1, 3), (0, 1, 2, 3)]:
+            raise ValueError(f"Unsupported kv cache stride order = {stride_order}")
+        return TritonAttentionBackend.get_kv_cache_stride_order(
+            include_num_layers_dimension
+        )
 
     @staticmethod
     def get_impl_cls() -> type["XcpuTritonAttentionImpl"]:
