@@ -1,6 +1,5 @@
 import torch
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -10,38 +9,6 @@ try:
     from vllm.model_executor.layers.activation import SigmoidMul
 except ImportError:
     SigmoidMul = None  # type: ignore[assignment,misc]
-
-
-def rms_norm(
-    x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
-) -> torch.Tensor:
-    import torch_xcpu.ops as ops
-
-    out = torch.empty_like(x)
-    ops.rms_norm(
-        out,
-        x,
-        weight,
-        variance_epsilon,
-    )
-    return out
-
-
-def fused_add_rms_norm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import torch_xcpu.ops as ops
-
-    ops.fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        variance_epsilon,
-    )
-    return x, residual
 
 
 if SigmoidMul is not None:
@@ -58,37 +25,6 @@ if SigmoidMul is not None:
             output = torch.empty_like(input)
             torch_xcpu.ops.fused_sigmoid_mul(output, input, gate)
             return output
-
-
-@RMSNorm.register_oot
-class XcpuRMSNorm(RMSNorm):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        var_hidden_size: int | None = None,
-        has_weight: bool = True,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)
-
-    def forward_oot(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.variance_size_override is not None:
-            return self.forward_native(x, residual)
-
-        add_residual = residual is not None
-        if add_residual:
-            assert residual is not None
-            assert self.weight.data is not None
-            return fused_add_rms_norm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
-        else:
-            return rms_norm(x, self.weight.data, self.variance_epsilon)
 
 
 @SiluAndMul.register_oot

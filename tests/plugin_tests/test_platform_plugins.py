@@ -23,12 +23,51 @@ from vllm.plugins import load_general_plugins
 
 
 def test_oot_custom_op(monkeypatch: pytest.MonkeyPatch):
-    # simulate workload by running an example
+    load_general_plugins()
+    from vllm import ir
+
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    McpuPlatform.import_ir_kernels()
+
+    assert ir.ops.rms_norm.impls["torch_xcpu"].inplace is False
+    assert ir.ops.fused_add_rms_norm.impls["torch_xcpu"].inplace is False
+    assert ir.ops.fused_add_rms_norm.impls["torch_xcpu_inplace"].inplace is True
+
+
+def test_rms_norm_uses_vllm_ir(monkeypatch: pytest.MonkeyPatch, default_vllm_config):
     load_general_plugins()
     from vllm.model_executor.layers.layernorm import RMSNorm
 
     layer = RMSNorm(1024)
-    assert layer.__class__.__name__ == "XcpuRMSNorm", (
-        f"Expected XcpuRMSNorm, got {layer.__class__.__name__}, "
-        "possibly because the custom op is not registered correctly."
+    assert layer.__class__ is RMSNorm
+
+
+def test_ir_priority_uses_functional_kernel_for_compile():
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationMode
+
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    McpuPlatform.import_ir_kernels()
+    eager_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
     )
+    compile_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.DYNAMO_TRACE_ONCE)
+    )
+
+    eager_priority = McpuPlatform.get_default_ir_op_priority(eager_config)
+    assert eager_priority.rms_norm == ["torch_xcpu", "native"]
+    assert eager_priority.fused_add_rms_norm == [
+        "torch_xcpu_inplace",
+        "torch_xcpu",
+        "native",
+    ]
+    compile_priority = McpuPlatform.get_default_ir_op_priority(compile_config)
+    assert compile_priority.rms_norm == ["torch_xcpu", "native"]
+    assert compile_priority.fused_add_rms_norm == [
+        "torch_xcpu",
+        "native",
+    ]

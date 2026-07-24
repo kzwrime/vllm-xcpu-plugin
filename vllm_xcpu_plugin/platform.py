@@ -14,6 +14,7 @@ import vllm_xcpu_plugin.envs as envs_xcpu
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
@@ -29,6 +30,35 @@ class McpuPlatform(Platform):
     dispatch_key: str = "PrivateUse1"
     dist_backend: str = "cpu:gloo,mcpu:mcpu"
     simple_compile_backend: str = "eager"
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        import vllm_xcpu_plugin.ir_kernels  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config import CompilationMode
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        # Eager execution dispatches directly to the implementation, so it can
+        # safely reuse the donated activation buffers. Mcpu compile currently
+        # uses DYNAMO_TRACE_ONCE rather than the custom VLLM_COMPILE backend;
+        # consequently the vLLM IR functionalization/lowering passes do not
+        # run. Select the genuinely functional one-launch kernel before Dynamo
+        # tracing instead of exposing a mutating implementation to Inductor.
+        fused_priority = ["torch_xcpu", "native"]
+        if vllm_config.compilation_config.mode in (
+            None,
+            CompilationMode.NONE,
+        ):
+            fused_priority.insert(0, "torch_xcpu_inplace")
+
+        return IrOpPriorityConfig.with_default(
+            ["torch_xcpu", "native"],
+            fused_add_rms_norm=fused_priority,
+        )
 
     @classmethod
     def get_attn_backend_cls(
