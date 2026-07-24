@@ -546,7 +546,7 @@ def _rejection_sampler_expand(launch: KernelLaunch) -> None:
     )
 
 
-def _rejection_compute_block_stats(launch: KernelLaunch) -> None:
+def _rejection_compute_local_logits_stats(launch: KernelLaunch) -> None:
     args = launch.arguments
     target_logits = args["target_logits_ptr"]
     vocab_size = args["vocab_size"]
@@ -560,11 +560,20 @@ def _rejection_compute_block_stats(launch: KernelLaunch) -> None:
         "target logits stride mismatch",
     )
     draft_logits = args["draft_logits_ptr"]
-    _expect(
-        args["draft_logits_stride_0"] == draft_logits.stride(0)
-        and args["draft_logits_stride_1"] == draft_logits.stride(1),
-        "draft logits stride mismatch",
-    )
+    if args["HAS_DRAFT_LOGITS"]:
+        _expect(draft_logits is not None, "draft logits must be provided")
+        _expect(
+            args["draft_logits_stride_0"] == draft_logits.stride(0)
+            and args["draft_logits_stride_1"] == draft_logits.stride(1),
+            "draft logits stride mismatch",
+        )
+    else:
+        _expect(draft_logits is None, "draft logits must be None")
+        _expect(
+            args["draft_logits_stride_0"] == 0
+            and args["draft_logits_stride_1"] == 0,
+            "absent draft logits must have zero strides",
+        )
     for tensor_name, stride_name in (
         ("target_local_argmax_ptr", "target_local_argmax_stride"),
         ("target_local_max_ptr", "target_local_max_stride"),
@@ -576,7 +585,7 @@ def _rejection_compute_block_stats(launch: KernelLaunch) -> None:
             args[stride_name] == args[tensor_name].stride(0),
             f"{tensor_name} stride mismatch",
         )
-    torch.ops.mcpu.vllm_rejection_compute_block_stats(
+    torch.ops.mcpu.vllm_rejection_compute_local_logits_stats(
         args["target_local_argmax_ptr"],
         args["target_local_max_ptr"],
         args["target_local_sumexp_ptr"],
@@ -593,6 +602,56 @@ def _rejection_compute_block_stats(launch: KernelLaunch) -> None:
     )
 
 
+def _rejection_cumulative_log_p(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["idx_mapping_ptr"].numel()
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        launch.metadata.get("num_warps") == 1,
+        "cumulative log-p requires num_warps=1",
+    )
+    torch.ops.mcpu.vllm_rejection_cumulative_log_p(
+        args["cumulative_log_p_ptr"],
+        args["target_logits_ptr"],
+        args["target_local_max_ptr"],
+        args["target_local_sumexp_ptr"],
+        args["draft_sampled_ptr"],
+        args["draft_logits_ptr"] if args["HAS_DRAFT_LOGITS"] else None,
+        args["draft_local_max_ptr"],
+        args["draft_local_sumexp_ptr"],
+        args["cu_num_logits_ptr"],
+        args["idx_mapping_ptr"],
+        args["temp_ptr"],
+        args["vocab_num_blocks"],
+    )
+
+
+def _rejection_local_residual_mass(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    output = args["local_residual_mass_ptr"]
+    _expect_grid(launch, output.shape)
+    _expect(args["BLOCK_SIZE"] == 8192, "residual mass BLOCK_SIZE must be 8192")
+    _expect(
+        args["vocab_num_blocks"] == output.shape[1],
+        "residual mass block count mismatch",
+    )
+    torch.ops.mcpu.vllm_rejection_local_residual_mass(
+        output,
+        args["cumulative_log_p_ptr"],
+        args["target_logits_ptr"],
+        args["target_local_max_ptr"],
+        args["target_local_sumexp_ptr"],
+        args["draft_logits_ptr"],
+        args["draft_local_max_ptr"],
+        args["draft_local_sumexp_ptr"],
+        args["expanded_idx_mapping_ptr"],
+        args["expanded_local_pos_ptr"],
+        args["temp_ptr"],
+        args["vocab_size"],
+        args["num_speculative_steps"],
+    )
+
+
 def _rejection_v2(launch: KernelLaunch) -> None:
     args = launch.arguments
     num_reqs = args["idx_mapping_ptr"].numel()
@@ -602,6 +661,13 @@ def _rejection_v2(launch: KernelLaunch) -> None:
         "rejection kernel requires num_warps=1",
     )
     _expect(not args["SYNTHETIC_MODE"], "synthetic rejection mode unsupported")
+    if args["USE_BLOCK_VERIFICATION"]:
+        _expect(args["cumulative_log_p_ptr"] is not None, "missing cumulative log p")
+        if args["HAS_DRAFT_LOGITS"]:
+            _expect(
+                args["local_residual_mass_ptr"] is not None,
+                "missing residual mass",
+            )
     vocab_num_blocks = args["vocab_num_blocks"]
     _expect(vocab_num_blocks > 0, "vocab_num_blocks must be positive")
     _expect(
@@ -622,11 +688,20 @@ def _rejection_v2(launch: KernelLaunch) -> None:
             f"{tensor_name} stride mismatch",
         )
     draft_logits = args["draft_logits_ptr"]
-    _expect(
-        args["draft_logits_stride_0"] == draft_logits.stride(0)
-        and args["draft_logits_stride_1"] == draft_logits.stride(1),
-        "draft logits stride mismatch",
-    )
+    if args["HAS_DRAFT_LOGITS"]:
+        _expect(draft_logits is not None, "draft logits must be provided")
+        _expect(
+            args["draft_logits_stride_0"] == draft_logits.stride(0)
+            and args["draft_logits_stride_1"] == draft_logits.stride(1),
+            "draft logits stride mismatch",
+        )
+    else:
+        _expect(draft_logits is None, "draft logits must be None")
+        _expect(
+            args["draft_logits_stride_0"] == 0
+            and args["draft_logits_stride_1"] == 0,
+            "absent draft logits must have zero strides",
+        )
     torch.ops.mcpu.vllm_rejection(
         args["sampled_ptr"],
         args["rejected_steps_ptr"],
@@ -645,6 +720,9 @@ def _rejection_v2(launch: KernelLaunch) -> None:
         args["temp_ptr"],
         args["seed_ptr"],
         args["pos_ptr"],
+        args["cumulative_log_p_ptr"],
+        args["local_residual_mass_ptr"],
+        args["USE_BLOCK_VERIFICATION"],
         vocab_num_blocks,
     )
 
@@ -657,6 +735,8 @@ def _rejection_resample(launch: KernelLaunch) -> None:
     num_blocks = (vocab_size + block_size - 1) // block_size
     _expect_grid(launch, (num_reqs, num_blocks))
     _expect(block_size == 1024, "resample BLOCK_SIZE must be 1024")
+    if args["USE_BLOCK_VERIFICATION"]:
+        _expect(args["cumulative_log_p_ptr"] is not None, "missing cumulative log p")
     for tensor_name, stride_name in (
         ("resampled_local_argmax_ptr", "resampled_local_argmax_stride"),
         ("resampled_local_max_ptr", "resampled_local_max_stride"),
@@ -667,11 +747,20 @@ def _rejection_resample(launch: KernelLaunch) -> None:
             f"{tensor_name} stride mismatch",
         )
     draft_logits = args["draft_logits_ptr"]
-    _expect(
-        args["draft_logits_stride_0"] == draft_logits.stride(0)
-        and args["draft_logits_stride_1"] == draft_logits.stride(1),
-        "draft logits stride mismatch",
-    )
+    if args["HAS_DRAFT_LOGITS"]:
+        _expect(draft_logits is not None, "draft logits must be provided")
+        _expect(
+            args["draft_logits_stride_0"] == draft_logits.stride(0)
+            and args["draft_logits_stride_1"] == draft_logits.stride(1),
+            "draft logits stride mismatch",
+        )
+    else:
+        _expect(draft_logits is None, "draft logits must be None")
+        _expect(
+            args["draft_logits_stride_0"] == 0
+            and args["draft_logits_stride_1"] == 0,
+            "absent draft logits must have zero strides",
+        )
     torch.ops.mcpu.vllm_rejection_resample(
         args["resampled_local_argmax_ptr"],
         args["resampled_local_max_ptr"],
@@ -686,9 +775,11 @@ def _rejection_resample(launch: KernelLaunch) -> None:
         args["temp_ptr"],
         args["seed_ptr"],
         args["pos_ptr"],
+        args["cumulative_log_p_ptr"],
         vocab_size,
         block_size,
         args["USE_FP64"],
+        args["USE_BLOCK_VERIFICATION"],
     )
 
 
@@ -1187,28 +1278,46 @@ _KERNELS: tuple[
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
-        "_compute_block_stats_kernel",
-        "8711ce7138a352828b6b7c63b2483feb544cb19c4a12dc6c6c11fb6e51bf8b76",
+        "_compute_local_logits_stats_kernel",
+        "d37d345853cbd4d215456059727b94ec42575c1e8dd5421991b489b0ba5e23bc",
         "f7df3922cbf844c774e1d7746d88d1b93dd75a99b0232d955c69d91ef553aea8",
-        "v0.24.0",
-        _rejection_compute_block_stats,
+        "v0.25.1",
+        _rejection_compute_local_logits_stats,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_compute_cumulative_log_p_kernel",
+        "facbac093d0917b1ac05ed5946e5283983ac5df7c250a661ee92252c381f575a",
+        "9288fe68370ddebf205d8583a3fde34969f8d3535c2f208615598df7140bddd2",
+        "v0.25.1",
+        _rejection_cumulative_log_p,
+        ("num_warps",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "_compute_local_residual_mass_kernel",
+        "3c0f47a77b2d498787c90b06659a4dfeb2565079a4e9957f1811757766c19ef4",
+        "bedaed3ba6a0b2032fac12cc9f5b33b47511463fb5385f5f57470104565869d5",
+        "v0.25.1",
+        _rejection_local_residual_mass,
         (),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_rejection_kernel",
-        "78c0b5afba1b38ef304e162fa22717b4a64d317e8c978709dcf5323655decbfd",
-        "c45d1cb9fe170a6824d201b8aea5ed7f07c8ff8fa891fc34fb3017b1db1b0bd3",
-        "v0.24.0",
+        "3920098c7bd8c39df49c5ddd3a29ac5410b34589380ab5f45d595f2a9fc4a998",
+        "ab95ffecb83ee24783fcfa2f1a52274a82888fc2763fd0669421935647b0ae5b",
+        "v0.25.1",
         _rejection_v2,
         ("num_warps",),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_resample_kernel",
-        "e9de8491b468f126ce8f9a26be89b0640a4001bdb08512f2a725ded22789c77c",
-        "9a45ff4a0621bf611ac1d60d2c8cbc684553c2f228700db4d39fb86152a002ff",
-        "v0.24.0",
+        "1b1246d50521edc32128655c5fc289d424b2ebba5aa785a98c16d6fb8439da53",
+        "2cb197288d2aabd1719d7dd1a599f48a5c059f1a8c4549196347eb95ea28af2a",
+        "v0.25.1",
         _rejection_resample,
         (),
     ),

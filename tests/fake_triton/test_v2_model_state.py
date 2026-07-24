@@ -9,7 +9,6 @@ from pathlib import Path
 
 def test_scatter_num_accepted_kernel_dispatches_with_current_vllm_abi():
     repo = Path(__file__).parents[2]
-    torch_mcpu_repo = repo.parent / "torch_mcpu"
     code = """
 import json
 import torch
@@ -39,7 +38,7 @@ print(json.dumps({
 }))
 """
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join((str(torch_mcpu_repo), str(repo)))
+    env["PYTHONPATH"] = str(repo)
     env["VLLM_PLUGINS"] = "xcpu_platform_plugin"
     result = subprocess.run(
         [sys.executable, "-c", code],

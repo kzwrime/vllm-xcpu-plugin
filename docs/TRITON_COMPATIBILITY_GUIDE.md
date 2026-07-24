@@ -1,5 +1,8 @@
 # vLLM XCPU Triton 兼容性与新算子接入指南
 
+> **迁移记录说明：** 具体版本的语义审计与迁移结论单独维护，不写入本通用指南。
+> 当前记录见 [v0.25.1 Triton 兼容层迁移记录](TRITON_MIGRATION_V0.25.1.md)。
+
 本文面向 `vllm-xcpu-plugin` 和 `torch_mcpu` 的维护者，说明如何使用当前 Fake Triton 兼容层、如何接入新的 vLLM Triton kernel，以及升级 vLLM、启用 `torch.compile` 时必须注意的边界。
 
 阅读顺序按日常开发优先级组织：先讲接入步骤和验证方法，再讲注意事项与排障，最后解释内部原理。

@@ -96,7 +96,9 @@ targets = {
         "_update_draft_inputs_kernel",
     ],
     "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils": [
-        "_compute_block_stats_kernel",
+        "_compute_local_logits_stats_kernel",
+        "_compute_cumulative_log_p_kernel",
+        "_compute_local_residual_mass_kernel",
         "_rejection_kernel",
         "_resample_kernel",
         "_insert_resampled_kernel",
@@ -172,14 +174,13 @@ print(json.dumps({
     assert payload == {
         "has_triton": True,
         "marker": True,
-        "count": 37,
+        "count": 39,
         "failed_closed": True,
     }
 
 
 def test_vllm_registry_is_version_locked_and_dispatches():
     repo = Path(__file__).parents[2]
-    torch_mcpu_repo = repo.parent / "torch_mcpu"
     code = """
 import json
 import torch
@@ -187,7 +188,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-    _compute_block_stats_kernel,
+    _compute_local_logits_stats_kernel,
 )
 from vllm.v1.worker.gpu.structured_outputs import _apply_grammar_bitmask_kernel
 from vllm.v1.sample.rejection_sampler import expand_kernel
@@ -221,6 +222,8 @@ _compute_slot_mapping_kernel[(2,)](
     block_table.stride(0),
     4,
     slot_mapping,
+    KV_CACHE_BLOCK_SIZE=4,
+    BLOCKS_PER_KV_BLOCK=1,
     TOTAL_CP_WORLD_SIZE=1,
     TOTAL_CP_RANK=0,
     CP_KV_CACHE_INTERLEAVE_SIZE=1,
@@ -251,7 +254,6 @@ try:
 except InvalidLaunchError:
     invalid_max_rejected = True
 block_target = torch.tensor([[1.0, 3.0, 2.0]], device="mcpu")
-dummy_draft = torch.empty((1, 1, 1), device="mcpu")
 block_argmax = torch.full((1, 1), -1, dtype=torch.int64, device="mcpu")
 block_target_max = torch.full((1, 1), -1.0, device="mcpu")
 block_target_sumexp = torch.full((1, 1), -1.0, device="mcpu")
@@ -260,7 +262,7 @@ block_draft_sumexp = torch.full((1, 1), -7.0, device="mcpu")
 block_mapping = torch.tensor([0], dtype=torch.int32, device="mcpu")
 block_pos = torch.tensor([0], dtype=torch.int32, device="mcpu")
 block_temp = torch.tensor([1.0], device="mcpu")
-_compute_block_stats_kernel[(1, 1)](
+_compute_local_logits_stats_kernel[(1, 1)](
     block_argmax,
     block_argmax.stride(0),
     block_target_max,
@@ -273,9 +275,9 @@ _compute_block_stats_kernel[(1, 1)](
     block_draft_sumexp.stride(0),
     block_target,
     block_target.stride(0),
-    dummy_draft,
-    dummy_draft.stride(0),
-    dummy_draft.stride(1),
+    None,
+    0,
+    0,
     block_mapping,
     block_pos,
     block_temp,
@@ -300,7 +302,7 @@ print(json.dumps({
     "invalid_max_rejected": invalid_max_rejected,
     "block_stats_launches": registry.launch_counts()[
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils."
-        "_compute_block_stats_kernel"
+        "_compute_local_logits_stats_kernel"
     ],
     "block_target_max": block_target_max.cpu().tolist(),
     "block_draft_max": block_draft_max.cpu().tolist(),
@@ -318,7 +320,7 @@ print(json.dumps({
 }))
 """
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join((str(torch_mcpu_repo), str(repo)))
+    env["PYTHONPATH"] = str(repo)
     env["VLLM_PLUGINS"] = "xcpu_platform_plugin"
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -330,8 +332,8 @@ print(json.dumps({
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
         "has_triton": True,
-        "registrations": 39,
-        "source_versions": ["v0.24.0"],
+        "registrations": 41,
+        "source_versions": ["v0.24.0", "v0.25.0", "v0.25.1"],
         "expand_launches": 1,
         "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],
         "invalid_max_rejected": True,
