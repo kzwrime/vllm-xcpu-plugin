@@ -19,6 +19,7 @@ This test file covers real-world usage from vLLM framework:
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
+from ops_test_data import case_id, run_data_mode_case
 from test_activation import _model_filter_matches
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -119,6 +120,48 @@ _3D_CONFIGS = [
 
 SEEDS = [0]
 CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
+
+
+def _run_rms_norm_case(
+    case: dict,
+    weight_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> torch.Tensor:
+    inputs = case["inputs"]
+    layer = RMSNorm(weight_size).to(dtype=dtype, device=device)
+    layer.weight.data = inputs["weight"].to(device)
+    x = inputs["x"].to(device)
+    out = layer(x)
+    torch.accelerator.synchronize()
+    out_cpu = out.cpu()
+
+    if x.dtype == torch.bfloat16:
+        opcheck(
+            torch.ops.torch_xcpu.rms_norm_bf16,
+            (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+        )
+    elif x.dtype == torch.float:
+        opcheck(
+            torch.ops.torch_xcpu.rms_norm_fp32,
+            (out, x, layer.weight.data, layer.variance_epsilon),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+        )
+    else:
+        raise RuntimeError(f"Unsupported dtype: {x.dtype}")
+    return out_cpu
+
+
+def _check_rms_norm_case(out_cpu: torch.Tensor, case: dict) -> None:
+    ref_out = case["expected"]
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
+    assert diff_out < default_dice_tol, (
+        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -394,73 +437,61 @@ def test_rms_norm_2d_model_configs(
     dtype: torch.dtype,
     seed: int,
     device: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Test rms_norm with 2D format [num_tokens, hidden_size] using model configs.
 
     Tests hidden sizes derived from actual model configurations,
     including DeepSeek-V3 q_lora_rank and kv_lora_rank special cases.
     """
-    set_random_seed(seed)
-    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
-    layer.weight.data.normal_(mean=1.0, std=0.1)
-    scale = 1 / (2 * hidden_size)
 
-    if is_mla_kv_lora:
-        # MLA kv_lora: non-contiguous view with stride = kv_lora_rank + qk_rope_head_dim
-        kv_lora_rank = 512
-        qk_rope_head_dim = 64  # DeepSeek-V3 rotary_dim
-        if has_q_lora:
-            q_lora_rank = 1536
-            mla_head_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+    def build_case():
+        set_random_seed(seed)
+        layer = RMSNorm(hidden_size).to(dtype=dtype, device="cpu")
+        layer.weight.data.normal_(mean=1.0, std=0.1)
+        scale = 1 / (2 * hidden_size)
+
+        if is_mla_kv_lora:
+            kv_lora_rank = 512
+            qk_rope_head_dim = 64
+            if has_q_lora:
+                q_lora_rank = 1536
+                mla_head_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+            else:
+                mla_head_size = kv_lora_rank + qk_rope_head_dim
+            combined = (
+                torch.randn(num_tokens, mla_head_size, dtype=dtype, device="cpu")
+                * scale
+            )
+            x_cpu = combined[:, :hidden_size]
         else:
-            mla_head_size = kv_lora_rank + qk_rope_head_dim
-        combined = (
-            torch.randn(num_tokens, mla_head_size, dtype=dtype, device="cpu") * scale
-        )
-        x_cpu = combined[:, :hidden_size]  # Non-contiguous view
-        x = combined.to(device)[:, :hidden_size]
-        assert x.stride() == x_cpu.stride()
-    else:
-        # Regular case: contiguous tensor
-        x_cpu = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cpu") * scale
-        x = x_cpu.to(device)
+            x_cpu = (
+                torch.randn(num_tokens, hidden_size, dtype=dtype, device="cpu") * scale
+            )
 
-    # Compute reference in fp32 for higher precision
-    layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
-    x_fp32 = x_cpu.to(torch.float)
-    ref_out = layer_fp32.forward_native(x_fp32)
+        layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float)
+        layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+        ref_out = layer_fp32.forward_native(x_cpu.to(torch.float))
+        return {
+            "inputs": {"x": x_cpu, "weight": layer.weight.data.cpu()},
+            "expected": ref_out,
+        }
 
-    out = layer(x)
-    torch.accelerator.synchronize()
-    out_cpu = out.cpu()
-
-    # Compare using both assert_close and default_dice_tol
-    atol = get_default_atol(out_cpu)
-    rtol = get_default_rtol(out_cpu)
-    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
-
-    # Check Dice tolerance
-    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
-    assert diff_out < default_dice_tol, (
-        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    run_data_mode_case(
+        op_name="rms_norm_2d_model_config",
+        case_name=case_id(
+            f"tokens={num_tokens}",
+            f"hidden={hidden_size}",
+            f"mla={is_mla_kv_lora}",
+            f"q_lora={has_q_lora}",
+            dtype,
+            f"seed={seed}",
+        ),
+        build_fn=build_case,
+        run_fn=lambda case: _run_rms_norm_case(case, hidden_size, dtype, device),
+        check_fn=_check_rms_norm_case,
+        pytest_config=request.config,
     )
-
-    # Check the custom kernel
-    if x.dtype == torch.bfloat16:
-        opcheck(
-            torch.ops.torch_xcpu.rms_norm_bf16,
-            (out, x, layer.weight.data, layer.variance_epsilon),
-            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-        )
-    elif x.dtype == torch.float:
-        opcheck(
-            torch.ops.torch_xcpu.rms_norm_fp32,
-            (out, x, layer.weight.data, layer.variance_epsilon),
-            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-        )
-    else:
-        raise RuntimeError(f"Unsupported dtype: {x.dtype}")
 
 
 @pytest.mark.parametrize("num_tokens", COMMON_TOKENS)
@@ -482,6 +513,7 @@ def test_rms_norm_3d_model_configs(
     dtype: torch.dtype,
     seed: int,
     device: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Test rms_norm with 3D format using model configs.
 
@@ -489,94 +521,73 @@ def test_rms_norm_3d_model_configs(
     Tests attention head normalization for Q and K tensors
     with realistic num_heads derived from model configurations and TP sizes.
     """
-    set_random_seed(seed)
 
-    config = ALL_MODEL_CONFIGS[model_name]
+    def build_case():
+        set_random_seed(seed)
+        config = ALL_MODEL_CONFIGS[model_name]
+        layer = RMSNorm(head_size).to(dtype=dtype, device="cpu")
+        layer.weight.data.normal_(mean=1.0, std=0.1)
+        scale = 1 / (2 * head_size)
 
-    # For 3D rms_norm, framework uses weight size = head_size
-    layer = RMSNorm(head_size).to(dtype=dtype, device=device)
-    layer.weight.data.normal_(mean=1.0, std=0.1)
-
-    scale = 1 / (2 * head_size)
-
-    # Create non-contiguous 3D view simulating framework behavior
-    if num_tokens > 1:
-        # Multi-token: simulate non-contiguous input from QK projection view
-        complete_num_kv_heads = config.num_kv_heads if config.num_kv_heads else 0
-        complete_num_heads = config.num_heads
-
-        if complete_num_kv_heads > 0:
-            num_kv_heads_per_rank = max(complete_num_kv_heads // tp_size, 1)
-        else:
-            num_kv_heads_per_rank = 0
-
-        # Calculate total_size for stride based on tensor type
-        if tensor_type == "KV":
-            # K tensor: stride based on Q heads (num_heads_per_rank from Q side)
-            num_heads_per_rank_q = max(config.num_heads // tp_size, 1)
-            total_size = num_heads_per_rank_q + 2 * num_kv_heads_per_rank
-        else:
-            # Q tensor
-            if config.num_heads is not None:
-                num_heads_per_rank_q = max(config.num_heads // tp_size, 1)
+        if num_tokens > 1:
+            complete_num_kv_heads = config.num_kv_heads if config.num_kv_heads else 0
+            complete_num_heads = config.num_heads
+            if complete_num_kv_heads > 0:
+                num_kv_heads_per_rank = max(complete_num_kv_heads // tp_size, 1)
             else:
-                num_heads_per_rank_q = num_heads
+                num_kv_heads_per_rank = 0
 
-            if complete_num_heads is not None and tp_size == 1:
-                total_size = complete_num_heads + 2 * num_kv_heads_per_rank
-            elif num_heads_per_rank_q is not None:
+            if tensor_type == "KV":
+                num_heads_per_rank_q = max(config.num_heads // tp_size, 1)
                 total_size = num_heads_per_rank_q + 2 * num_kv_heads_per_rank
             else:
-                total_size = num_heads + 2 * num_kv_heads_per_rank
+                if config.num_heads is not None:
+                    num_heads_per_rank_q = max(config.num_heads // tp_size, 1)
+                else:
+                    num_heads_per_rank_q = num_heads
 
-        combined = (
-            torch.randn(num_tokens, total_size, head_size, dtype=dtype, device="cpu")
-            * scale
-        )
-        x_cpu = combined[:, :num_heads, :]  # Non-contiguous view
-        x = combined.to(device)[:, :num_heads, :]
-        assert x.stride() == x_cpu.stride()
-    else:
-        # Single token: contiguous (decode mode)
-        x_cpu = (
-            torch.randn(num_tokens, num_heads, head_size, dtype=dtype, device="cpu")
-            * scale
-        )
-        x = x_cpu.to(device)
+                if complete_num_heads is not None and tp_size == 1:
+                    total_size = complete_num_heads + 2 * num_kv_heads_per_rank
+                elif num_heads_per_rank_q is not None:
+                    total_size = num_heads_per_rank_q + 2 * num_kv_heads_per_rank
+                else:
+                    total_size = num_heads + 2 * num_kv_heads_per_rank
 
-    # Compute reference in fp32 for higher precision
-    layer_fp32 = RMSNorm(head_size).to(dtype=torch.float)
-    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
-    x_fp32 = x_cpu.to(torch.float)
-    ref_out = layer_fp32.forward_native(x_fp32)
+            combined = (
+                torch.randn(
+                    num_tokens, total_size, head_size, dtype=dtype, device="cpu"
+                )
+                * scale
+            )
+            x_cpu = combined[:, :num_heads, :]
+        else:
+            x_cpu = (
+                torch.randn(num_tokens, num_heads, head_size, dtype=dtype, device="cpu")
+                * scale
+            )
 
-    out = layer(x)
-    torch.accelerator.synchronize()
-    out_cpu = out.cpu()
+        layer_fp32 = RMSNorm(head_size).to(dtype=torch.float)
+        layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+        ref_out = layer_fp32.forward_native(x_cpu.to(torch.float))
+        return {
+            "inputs": {"x": x_cpu, "weight": layer.weight.data.cpu()},
+            "expected": ref_out,
+        }
 
-    # Compare using both assert_close and default_dice_tol
-    atol = get_default_atol(out_cpu)
-    rtol = get_default_rtol(out_cpu)
-    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
-
-    # Check Dice tolerance
-    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
-    assert diff_out < default_dice_tol, (
-        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    run_data_mode_case(
+        op_name="rms_norm_3d_model_config",
+        case_name=case_id(
+            model_name,
+            f"tp={tp_size}",
+            tensor_type,
+            f"tokens={num_tokens}",
+            f"heads={num_heads}",
+            f"head={head_size}",
+            dtype,
+            f"seed={seed}",
+        ),
+        build_fn=build_case,
+        run_fn=lambda case: _run_rms_norm_case(case, head_size, dtype, device),
+        check_fn=_check_rms_norm_case,
+        pytest_config=request.config,
     )
-
-    # Check the custom kernel
-    if x.dtype == torch.bfloat16:
-        opcheck(
-            torch.ops.torch_xcpu.rms_norm_bf16,
-            (out, x, layer.weight.data, layer.variance_epsilon),
-            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-        )
-    elif x.dtype == torch.float:
-        opcheck(
-            torch.ops.torch_xcpu.rms_norm_fp32,
-            (out, x, layer.weight.data, layer.variance_epsilon),
-            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-        )
-    else:
-        raise RuntimeError(f"Unsupported dtype: {x.dtype}")

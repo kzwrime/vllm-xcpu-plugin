@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
+from ops_test_data import case_id, run_data_mode_case
 from test_activation import _model_filter_matches
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -68,6 +69,26 @@ TENSORS_SHAPES_FN = [
     _get_flat_tensor_shape,
     _get_padded_tensor_shape,
 ]
+
+
+def _fresh_to_device(tensor: torch.Tensor, device: str) -> torch.Tensor:
+    return tensor.clone().to(device)
+
+
+def _make_rope(
+    head_size: int,
+    max_position: int,
+    is_neox_style: bool,
+    rope_parameters: dict,
+    dtype: torch.dtype,
+    device: str | None = None,
+):
+    rope = get_rope(
+        head_size, max_position, is_neox_style, rope_parameters, dtype=dtype
+    )
+    cache = rope._compute_cos_sin_cache().to(dtype=dtype)
+    rope.cos_sin_cache = cache.to(device) if device is not None else cache
+    return rope
 
 
 @torch.inference_mode()
@@ -143,12 +164,100 @@ def _test_rotary_embedding_model(
             (positions, query, key, head_size, rope.cos_sin_cache, is_neox_style),
             cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
+
+
+def _run_rotary_embedding_case(
+    case: dict,
+    is_neox_style: bool,
+    head_size: int,
+    rotary_dim: int,
+    rope_theta: float,
+    max_position: int,
+    dtype: torch.dtype,
+    use_key: bool,
+    device: str,
+) -> dict:
+    inputs = case["inputs"]
+    rope_parameters = {
+        "rope_type": "default",
+        "rope_theta": rope_theta,
+        "partial_rotary_factor": rotary_dim / head_size,
+    }
+    rope = _make_rope(
+        head_size, max_position, is_neox_style, rope_parameters, dtype, device
+    )
+    if inputs.get("layout") == "qkv":
+        qkv = _fresh_to_device(inputs["qkv"], device)
+        q_end = int(inputs["q_end"])
+        k_end = int(inputs["k_end"])
+        query = qkv[:, :q_end, :]
+        key = qkv[:, q_end:k_end, :] if use_key else None
+        query_shape = tuple(inputs["query_shape"])
+        key_shape = tuple(inputs["key_shape"]) if inputs.get("key_shape") else None
+    else:
+        query = _fresh_to_device(inputs["query"], device)
+        key_cpu = inputs.get("key")
+        key = (
+            _fresh_to_device(key_cpu, device)
+            if key_cpu is not None and use_key
+            else None
+        )
+        query_shape = tuple(inputs.get("query_shape", inputs["query"].shape))
+        key_shape = tuple(
+            inputs.get("key_shape", key_cpu.shape if key_cpu is not None else ())
+        )
+    positions = _fresh_to_device(inputs["positions"], device)
+    out_query, out_key = rope.forward(
+        positions,
+        query.view(query.shape[0], -1),
+        key.view(key.shape[0], -1) if key is not None else None,
+    )
+    torch.accelerator.synchronize()
+    actual = {
+        "query": out_query.view(query_shape).cpu(),
+        "key": out_key.view(key_shape).cpu() if out_key is not None else None,
+    }
+
+    if dtype == torch.bfloat16:
+        opcheck(
+            torch.ops.torch_xcpu.rotary_embedding_bf16,
+            (positions, query, key, head_size, rope.cos_sin_cache, is_neox_style),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+        )
     elif dtype == torch.float:
         opcheck(
             torch.ops.torch_xcpu.rotary_embedding_fp32,
             (positions, query, key, head_size, rope.cos_sin_cache, is_neox_style),
             cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
         )
+    return actual
+
+
+def _check_rotary_embedding_case(actual: dict, case: dict) -> None:
+    expected = case["expected"]
+    out_query_cpu = actual["query"]
+    ref_query = expected["query"]
+    atol = get_default_atol(out_query_cpu)
+    rtol = get_default_rtol(out_query_cpu)
+    torch.testing.assert_close(
+        out_query_cpu.to(torch.float32), ref_query, atol=atol, rtol=rtol
+    )
+    diff_query = calc_diff(out_query_cpu.to(torch.float32), ref_query)
+    assert diff_query < default_dice_tol, (
+        f"Query diff {diff_query} exceeds dice tolerance {default_dice_tol}"
+    )
+
+    if expected["key"] is not None:
+        assert actual["key"] is not None
+        torch.testing.assert_close(
+            actual["key"].to(torch.float32), expected["key"], atol=atol, rtol=rtol
+        )
+        diff_key = calc_diff(actual["key"].to(torch.float32), expected["key"])
+        assert diff_key < default_dice_tol, (
+            f"Key diff {diff_key} exceeds dice tolerance {default_dice_tol}"
+        )
+    else:
+        assert actual["key"] is None
 
 
 @pytest.mark.parametrize("is_neox_style", IS_NEOX_STYLE)
@@ -184,9 +293,12 @@ def _test_rotary_embedding_basic(
         "rope_theta": rope_theta,
         "partial_rotary_factor": rotary_dim / head_size,
     }
-    rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
-    rope_fp32 = rope.to(dtype=torch.float32)
-    rope = rope.to(dtype=dtype, device=device)
+    rope_fp32 = _make_rope(
+        head_size, max_position, is_neox_style, rope_parameters, torch.float32
+    )
+    rope = _make_rope(
+        head_size, max_position, is_neox_style, rope_parameters, dtype, device
+    )
 
     for tensor_shape_fn in TENSORS_SHAPES_FN:
         for batch_size in BATCH_SIZES:
@@ -312,6 +424,7 @@ def test_rotary_embedding(
     use_key: bool,
     combinations: RotaryEmbeddingConfig,
     subtests,
+    request: pytest.FixtureRequest,
 ) -> None:
 
     num_heads: int = combinations.num_heads
@@ -326,67 +439,106 @@ def test_rotary_embedding(
     if rotary_dim is None:
         rotary_dim = head_size
 
-    set_random_seed(seed)
     if rotary_dim is None:
         rotary_dim = head_size
-    rope_parameters = {
-        "rope_type": "default",
-        "rope_theta": rope_theta,
-        "partial_rotary_factor": rotary_dim / head_size,
-    }
-    rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
-    rope_fp32 = rope.to(dtype=torch.float32)
-    rope = rope.to(dtype=dtype, device=device)
 
     for seq_len in COMMON_TOKENS:
         with subtests.test(
             msg="rotary_embedding_config",
             seq_len=seq_len,
         ):
-            if contiguous_qkv:
-                # Models using .split() produce contiguous tensors
-                query_cpu = torch.randn(
-                    seq_len, num_heads, head_size, dtype=dtype, device="cpu"
-                )
-                key_cpu = torch.randn(
-                    seq_len, num_kv_heads, head_size, dtype=dtype, device="cpu"
-                )
-            else:
-                # Models using .chunk() or with TP sharding produce non-contiguous views
-                # Simulate by creating a combined QKV tensor and slicing
-                q_proj_size = num_heads
-                k_proj_size = num_kv_heads
-                v_proj_size = num_kv_heads
-                total_qkv_size = q_proj_size + k_proj_size + v_proj_size
 
-                qkv = torch.randn(
-                    seq_len, total_qkv_size, head_size, dtype=dtype, device="cpu"
+            def build_case(seq_len=seq_len):
+                set_random_seed(seed)
+                rope_parameters = {
+                    "rope_type": "default",
+                    "rope_theta": rope_theta,
+                    "partial_rotary_factor": rotary_dim / head_size,
+                }
+                rope_fp32 = _make_rope(
+                    head_size,
+                    max_position,
+                    is_neox_style,
+                    rope_parameters,
+                    torch.float32,
                 )
-                q_end = q_proj_size
-                k_end = q_proj_size + k_proj_size
-                query_cpu = qkv[:, :q_end, :]
-                key_cpu = qkv[:, q_end:k_end, :]
-                qkv_device = qkv.to(device)
-                query = qkv_device[:, :q_end, :]
-                key = qkv_device[:, q_end:k_end, :]
-                assert query.stride() == query_cpu.stride()
-                assert key.stride() == key_cpu.stride()
-            if contiguous_qkv:
-                query = query_cpu.to(device)
-                key = key_cpu.to(device)
+                if contiguous_qkv:
+                    query_cpu = torch.randn(
+                        seq_len, num_heads, head_size, dtype=dtype, device="cpu"
+                    )
+                    key_cpu = torch.randn(
+                        seq_len, num_kv_heads, head_size, dtype=dtype, device="cpu"
+                    )
+                    inputs = {
+                        "layout": "separate",
+                        "query": query_cpu,
+                        "key": key_cpu if use_key else None,
+                        "query_shape": tuple(query_cpu.shape),
+                        "key_shape": tuple(key_cpu.shape) if use_key else None,
+                    }
+                else:
+                    q_proj_size = num_heads
+                    k_proj_size = num_kv_heads
+                    v_proj_size = num_kv_heads
+                    total_qkv_size = q_proj_size + k_proj_size + v_proj_size
 
-            positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
-            _test_rotary_embedding_model(
-                rope,
-                rope_fp32,
-                query_cpu,
-                key_cpu if use_key else None,
-                positions_cpu,
-                query,
-                key if use_key else None,
-                positions_cpu.to(device),
-                is_neox_style,
-                head_size,
-                dtype,
-                use_key,
+                    qkv = torch.randn(
+                        seq_len, total_qkv_size, head_size, dtype=dtype, device="cpu"
+                    )
+                    q_end = q_proj_size
+                    k_end = q_proj_size + k_proj_size
+                    query_cpu = qkv[:, :q_end, :]
+                    key_cpu = qkv[:, q_end:k_end, :]
+                    inputs = {
+                        "layout": "qkv",
+                        "qkv": qkv,
+                        "q_end": q_end,
+                        "k_end": k_end,
+                        "query_shape": tuple(query_cpu.shape),
+                        "key_shape": tuple(key_cpu.shape) if use_key else None,
+                    }
+
+                positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
+                ref_query, ref_key = rope_fp32.forward_native(
+                    positions_cpu,
+                    query_cpu.to(torch.float32).clone(),
+                    key_cpu.to(torch.float32).clone() if use_key else None,
+                )
+                inputs["positions"] = positions_cpu
+                return {
+                    "inputs": inputs,
+                    "expected": {"query": ref_query, "key": ref_key},
+                }
+
+            run_data_mode_case(
+                op_name="rotary_embedding",
+                case_name=case_id(
+                    combinations.model_name,
+                    f"seq={seq_len}",
+                    f"heads={num_heads}",
+                    f"kv={num_kv_heads}",
+                    f"head={head_size}",
+                    f"rotary={rotary_dim}",
+                    f"contig={contiguous_qkv}",
+                    f"neox={is_neox_style}",
+                    f"key={use_key}",
+                    f"theta={rope_theta}",
+                    f"maxpos={max_position}",
+                    dtype,
+                    f"seed={seed}",
+                ),
+                build_fn=build_case,
+                run_fn=lambda case: _run_rotary_embedding_case(
+                    case,
+                    is_neox_style,
+                    head_size,
+                    rotary_dim,
+                    rope_theta,
+                    max_position,
+                    dtype,
+                    use_key,
+                    device,
+                ),
+                check_fn=_check_rotary_embedding_case,
+                pytest_config=request.config,
             )

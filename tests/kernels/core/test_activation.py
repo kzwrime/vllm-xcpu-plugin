@@ -7,6 +7,7 @@ import random
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
+from ops_test_data import case_id, run_data_mode_case
 from torch_xcpu.model_configs import ALL_MODEL_CONFIGS, COMMON_TOKENS
 from vllm.model_executor.layers.activation import (
     FatreluAndMul,
@@ -41,6 +42,82 @@ CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 # CUDA_DEVICES = [
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
+
+
+def _activation_layer_and_fn(
+    activation: str,
+    x: torch.Tensor,
+    threshold: float | None,
+):
+    if activation == "silu_and_mul":
+        layer = SiluAndMul()
+        fn = (
+            torch.ops.torch_xcpu.silu_and_mul_bf16
+            if x.dtype == torch.bfloat16
+            else torch.ops.torch_xcpu.silu_and_mul_fp32
+        )
+    elif activation == "mul_and_silu":
+        layer = MulAndSilu()
+        fn = torch.ops._C.mul_and_silu
+    elif activation == "gelu":
+        layer = GeluAndMul(approximate="none")
+        fn = torch.ops._C.gelu_and_mul
+    elif activation == "gelu_tanh":
+        layer = GeluAndMul(approximate="tanh")
+        fn = torch.ops._C.gelu_tanh_and_mul
+    elif activation == "fatrelu":
+        assert threshold is not None
+        layer = FatreluAndMul(threshold)
+        fn = torch.ops._C.fatrelu_and_mul
+    elif activation == "swigluoai_and_mul":
+        layer = SwigluOAIAndMul()
+        fn = torch.ops._C.swigluoai_and_mul
+    else:
+        raise RuntimeError(f"Unsupported activation: {activation}")
+    return layer, fn
+
+
+def _run_activation_case(
+    case: dict,
+    activation: str,
+    device: str,
+) -> torch.Tensor:
+    inputs = case["inputs"]
+    x = inputs["x"].to(device)
+    layer, fn = _activation_layer_and_fn(activation, x, inputs.get("threshold"))
+    out = layer(x)
+    torch.accelerator.synchronize()
+    out_cpu = out.cpu()
+
+    d = x.shape[-1] // 2
+    output_shape = x.shape[:-1] + (d,)
+    opcheck_out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    if activation == "fatrelu":
+        opcheck(
+            fn,
+            (opcheck_out, x, inputs["threshold"]),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+        )
+    elif activation == "swigluoai_and_mul":
+        opcheck(
+            fn,
+            (opcheck_out, x, layer.alpha, layer.limit),
+            cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+        )
+    else:
+        opcheck(fn, (opcheck_out, x), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK)
+    return out_cpu
+
+
+def _check_activation_case(out_cpu: torch.Tensor, case: dict) -> None:
+    ref_out = case["expected"]
+    atol = get_default_atol(out_cpu)
+    rtol = get_default_rtol(out_cpu)
+    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
+    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
+    assert diff_out < default_dice_tol, (
+        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    )
 
 
 def _model_filter_matches(model_name: str) -> bool:
@@ -101,73 +178,27 @@ def test_act_and_mul(
     dtype: torch.dtype,
     seed: int,
     device: str,
+    request: pytest.FixtureRequest,
 ) -> None:
-    set_random_seed(seed)
-    x_cpu = torch.randn(num_tokens, 2 * d, dtype=dtype, device="cpu")
-    x = x_cpu.to(device)
-    if activation == "silu_and_mul":
-        layer = SiluAndMul()
-        fn = torch.ops._C.silu_and_mul
-    if activation == "mul_and_silu":
-        layer = MulAndSilu()
-        fn = torch.ops._C.mul_and_silu
-    elif activation == "gelu":
-        layer = GeluAndMul(approximate="none")
-        fn = torch.ops._C.gelu_and_mul
-    elif activation == "gelu_tanh":
-        layer = GeluAndMul(approximate="tanh")
-        fn = torch.ops._C.gelu_tanh_and_mul
-    elif activation == "fatrelu":
-        threshold = random.uniform(0, 1)
-        layer = FatreluAndMul(threshold)
-        fn = torch.ops._C.fatrelu_and_mul
-    elif activation == "swigluoai_and_mul":
-        layer = SwigluOAIAndMul()
-        fn = torch.ops._C.swigluoai_and_mul
+    def build_case():
+        set_random_seed(seed)
+        x_cpu = torch.randn(num_tokens, 2 * d, dtype=dtype, device="cpu")
+        threshold = random.uniform(0, 1) if activation == "fatrelu" else None
+        layer, _ = _activation_layer_and_fn(activation, x_cpu, threshold)
+        ref_out = layer.to(dtype=torch.float).forward_native(x_cpu.to(torch.float))
+        inputs = {"x": x_cpu}
+        if threshold is not None:
+            inputs["threshold"] = threshold
+        return {"inputs": inputs, "expected": ref_out}
 
-    # Compute reference in fp32 for higher precision
-    x_fp32 = x_cpu.to(torch.float)
-    layer_fp32 = layer.to(dtype=torch.float)
-    ref_out = layer_fp32.forward_native(x_fp32)
-
-    out = layer(x)
-    torch.accelerator.synchronize()
-    out_cpu = out.cpu()
-
-    # Print error metrics
-    # max_abs_error = (out.to(torch.float) - ref_out).abs().max().item()
-    # max_rel_error = ((out.to(torch.float) - ref_out).abs() / (ref_out.abs() + 1e-12)).max().item()  # noqa: E501
-    # print(f"  Output: max_abs_error={max_abs_error:.6e}, max_rel_error={max_rel_error:.6e}, diff_out={diff_out:.6e}")  # noqa: E501
-
-    # Compare using both assert_close and default_dice_tol
-    # Reference precision is fp32, tolerance based on target (out) dtype
-    atol = get_default_atol(out_cpu)
-    rtol = get_default_rtol(out_cpu)
-    torch.testing.assert_close(out_cpu.to(torch.float), ref_out, atol=atol, rtol=rtol)
-
-    # Check Dice tolerance
-    diff_out = calc_diff(out_cpu.to(torch.float), ref_out)
-    assert diff_out < default_dice_tol, (
-        f"Output diff {diff_out} exceeds dice tolerance {default_dice_tol}"
+    run_data_mode_case(
+        op_name="activation",
+        case_name=case_id(activation, f"tokens={num_tokens}", f"d={d}", dtype, seed),
+        build_fn=build_case,
+        run_fn=lambda case: _run_activation_case(case, activation, device),
+        check_fn=_check_activation_case,
+        pytest_config=request.config,
     )
-
-    d = x.shape[-1] // 2
-    output_shape = x.shape[:-1] + (d,)
-    out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-    if activation == "silu_and_mul":
-        fn = (
-            torch.ops.torch_xcpu.silu_and_mul_bf16
-            if x.dtype == torch.bfloat16
-            else torch.ops.torch_xcpu.silu_and_mul_fp32
-        )
-    if activation == "fatrelu":
-        opcheck(fn, (out, x, threshold), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK)
-    elif activation == "swigluoai_and_mul":
-        opcheck(
-            fn, (out, x, layer.alpha, layer.limit), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK
-        )
-    else:
-        opcheck(fn, (out, x), cond=CUSTOM_OP_TEST_ENABLE_OPCHECK)
 
 
 # @pytest.mark.parametrize(
