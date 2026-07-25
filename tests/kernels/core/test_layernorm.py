@@ -4,6 +4,7 @@
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
+from ops_test_data import case_id, run_data_mode_case
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
@@ -44,6 +45,63 @@ CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 # ]
 
 
+def _run_rms_norm_case(case: dict, hidden_size: int, dtype: torch.dtype, device: str):
+    inputs = case["inputs"]
+    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
+    layer.weight.data = inputs["weight"].to(device)
+    x = inputs["x"].to(device)
+    residual_cpu = inputs.get("residual")
+    residual = residual_cpu.to(device) if residual_cpu is not None else None
+    out = layer(x, residual)
+    torch.accelerator.synchronize()
+
+    if residual is not None:
+        actual = {"out": out[0].cpu(), "residual": out[1].cpu()}
+        if x.dtype == torch.bfloat16:
+            opcheck(
+                torch.ops.torch_xcpu.fused_add_rms_norm_bf16,
+                (x, residual, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+            )
+        elif x.dtype == torch.float:
+            opcheck(
+                torch.ops.torch_xcpu.fused_add_rms_norm_fp32,
+                (x, residual, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+            )
+    else:
+        actual = {"out": out.cpu()}
+        if x.dtype == torch.bfloat16:
+            opcheck(
+                torch.ops.torch_xcpu.rms_norm_bf16,
+                (out, x, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+            )
+        elif x.dtype == torch.float:
+            opcheck(
+                torch.ops.torch_xcpu.rms_norm_fp32,
+                (out, x, layer.weight.data, layer.variance_epsilon),
+                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
+            )
+        else:
+            raise RuntimeError(f"Unsupported dtype: {x.dtype}")
+    return actual
+
+
+def _check_rms_norm_case(actual: dict, case: dict) -> None:
+    expected = case["expected"]
+    torch.testing.assert_close(
+        actual["out"].to(torch.float), expected["out"], atol=1e-2, rtol=1e-2
+    )
+    if "residual" in expected:
+        torch.testing.assert_close(
+            actual["residual"].to(torch.float),
+            expected["residual"],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
@@ -61,71 +119,48 @@ def test_rms_norm(
     seed: int,
     device: str,
     strided_input: bool,
+    request: pytest.FixtureRequest,
 ) -> None:
-    set_random_seed(seed)
-    layer = RMSNorm(hidden_size).to(dtype=dtype, device=device)
-    layer.weight.data.normal_(mean=1.0, std=0.1)
-    scale = 1 / (2 * hidden_size)
-    last_dim = 2 * hidden_size if strided_input else hidden_size
-    x_base_cpu = torch.randn(num_tokens, last_dim, dtype=dtype, device="cpu")
-    x_cpu = x_base_cpu[..., :hidden_size]
-    assert x_cpu.is_contiguous() != strided_input
-    x_cpu *= scale
-    residual_cpu = torch.randn_like(x_cpu) * scale if add_residual else None
-    x_base = x_base_cpu.to(device)
-    x = x_base[..., :hidden_size]
-    assert x.stride() == x_cpu.stride()
-    residual = residual_cpu.to(device) if residual_cpu is not None else None
+    def build_case():
+        set_random_seed(seed)
+        layer = RMSNorm(hidden_size).to(dtype=dtype, device="cpu")
+        layer.weight.data.normal_(mean=1.0, std=0.1)
+        scale = 1 / (2 * hidden_size)
+        last_dim = 2 * hidden_size if strided_input else hidden_size
+        x_base_cpu = torch.randn(num_tokens, last_dim, dtype=dtype, device="cpu")
+        x_cpu = x_base_cpu[..., :hidden_size]
+        assert x_cpu.is_contiguous() != strided_input
+        x_cpu *= scale
+        residual_cpu = torch.randn_like(x_cpu) * scale if add_residual else None
 
-    # NOTE(woosuk): The reference implementation should be executed first
-    # because the custom kernel is in-place.
-    layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float, device="cpu")
-    layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
-    ref_out = layer_fp32.forward_native(
-        x_cpu.to(torch.float),
-        residual_cpu.to(torch.float) if residual_cpu is not None else None,
+        layer_fp32 = RMSNorm(hidden_size).to(dtype=torch.float, device="cpu")
+        layer_fp32.weight.data = layer.weight.data.cpu().to(torch.float)
+        ref_out = layer_fp32.forward_native(
+            x_cpu.to(torch.float),
+            residual_cpu.to(torch.float) if residual_cpu is not None else None,
+        )
+        expected = (
+            {"out": ref_out[0], "residual": ref_out[1]}
+            if add_residual
+            else {"out": ref_out}
+        )
+        inputs = {"x": x_cpu, "weight": layer.weight.data.cpu()}
+        if residual_cpu is not None:
+            inputs["residual"] = residual_cpu
+        return {"inputs": inputs, "expected": expected}
+
+    run_data_mode_case(
+        op_name="layernorm_rms_norm",
+        case_name=case_id(
+            f"tokens={num_tokens}",
+            f"hidden={hidden_size}",
+            f"residual={add_residual}",
+            dtype,
+            f"seed={seed}",
+            f"strided={strided_input}",
+        ),
+        build_fn=build_case,
+        run_fn=lambda case: _run_rms_norm_case(case, hidden_size, dtype, device),
+        check_fn=_check_rms_norm_case,
+        pytest_config=request.config,
     )
-    out = layer(x, residual)
-    # NOTE(woosuk): LayerNorm operators (including RMS) typically have larger
-    # numerical errors than other operators because they involve reductions.
-    # Therefore, we use a larger tolerance.
-    if add_residual:
-        torch.testing.assert_close(
-            out[0].cpu().to(torch.float), ref_out[0], atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            out[1].cpu().to(torch.float), ref_out[1], atol=1e-2, rtol=1e-2
-        )
-    else:
-        torch.testing.assert_close(
-            out.cpu().to(torch.float), ref_out, atol=1e-2, rtol=1e-2
-        )
-
-    if residual is not None:
-        if x.dtype == torch.bfloat16:
-            opcheck(
-                torch.ops.torch_xcpu.fused_add_rms_norm_bf16,
-                (x, residual, layer.weight.data, layer.variance_epsilon),
-                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-            )
-        elif x.dtype == torch.float:
-            opcheck(
-                torch.ops.torch_xcpu.fused_add_rms_norm_fp32,
-                (x, residual, layer.weight.data, layer.variance_epsilon),
-                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-            )
-    else:
-        if x.dtype == torch.bfloat16:
-            opcheck(
-                torch.ops.torch_xcpu.rms_norm_bf16,
-                (out, x, layer.weight.data, layer.variance_epsilon),
-                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-            )
-        elif x.dtype == torch.float:
-            opcheck(
-                torch.ops.torch_xcpu.rms_norm_fp32,
-                (out, x, layer.weight.data, layer.variance_epsilon),
-                cond=CUSTOM_OP_TEST_ENABLE_OPCHECK,
-            )
-        else:
-            raise RuntimeError(f"Unsupported dtype: {x.dtype}")
