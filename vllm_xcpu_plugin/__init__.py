@@ -32,14 +32,15 @@ def register_ops():
     register_vllm_kernels()
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
+    from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.fake_triton.runtime import KernelVersionError
 
-    def install_optional_patch(name, patch):
+    def install_optional_integration(name, install):
         try:
-            patch()
+            install()
         except (ImportError, AttributeError, KernelVersionError) as exc:
             logger.warning(
-                "Skipping optional %s patch because its vLLM compatibility "
+                "Skipping optional %s integration because its vLLM compatibility "
                 "targets are unavailable or changed: %s",
                 name,
                 exc,
@@ -48,7 +49,8 @@ def register_ops():
     # Model-specific patches must not block unrelated dense-model startup.
     # Their own compatibility checks still prevent stale replacements from
     # being installed for a model that needs them.
-    install_optional_patch("GDN", maybe_patch_gdn_attention)
+    install_optional_integration("GDN", maybe_patch_gdn_attention)
+    install_optional_integration("FP8 linear", register_fp8_linear_kernel)
 
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
@@ -60,11 +62,15 @@ def register_ops():
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
     import vllm_xcpu_plugin.mla_patch as mla_patch
 
-    install_optional_patch("MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax)
+    install_optional_integration(
+        "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
+    )
     topk_patch.maybe_patch_vllm_topk_topp_sampler()
     sampler_patch.maybe_patch_vllm_temperature()
     sampler_patch.maybe_patch_vllm_gumbel_sample()
-    install_optional_patch(
+    install_optional_integration(
         "MoE grouped_topk", grouped_topk_patch.maybe_patch_vllm_grouped_topk
     )
-    install_optional_patch("MLA attention", mla_patch.maybe_patch_vllm_mla_attention)
+    install_optional_integration(
+        "MLA attention", mla_patch.maybe_patch_vllm_mla_attention
+    )
