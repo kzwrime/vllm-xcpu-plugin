@@ -179,7 +179,11 @@ class McpuPlatform(Platform):
                 "dce": True,
                 "size_asserts": False,
                 "nan_asserts": False,
-                "epilogue_fusion": True,
+                # mcpu memory must only be touched by stream-aware ATen/custom
+                # operators. Do not let Inductor synthesize host-side fused
+                # compute kernels; metadata-only views are still lowered.
+                "epilogue_fusion": False,
+                "pattern_matcher": False,
                 "cpp.dynamic_threads": True,
                 # Inductor combo kernels currently require a SIMD/CUDA
                 # scheduler. mcpu delegates to the C++ CPU scheduler, so keep

@@ -487,6 +487,116 @@ def _scatter_num_accepted(launch: KernelLaunch) -> None:
     )
 
 
+def _preprocess_mamba_align(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = args["num_reqs"]
+    block_size = args["BLOCK_SIZE"]
+    _expect(block_size == 256, "mamba align preprocess BLOCK_SIZE must be 256")
+    _expect_grid(launch, ((num_reqs + block_size - 1) // block_size,))
+    _expect(
+        args["MAMBA_BLOCK_SIZE"] > 0,
+        "mamba align preprocess MAMBA_BLOCK_SIZE must be positive",
+    )
+    torch.ops.mcpu.vllm_preprocess_mamba_align(
+        args["idx_mapping_ptr"],
+        args["state_idx_ptr"],
+        args["num_computed_tokens_ptr"],
+        args["query_start_loc_ptr"],
+        args["num_accepted_tokens_ptr"],
+        args["src_col_ptr"],
+        args["src_off_ptr"],
+        num_reqs,
+        args["MAMBA_BLOCK_SIZE"],
+    )
+
+
+def _precopy_mamba_align(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    total_states = args["state_base_addrs_ptr"].numel()
+    _expect_grid(launch, (args["num_reqs"], total_states))
+    _expect(
+        args["COPY_BLOCK_SIZE"] == 1024,
+        "mamba align precopy COPY_BLOCK_SIZE must be 1024",
+    )
+    torch.ops.mcpu.vllm_precopy_mamba_align(
+        args["mamba_state_idx_ptr"],
+        args["src_col_ptr"],
+        args["token_bias_ptr"],
+        args["block_table_ptrs_ptr"],
+        args["block_table_stride_req"],
+        args["state_base_addrs_ptr"],
+        args["state_block_strides_ptr"],
+        args["state_elem_sizes_ptr"],
+        args["state_inner_sizes_ptr"],
+        args["state_conv_widths_ptr"],
+        args["state_group_indices_ptr"],
+        args["state_dim_row_count_ptr"],
+        args["state_dim_row_stride_ptr"],
+        args["idx_mapping_ptr"],
+        args["num_reqs"],
+        total_states,
+        args["CONV_STATE_DIM_FIRST"],
+    )
+
+
+def _postprocess_mamba(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    total_states = args["state_base_addrs_ptr"].numel()
+    _expect_grid(launch, (args["num_reqs"], total_states))
+    _expect(
+        args["COPY_BLOCK_SIZE"] == 1024,
+        "mamba postprocess COPY_BLOCK_SIZE must be 1024",
+    )
+    _expect(args["block_size"] > 0, "mamba postprocess block_size must be positive")
+    has_idx_mapping = args["HAS_IDX_MAPPING"]
+    precomputed = args["PRECOMPUTED_NEW_COMPUTED"]
+    v1_mode = (
+        not has_idx_mapping
+        and not precomputed
+        and args["idx_mapping_ptr"] is None
+        and args["num_scheduled_tokens_ptr"] is not None
+        and args["num_draft_tokens_ptr"] is not None
+        and args["num_accepted_tokens_out_ptr"] is not None
+    )
+    v2_align_mode = (
+        has_idx_mapping
+        and precomputed
+        and args["idx_mapping_ptr"] is not None
+        and args["num_scheduled_tokens_ptr"] is None
+        and args["num_draft_tokens_ptr"] is None
+        and args["num_accepted_tokens_out_ptr"] is None
+    )
+    _expect(
+        v1_mode or v2_align_mode,
+        "mamba postprocess only supports the audited V1 or V2-align ABI",
+    )
+    torch.ops.mcpu.vllm_postprocess_mamba(
+        args["num_accepted_tokens_ptr"],
+        args["mamba_state_idx_ptr"],
+        args["num_scheduled_tokens_ptr"],
+        args["num_computed_tokens_ptr"],
+        args["num_draft_tokens_ptr"],
+        args["block_table_ptrs_ptr"],
+        args["block_table_stride_req"],
+        args["state_base_addrs_ptr"],
+        args["state_block_strides_ptr"],
+        args["state_elem_sizes_ptr"],
+        args["state_inner_sizes_ptr"],
+        args["state_conv_widths_ptr"],
+        args["state_group_indices_ptr"],
+        args["state_dim_row_count_ptr"],
+        args["state_dim_row_stride_ptr"],
+        args["num_accepted_tokens_out_ptr"],
+        args["idx_mapping_ptr"],
+        args["num_reqs"],
+        total_states,
+        args["block_size"],
+        args["CONV_STATE_DIM_FIRST"],
+        has_idx_mapping,
+        precomputed,
+    )
+
+
 def _get_num_sampled_and_rejected(launch: KernelLaunch) -> None:
     args = launch.arguments
     _expect_grid(launch, (args["idx_mapping_ptr"].numel(),))
@@ -1229,6 +1339,33 @@ _KERNELS: tuple[
         "7b68271fdc1121235ae9233ae2da4fa18745e1bb8c65e69373649a8545e4e81d",
         "v0.24.0",
         _prepare_rope_positions,
+        (),
+    ),
+    (
+        "vllm.v1.worker.mamba_utils",
+        "preprocess_mamba_align_fused_kernel",
+        "55c1440a10f71a2582d7c8aec21c1ccfa605381b5c3f24c2990c2be08ec10ab6",
+        "d37373ee6a2ab978247bbba864c785901c1afd677b98850f9d6a68bb81e77e49",
+        "v0.25.1",
+        _preprocess_mamba_align,
+        (),
+    ),
+    (
+        "vllm.v1.worker.mamba_utils",
+        "precopy_mamba_align_fused_kernel",
+        "9bbbde89056d4fba815268a71d038650bc840e2dafd9944c3fd9b619876efd2e",
+        "7e3b13b611b2c064d90bc22719d3ec5384dc9a93eba374f7885195bd73b1e35a",
+        "v0.25.1",
+        _precopy_mamba_align,
+        (),
+    ),
+    (
+        "vllm.v1.worker.mamba_utils",
+        "postprocess_mamba_fused_kernel",
+        "fbb8149128bd42bc175a2e3ae42b8600634a0d973ce7098b7a076c1bfa7acf6c",
+        "34919a7a6f15f7639eb0ee59abebf561f2c48b1243eee651aa03adeafd7ec97b",
+        "v0.25.1",
+        _postprocess_mamba,
         (),
     ),
     (

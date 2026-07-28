@@ -74,6 +74,11 @@ from vllm.triton_utils import HAS_TRITON, triton
 from vllm_xcpu_plugin.fake_triton.runtime import UnknownKernelError
 
 targets = {
+    "vllm.v1.worker.mamba_utils": [
+        "preprocess_mamba_align_fused_kernel",
+        "precopy_mamba_align_fused_kernel",
+        "postprocess_mamba_fused_kernel",
+    ],
     "vllm.v1.worker.utils": ["_zero_kv_blocks_kernel"],
     "vllm.v1.worker.block_table": ["_compute_slot_mapping_kernel"],
     "vllm.v1.worker.gpu.buffer_utils": ["_apply_write_kernel"],
@@ -174,7 +179,7 @@ print(json.dumps({
     assert payload == {
         "has_triton": True,
         "marker": True,
-        "count": 39,
+        "count": 42,
         "failed_closed": True,
     }
 
@@ -332,7 +337,7 @@ print(json.dumps({
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
         "has_triton": True,
-        "registrations": 41,
+        "registrations": 44,
         "source_versions": ["v0.24.0", "v0.25.0", "v0.25.1"],
         "expand_launches": 1,
         "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],

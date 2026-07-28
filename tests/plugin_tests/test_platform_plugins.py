@@ -71,3 +71,33 @@ def test_ir_priority_uses_functional_kernel_for_compile():
         "torch_xcpu",
         "native",
     ]
+
+
+def test_compile_config_disables_inductor_fusions():
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationMode
+
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=[],
+            backend="",
+            inductor_compile_config={},
+        ),
+        parallel_config=SimpleNamespace(worker_cls=None),
+        cache_config=SimpleNamespace(
+            user_specified_block_size=True,
+            block_size=256,
+        ),
+        model_config=None,
+    )
+
+    McpuPlatform.check_and_update_config(config)
+
+    compile_config = config.compilation_config.inductor_compile_config
+    assert compile_config["epilogue_fusion"] is False
+    assert compile_config["pattern_matcher"] is False
+    assert compile_config["combo_kernels"] is False
