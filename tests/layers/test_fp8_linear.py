@@ -10,13 +10,17 @@ from vllm_xcpu_plugin.layers.fp8_linear import (
 )
 
 
-def test_register_fp8_linear_kernel_for_oot_platform_is_idempotent():
-    register_fp8_linear_kernel()
-    register_fp8_linear_kernel()
-
-    kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.OOT]
-    assert kernels[0] is XcpuFp8BlockScaledMMLinearKernel
-    assert kernels.count(XcpuFp8BlockScaledMMLinearKernel) == 1
+def test_register_fp8_linear_kernel_for_oot_platform():
+    kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS.setdefault(PlatformEnum.OOT, [])
+    original = list(kernels)
+    try:
+        register_fp8_linear_kernel()
+        assert kernels[-1] is XcpuFp8BlockScaledMMLinearKernel
+        assert kernels.count(XcpuFp8BlockScaledMMLinearKernel) == (
+            original.count(XcpuFp8BlockScaledMMLinearKernel) + 1
+        )
+    finally:
+        kernels[:] = original
 
 
 def test_register_fp8_linear_kernel_prefers_public_api(monkeypatch):

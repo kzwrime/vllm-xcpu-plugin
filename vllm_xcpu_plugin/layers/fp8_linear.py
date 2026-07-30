@@ -163,30 +163,12 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
 
 def register_fp8_linear_kernel() -> None:
-    """Register through vLLM's OOT plugin lifecycle.
-
-    vLLM exposes ``register_linear_kernel`` publicly, but the version bundled
-    with this kit does not yet accept its own block-FP8 registry as a kernel
-    type. Prefer that public API once it does; keep the version-specific
-    fallback contained here so no vLLM source patch is required.
-    """
-    from vllm.model_executor.kernels import linear
+    """Register the block-FP8 kernel through vLLM's public OOT API."""
+    from vllm.model_executor.kernels.linear import register_linear_kernel
     from vllm.platforms.interface import PlatformEnum
 
-    try:
-        linear.register_linear_kernel(
-            XcpuFp8BlockScaledMMLinearKernel,
-            PlatformEnum.OOT,
-            "fp8_block",
-        )
-        return
-    except ValueError as exc:
-        if "Unrecognized kernel type" not in str(exc):
-            raise
-
-    # Compatibility fallback for vLLM
-    # 4b2dd5f509a2ee3d5ec1c0c9832a89a0cb19072d. This is registry extension,
-    # not monkey-patching behavior or modifying the vLLM checkout.
-    kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS.setdefault(PlatformEnum.OOT, [])
-    if XcpuFp8BlockScaledMMLinearKernel not in kernels:
-        kernels.insert(0, XcpuFp8BlockScaledMMLinearKernel)
+    register_linear_kernel(
+        XcpuFp8BlockScaledMMLinearKernel,
+        PlatformEnum.OOT,
+        "fp8_block",
+    )
