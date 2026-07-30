@@ -15,6 +15,7 @@ import vllm_xcpu_plugin.envs as envs_xcpu
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
@@ -30,6 +31,16 @@ class McpuPlatform(Platform):
     dispatch_key: str = "PrivateUse1"
     dist_backend: str = "cpu:gloo,mcpu:mcpu"
     simple_compile_backend: str = "eager"
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        from vllm_xcpu_plugin.layers.fp8_moe import (
+            register_fp8_moe_quantization,
+        )
+
+        register_fp8_moe_quantization()
 
     @classmethod
     def import_ir_kernels(cls) -> None:

@@ -101,3 +101,20 @@ def test_compile_config_disables_inductor_fusions():
     assert compile_config["epilogue_fusion"] is False
     assert compile_config["pattern_matcher"] is False
     assert compile_config["combo_kernels"] is False
+
+
+def test_platform_pre_registers_fp8_quantization(monkeypatch: pytest.MonkeyPatch):
+    from vllm_xcpu_plugin.layers import fp8_moe
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    moe_registered = False
+
+    def register_moe():
+        nonlocal moe_registered
+        moe_registered = True
+
+    monkeypatch.setattr(fp8_moe, "register_fp8_moe_quantization", register_moe)
+
+    McpuPlatform.pre_register_and_update()
+
+    assert moe_registered
