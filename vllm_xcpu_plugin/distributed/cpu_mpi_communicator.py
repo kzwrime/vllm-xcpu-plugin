@@ -157,15 +157,109 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
-        raise NotImplementedError
+        if isinstance(input_, list):
+            output_list: list[torch.Tensor] = []
+            for tensor in input_:
+                output = self.all_gatherv(tensor, dim=dim, sizes=sizes)
+                assert isinstance(output, torch.Tensor)
+                output_list.append(output)
+            return output_list
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        raise NotImplementedError
+        if not -input_.dim() <= dim < input_.dim():
+            raise ValueError(f"invalid dim {dim} for input shape {tuple(input_.shape)}")
+        if dim < 0:
+            dim += input_.dim()
+        if sizes is None:
+            sizes = [input_.size(dim)] * self.world_size
+        if len(sizes) != self.world_size or any(size < 0 for size in sizes):
+            raise ValueError("sizes must contain one non-negative value per rank")
+        if input_.size(dim) != sizes[self.rank_in_group]:
+            raise ValueError(
+                "local input size does not match sizes for this rank: "
+                f"{input_.size(dim)} != {sizes[self.rank_in_group]}"
+            )
+        if self.world_size == 1:
+            return input_
+        if max(sizes) == 0:
+            return input_
+        if len(set(sizes)) == 1:
+            return self.all_gather(input_, dim=dim)
+
+        max_size = max(sizes)
+        if input_.size(dim) < max_size:
+            pad_shape = list(input_.shape)
+            pad_shape[dim] = max_size - input_.size(dim)
+            padding = torch.zeros(pad_shape, dtype=input_.dtype, device=input_.device)
+            padded = torch.cat((input_, padding), dim=dim)
+        else:
+            padded = input_
+        gathered = self.all_gather(padded, dim=dim)
+        rank_chunks = gathered.split(max_size, dim=dim)
+        return torch.cat(
+            [
+                chunk.narrow(dim, 0, size)
+                for chunk, size in zip(rank_chunks, sizes, strict=True)
+            ],
+            dim=dim,
+        )
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        world_size = self.world_size
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+
+        # Note: This will produce an incorrect answer if we don't make
+        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+        input_tensor = input_.movedim(0, dim).contiguous()
+
+        assert input_tensor.shape[0] % world_size == 0
+        chunk_size = input_tensor.shape[0] // world_size
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
+
+        output = torch.empty(
+            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+        )
+
+        dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+
+        # Reshape before returning
+        return output.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
-    ) -> torch.Tensor:
-        raise NotImplementedError
+    ):
+        world_size = self.world_size
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+
+        # Note: This will produce an incorrect answer if we don't make
+        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+        input_tensor = input_.movedim(0, dim).contiguous()
+
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_tensor.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_tensor.shape[0] % world_size == 0
+            chunk_size = input_tensor.shape[0] // world_size
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
+
+        output = torch.empty(
+            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+        )
+        if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+            # if inputs shape in different ranks is not the same using reduce_scatter
+            input_splits = list(input_tensor.split(sizes, dim=0))
+            dist.reduce_scatter(output, input_splits, group=self.device_group)
+        else:
+            dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+        # Reshape before returning
+        return output.movedim(0, dim).contiguous()
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
