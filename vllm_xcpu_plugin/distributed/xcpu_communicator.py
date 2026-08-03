@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib
-from typing import Any, cast
-
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from vllm.distributed.device_communicators.all2all import (
+    AgRsAll2AllManager,
     All2AllManagerBase,
 )
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -15,16 +13,11 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.logger import init_logger
 
-import vllm_xcpu_plugin.envs as envs_xcpu
+from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import (
+    MPI_ALLTOALLV_BACKENDS,
+)
 
 logger = init_logger(__name__)
-
-_all2all_module = importlib.import_module(
-    "vllm.distributed.device_communicators.all2all"
-)
-NaiveAll2AllManager = cast(Any, getattr(_all2all_module, "NaiveAll2AllManager", None))
-if NaiveAll2AllManager is None:
-    NaiveAll2AllManager = cast(Any, _all2all_module.AgRsAll2AllManager)
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
@@ -39,10 +32,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         self.dist_module = torch.distributed
 
         if self.use_all2all:
-            self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
-            if self.all2all_backend == "naive":  # type: ignore[has-type]
-                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]
+            if self.all2all_backend in ("naive", "allgather_reducescatter"):
+                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "all_to_all_single":
                 from vllm_xcpu_plugin.distributed.all2all import (
                     All2allvSingleAll2AllManager,
                 )
@@ -50,13 +42,22 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = All2allvSingleAll2AllManager(
                     cpu_group=self.cpu_group
                 )
-            elif self.all2all_backend == "torch_all_to_all_single":  # type: ignore[has-type]
+            elif self.all2all_backend == "torch_all_to_all_single":
                 self.all2all_manager = All2AllManagerBase(cpu_group=self.cpu_group)
+            elif self.all2all_backend in MPI_ALLTOALLV_BACKENDS:
+                raise RuntimeError(
+                    f"{self.all2all_backend} requires VLLM_CPU_USE_MPI=1 and "
+                    "CpuMPICommunicator"
+                )
             else:
                 raise ValueError(
                     f"Unknown/Unsupported all2all backend: {self.all2all_backend}"
                 )
-            logger.info("Using all2all_backend = %s", self.all2all_backend)
+            logger.info(
+                "MoE all2all backend=%s manager=%s",
+                self.all2all_backend,
+                type(self.all2all_manager).__name__,
+            )
 
     def all_reduce(self, input_):
         torch.distributed.all_reduce(input_, group=self.device_group)

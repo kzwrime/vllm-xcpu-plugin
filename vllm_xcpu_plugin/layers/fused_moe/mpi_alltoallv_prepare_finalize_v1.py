@@ -26,13 +26,22 @@ from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
 
 class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalizeModular):
     """
-    High-performance CPU implementation of Expert Parallel communication.
+    Deprecated MPI alltoallv implementation retained for source compatibility.
+
+    The shared XCPU factory rejects v1. Use v2, v3, v4, or v5.
 
     Improvements over original:
     1. Removes all Python loops for index generation (vectorized).
     2. Uses C++ kernel for finalize (alltoallv + unpermute+reduce fused).
     3. Removes quantization overhead.
     """
+
+    @staticmethod
+    def _raise_deprecated() -> None:
+        raise RuntimeError(
+            "MpiAlltoallvPrepareAndFinalizeV1 is deprecated and no longer "
+            "supported; use v2, v3, v4, or v5"
+        )
 
     def __init__(
         self,
@@ -45,6 +54,9 @@ class MpiAlltoallvPrepareAndFinalizeV1(mk.FusedMoEPrepareAndFinalizeModular):
         dp_rank: int,
         dp_size: int,
     ):
+        self._raise_deprecated()
+
+        # Historical implementation retained below for reference.
         super().__init__()
         self.max_num_tokens = max_num_tokens
         self.ep_group = ep_group

@@ -14,7 +14,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceNoOP,
+    TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 
@@ -104,15 +104,11 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         ep_group: dist.ProcessGroup,
         num_local_experts: int,
         num_dispatchers: int,
-        rank_expert_offset: int,
-        tp_rank: int,
-        tp_size: int,
     ):
         super().__init__()
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
-        self.rank_expert_offset = rank_expert_offset
 
         self.ep_rank = dist.get_rank(self.ep_group)
         self.ep_size = dist.get_world_size(self.ep_group)
@@ -120,6 +116,8 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         # Context storage for finalize phase
         # We need to know where to put the received data back
         self._row_indices_restore: torch.Tensor | None = None
+        self._sort_indices: torch.Tensor | None = None
+        self._topk_weights: torch.Tensor | None = None
 
         # Communication metadata
         self._send_split_sizes: list[int] | None = None
@@ -217,6 +215,8 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         ).repeat_interleave(topk)
         # Reorder this mapping to match the data we are sending
         self._row_indices_restore = original_row_indices[sort_indices]
+        self._sort_indices = sort_indices
+        self._topk_weights = topk_weights
 
         # 4. Prepare Send Tensors
         # Use index_select or advanced indexing.
@@ -225,7 +225,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
 
         # Flatten and sort metadata
         send_topk_ids = topk_ids.flatten()[sort_indices]
-        send_topk_weights = topk_weights.flatten()[sort_indices]
 
         # 5. Exchange Split Sizes
         self._send_split_sizes = send_split_sizes_tensor.tolist()
@@ -245,9 +244,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
             (total_recv, hidden_dim), dtype=a1.dtype, device=device
         )
         recv_topk_ids = torch.empty((total_recv,), dtype=topk_ids.dtype, device=device)
-        recv_topk_weights = torch.empty(
-            (total_recv,), dtype=topk_weights.dtype, device=device
-        )
 
         # 7. Perform All-to-All
         # Note: We issue multiple all_to_all calls.
@@ -265,14 +261,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         dist.all_to_all_single(
             recv_topk_ids,
             send_topk_ids,
-            output_split_sizes=self._recv_split_sizes,
-            input_split_sizes=self._send_split_sizes,
-            group=self.ep_group,
-        )
-
-        dist.all_to_all_single(
-            recv_topk_weights,
-            send_topk_weights,
             output_split_sizes=self._recv_split_sizes,
             input_split_sizes=self._send_split_sizes,
             group=self.ep_group,
@@ -297,15 +285,14 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         )
 
         def _receiver() -> mk.PrepareResultType:
-            # vLLM expects 2D topk_ids/weights [tokens, topk] usually, but since we
-            # broke down the batch into individual tokens for EP,
-            # we return [total_recv, 1].
+            ret_topk_ids = recv_topk_ids.unsqueeze(1)
             return (
                 recv_hidden_states,
                 None,  # no quant scale
                 expert_tokens_meta,
-                recv_topk_ids.unsqueeze(1),
-                recv_topk_weights.unsqueeze(1),
+                ret_topk_ids,
+                # Experts 只使用 [C,1] shape; Finalize 使用原始 router weight。
+                torch.empty_like(ret_topk_ids, dtype=topk_weights.dtype),
             )
 
         return _receiver
@@ -339,18 +326,12 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> Callable:
 
-        # # Validation
-        # if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
-        #      # Ensure we use a contiguous reducer logic if delegated
-        #      weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+        assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate)
 
-        assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
-
-        # 1. Apply Weights (if not done on input)
-        # Note: topk_weights here comes from the 'prepare' return,
-        # so it is [total_recv, 1] fused_expert_output is [total_recv, hidden_dim]
-        # if not apply_router_weight_on_input and fused_expert_output.numel() > 0:
-        #     fused_expert_output = fused_expert_output * topk_weights
+        del topk_weights, topk_ids
+        assert not apply_router_weight_on_input
+        assert self._sort_indices is not None
+        assert self._topk_weights is not None
 
         # 2. Reverse Communication (Experts -> Original Ranks)
         # Send back what we received.
@@ -378,6 +359,12 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
             group=self.ep_group,
         )
 
+        # Reverse communication restores this source rank's send order. Apply
+        # the saved original router weights here, then reduce top-k slots by row.
+        router_weights = self._topk_weights.flatten()[self._sort_indices]
+        assert router_weights.shape == (recv_hidden_states.shape[0],)
+        recv_hidden_states.mul_(router_weights.unsqueeze(1))
+
         # 4. UNPERMUTE AND REDUCE
         # We need to reset output first because we are accumulating
         output.zero_()
@@ -390,6 +377,10 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         unpermute_and_reduce_after_alltoallv(
             output, recv_hidden_states, self._row_indices_restore
         )
+
+        self._row_indices_restore = None
+        self._sort_indices = None
+        self._topk_weights = None
 
         def _receiver():
             pass

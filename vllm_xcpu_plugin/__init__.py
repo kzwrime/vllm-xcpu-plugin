@@ -36,6 +36,7 @@ def register_ops():
     from vllm_xcpu_plugin.layers.fp8_moe import (
         register_fp8_moe_quantization,
     )
+    import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
     from vllm_xcpu_plugin.fake_triton.runtime import KernelVersionError
 
     def install_optional_integration(name, install):

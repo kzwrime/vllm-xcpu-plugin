@@ -36,6 +36,7 @@ class McpuPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
         from vllm_xcpu_plugin.layers.fp8_moe import (
             register_fp8_moe_quantization,
         )

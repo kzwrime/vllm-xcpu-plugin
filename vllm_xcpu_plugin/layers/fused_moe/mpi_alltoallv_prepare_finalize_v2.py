@@ -18,10 +18,13 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceNoOP,
+    TopKWeightAndReduceDelegate,
 )
 
 from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import CpuMPICommunicator
+from vllm_xcpu_plugin.layers.fused_moe.expert_tokens_metadata import (
+    XCPUExpertTokensMetadata,
+)
 
 
 class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
@@ -54,6 +57,8 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
 
         self.dp_rank = dp_rank
         self.dp_size = dp_size
+        # v2 通过模型级 TP peers 分摊 EP 目标 rank。这里需要原始模型 TP
+        # group 坐标，不能使用开启 EP 后恒为 0/1 的 MoE 计算 TP。
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = dist.get_rank(self.ep_group)
@@ -83,7 +88,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         self.comm_ptr_wrapper = communicator.comm_ptr_wrapper
 
         # Communication metadata tensor:
-        # [ep_size, ep_rank, tp_rank, tp_size, dp_rank, dp_size]
+        # [ep_size, ep_rank, model_tp_rank, model_tp_size, dp_rank, dp_size]
         self._comm_metadata = torch.tensor(
             [
                 self.ep_size,
@@ -206,7 +211,10 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
 
         # --- For fused operator ---
         sort_indices_back = torch.empty(total_tokens, dtype=torch.int32, device=device)
-        expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
+        expert_num_tokens_global = torch.empty(
+            num_experts, dtype=torch.int32, device=device
+        )
+        num_input_rows_valid = torch.empty(1, dtype=torch.int32, device=device)
 
         static_buffer_padding_per_dp = (
             self.num_local_experts + hidden_dim - 1
@@ -224,8 +232,11 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         )
         assert static_buffer_size % self.ep_size == 0
 
-        recv_topk_ids = torch.empty(
-            static_buffer_size, dtype=torch.int32, device=device
+        recv_topk_ids = torch.full(
+            (static_buffer_size,),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         recv_hidden_states = torch.empty(
             (static_buffer_size, hidden_dim), dtype=a1.dtype, device=device
@@ -248,8 +259,6 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
         # Workspace is no longer used internally, pass empty tensor for compatibility
         workspace = torch.empty(0, dtype=torch.int32, device=device)
 
-        ret_topk_ids_shape = (static_buffer_size, 1)
-
         # =============================================================================
         # Call fused operator (phase1 + alltoall + phase2 + alltoallv)
         # =============================================================================
@@ -258,7 +267,8 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
             sort_indices_back,  # output
             recv_hidden_states,  # output
             recv_topk_ids,  # output
-            expert_num_tokens,  # output
+            expert_num_tokens_global,  # output
+            num_input_rows_valid,  # output
             self._recv_split_sizes,  # output
             self._full_send_split_sizes,  # output
             send_hidden_states,
@@ -276,9 +286,13 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
 
         self._sort_indices_back = sort_indices_back
 
-        expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens,
-            expert_num_tokens_cpu=expert_num_tokens.cpu(),
+        local_expert_num_tokens = expert_num_tokens_global.narrow(
+            0, self.rank_expert_offset, self.num_local_experts
+        ).contiguous()
+        expert_tokens_meta = XCPUExpertTokensMetadata(
+            expert_num_tokens=local_expert_num_tokens,
+            expert_num_tokens_cpu=local_expert_num_tokens.cpu(),
+            num_input_rows_valid=num_input_rows_valid,
         )
 
         def _receiver() -> mk.PrepareResultType:
@@ -288,9 +302,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
                 None,  # no quant scale
                 expert_tokens_meta,
                 ret_topk_ids,
-                torch.empty(
-                    ret_topk_ids_shape, device=device, dtype=topk_weights.dtype
-                ),
+                torch.empty_like(ret_topk_ids, dtype=topk_weights.dtype),
             )
 
         return _receiver
@@ -325,7 +337,7 @@ class MpiAlltoallvPrepareAndFinalizeV2(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> tuple[Callable, Callable]:
         from torch_xcpu import ops as xcpu_ops
 
-        assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
+        assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate)
 
         finalize_send_sizes_tensor = self._recv_split_sizes
         finalize_recv_sizes_tensor = self._full_send_split_sizes

@@ -1,10 +1,8 @@
-import importlib
-from typing import Any, cast
-
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from vllm.distributed.device_communicators.all2all import (
+    AgRsAll2AllManager,
     All2AllManagerBase,
 )
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -12,14 +10,14 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.logger import logger
 
-import vllm_xcpu_plugin.envs as envs_xcpu
-
-_all2all_module = importlib.import_module(
-    "vllm.distributed.device_communicators.all2all"
-)
-NaiveAll2AllManager = cast(Any, getattr(_all2all_module, "NaiveAll2AllManager", None))
-if NaiveAll2AllManager is None:
-    NaiveAll2AllManager = cast(Any, _all2all_module.AgRsAll2AllManager)
+MPI_ALLTOALLV_BACKENDS = {
+    "mpi_alltoallv",
+    "mpi_alltoallv_v1",
+    "mpi_alltoallv_v2",
+    "mpi_alltoallv_v3",
+    "mpi_alltoallv_v4",
+    "mpi_alltoallv_v5",
+}
 
 
 class CpuMPICommunicator(DeviceCommunicatorBase):
@@ -86,16 +84,9 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         )
 
         if self.use_all2all:
-            self.all2all_backend = envs_xcpu.VLLM_ALL2ALL_BACKEND_XCPU
-            if self.all2all_backend == "allgather_reducescatter":  # type: ignore[has-type]
-                logger.warning(
-                    "Not supported all2all backend %s, fallback to all_to_all_single",
-                    self.all2all_backend,
-                )
-                self.all2all_backend = "all_to_all_single"  # type: ignore[assignment]
-            if self.all2all_backend == "naive":  # type: ignore[has-type]
-                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "all_to_all_single":  # type: ignore[has-type]
+            if self.all2all_backend in ("naive", "allgather_reducescatter"):
+                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "all_to_all_single":
                 from vllm_xcpu_plugin.distributed.all2all import (
                     All2allvSingleAll2AllManager,
                 )
@@ -103,14 +94,22 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = All2allvSingleAll2AllManager(
                     cpu_group=self.cpu_group
                 )
-            elif self.all2all_backend in ("torch_all_to_all_single", "mpi_alltoallv"):  # type: ignore[has-type]
-                # do nothing
+            elif (
+                self.all2all_backend == "torch_all_to_all_single"
+                or self.all2all_backend in MPI_ALLTOALLV_BACKENDS
+            ):
+                # Custom Prepare/Finalize owns dispatch/combine. The base
+                # manager supplies only rank/world-size control-plane state.
                 self.all2all_manager = All2AllManagerBase(cpu_group=self.cpu_group)
             else:
                 raise ValueError(
                     f"Unknown/Unsupported all2all backend: {self.all2all_backend}"
                 )
-            logger.info("Using all2all_backend = %s", self.all2all_backend)
+            logger.info(
+                "MoE all2all backend=%s manager=%s",
+                self.all2all_backend,
+                type(self.all2all_manager).__name__,
+            )
 
         self.comm_ptr = self.mpi_group_comm.py2f()
         self.comm_ptr_wrapper = torch.tensor([self.comm_ptr])

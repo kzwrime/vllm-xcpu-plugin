@@ -10,6 +10,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
@@ -27,10 +28,15 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
-        topk_reduce: bool = True,
     ):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        self.topk_reduce = topk_reduce
+        parallel = moe_config.moe_parallel_config
+        # 非 EP 在 Experts 内完成完整 top-k 归并。MPI v5 在 Experts 内完成
+        # destination-local route 加权归并，再由 Finalize 合并各 destination。
+        # 其他 EP 后端仍保持逐 route 输出，由各自的 Finalize 加权归并。
+        self.topk_reduce = not parallel.use_ep or (
+            getattr(parallel, "all2all_backend", None) == "mpi_alltoallv_v5"
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -65,8 +71,9 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        # CPUFusedMOE already handles weight application and reduction.
-        return TopKWeightAndReduceNoOP()
+        if self.topk_reduce:
+            return TopKWeightAndReduceNoOP()
+        return TopKWeightAndReduceDelegate()
 
     def workspace_shapes(
         self,
@@ -108,7 +115,8 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         Execute CPU MoE computation using native torch operations.
         The computation follows:
           Permute -> Grouped GEMM -> Activation -> Grouped GEMM -> Unpermute and reduce.
-        Note: topk_weights and topk_ids should already be computed by router.
+        Note: MPI v5 reads the dispatched router weights for destination-local
+        reduction. Other EP backends return one unweighted output per route.
         """
         activation_name = (
             activation.value if isinstance(activation, MoEActivation) else activation
@@ -118,20 +126,15 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
         assert a1q_scale is None, "CPU MoE does not support input quantization"
         assert a2_scale is None, "CPU MoE does not support intermediate quantization"
         assert self.quant_dtype is None, "CPU MoE does not support weight quantization"
+        assert apply_router_weight_on_input is False
 
         # Allocate all intermediate buffers here instead of in fused_moe_compute.
         M_full_padding = hidden_states.shape[0]
-        topk = topk_weights.shape[1]
+        topk = topk_ids.shape[1]
         K = hidden_states.shape[-1]
         num_experts = w1.shape[0]
         device = hidden_states.device
         fdtype = hidden_states.dtype
-
-        if not self.topk_reduce and topk != 1:
-            raise ValueError(
-                "CPU MoE without expert-side top-k reduction expects the "
-                f"prepare/finalize path to flatten routing to topk=1, got {topk}"
-            )
 
         # Allocate buffers using M_full_padding.
         permuted_hidden_states = torch.empty(
@@ -153,19 +156,27 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
 
         if expert_tokens_meta is None:
             expert_num_tokens = torch.empty(0, device=device, dtype=torch.int32)
+            num_input_rows_valid = torch.empty(0, device=device, dtype=torch.int32)
         else:
+            assert expert_tokens_meta.expert_num_tokens is not None
             expert_num_tokens = expert_tokens_meta.expert_num_tokens
+            metadata_num_input_rows_valid = getattr(
+                expert_tokens_meta, "num_input_rows_valid", None
+            )
+            if metadata_num_input_rows_valid is None:
+                num_input_rows_valid = torch.empty(0, device=device, dtype=torch.int32)
+            else:
+                assert isinstance(metadata_num_input_rows_valid, torch.Tensor)
+                num_input_rows_valid = metadata_num_input_rows_valid
 
         if expert_map is not None:
             expert_map = expert_map.to(torch.int32)
 
-        # Only allocate workspace_unpermute_and_reduce if topk_reduce=True.
-        if self.topk_reduce:
-            workspace_unpermute_and_reduce = torch.empty(
-                M_full_padding, K, dtype=topk_weights.dtype, device=device
-            )
-        else:
-            workspace_unpermute_and_reduce = torch.empty(0, device=device)
+        workspace_unpermute_and_reduce = (
+            torch.empty((M_full_padding, K), device=device, dtype=torch.float32)
+            if self.topk_reduce
+            else torch.empty(0, device=device)
+        )
 
         # Call the fused C++ operator from torch_xcpu.
         from torch_xcpu import ops as xcpu_ops
@@ -183,6 +194,7 @@ class CPUGroupGemmExperts(mk.FusedMoEExpertsModular):
             a1q_scale=a1q_scale,
             a2_scale=a2_scale,
             expert_num_tokens=expert_num_tokens,
+            num_input_rows_valid=num_input_rows_valid,
             apply_router_weight_on_input=apply_router_weight_on_input,
             topk_reduce=self.topk_reduce,
             permuted_hidden_states=permuted_hidden_states,

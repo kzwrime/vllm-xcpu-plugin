@@ -31,11 +31,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
-    "VLLM_ALL2ALL_BACKEND_XCPU": lambda: os.getenv("VLLM_ALL2ALL_BACKEND_XCPU", ""),
-    # MPI alltoallv implementation version: "v1" or "v2"
-    # v1: Uses moe_prepare_fused_v2 with extra padding calculation
-    # v2: Uses moe_prepare_fused with simplified buffer size calculation (default)
-    "VLLM_MPI_ALLTOALLV_VERSION": lambda: os.getenv("VLLM_MPI_ALLTOALLV_VERSION", "v1"),
     # Maximum number of hidden-state tokens that mpi_alltoallv v4 prepare may
     # receive on each rank. A non-positive value keeps the legacy derived size.
     "VLLM_XCPU_MOE_MAX_RECV_TOKENS": lambda: int(
