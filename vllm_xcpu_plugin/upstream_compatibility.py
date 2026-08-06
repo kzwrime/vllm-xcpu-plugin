@@ -300,6 +300,15 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "torch_xcpu.ops.topk_softmax",
         source_version="v0.25.0",
     ),
+    _operator(
+        "dflash",
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator",
+        "prepare_dflash_inputs_for_groups",
+        "95a7bc6ae8ece618fd95868e186e260ccd038a1ffdb34333d5793cafafa1798e",
+        "e38316fb463f4093f1619d74d16b01e8a26a7e5d27c5857be060b1af2f006e1e",
+        "torch_xcpu.ops.prepare_dflash_inputs",
+        source_version="v0.25.0",
+    ),
 )
 
 
