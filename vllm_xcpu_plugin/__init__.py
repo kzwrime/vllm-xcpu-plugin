@@ -31,6 +31,7 @@ def register_ops():
 
     register_vllm_kernels()
     import vllm_xcpu_plugin.custom_ops  # noqa
+    from vllm_xcpu_plugin.dflash_patch import maybe_patch_dflash_inputs
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.layers.fp8_moe import (
@@ -53,6 +54,7 @@ def register_ops():
     # Their own compatibility checks still prevent stale replacements from
     # being installed for a model that needs them.
     install_optional_integration("GDN", maybe_patch_gdn_attention)
+    install_optional_integration("DFlash", maybe_patch_dflash_inputs)
     install_optional_integration("FP8 linear", register_fp8_linear_kernel)
     install_optional_integration("FP8 MoE", register_fp8_moe_quantization)
 

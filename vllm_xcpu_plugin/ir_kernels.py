@@ -13,8 +13,11 @@ def _supports_rms_norm(
     return (
         variance_size is None
         and weight is not None
-        and x.dim() <= 3
+        and 2 <= x.dim() <= 4
         and x.stride(-1) == 1
+        and weight.dim() in (1, 2)
+        and weight.shape[-1] == x.shape[-1]
+        and (weight.dim() == 1 or weight.shape[0] == x.shape[0])
         and x.dtype in (torch.bfloat16, torch.float32)
         and weight.dtype == x.dtype
         and weight.device == x.device
@@ -37,7 +40,7 @@ def rms_norm(
 
     import torch_xcpu
 
-    out = torch.empty_like(x)
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     torch_xcpu.ops.rms_norm(out, x, weight, epsilon)
     return out
 

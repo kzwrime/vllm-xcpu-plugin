@@ -10,7 +10,7 @@ from vllm.config import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -550,6 +550,10 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         # max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
+        causal = attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            causal = True
+            raise NotImplementedError("per_seq_causal is not yet supported")
 
         # seq_threshold_3D = attn_metadata.seq_threshold_3D
         # num_par_softmax_segments = attn_metadata.num_par_softmax_segments
@@ -570,6 +574,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             softmax_scale=self.scale,
             window_size=1 + self.sliding_window[0],
             block_table=block_table,
+            causal=causal,
             # seq_threshold_3D=seq_threshold_3D,
             # num_par_softmax_segments=num_par_softmax_segments,
             # softmax_segm_output=softmax_segm_output,
@@ -598,4 +603,41 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             value,
             kv_cache,
             slot_mapping,
+        )
+
+    def do_kv_cache_update_grouped(
+        self,
+        layers: list[Attention],
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        slot_mappings: list[torch.Tensor | None],
+    ) -> None:
+        kv_caches = []
+        active_slot_mappings = []
+        layer_indices = []
+        for layer_idx, (layer, slot_mapping) in enumerate(
+            zip(layers, slot_mappings, strict=True)
+        ):
+            impl = layer.impl
+            if slot_mapping is None:
+                continue
+            if impl.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):  # type: ignore[attr-defined]
+                continue
+            if impl.kv_sharing_target_layer_name is not None:  # type: ignore[attr-defined]
+                continue
+            kv_caches.append(layer.kv_cache)
+            active_slot_mappings.append(slot_mapping)
+            layer_indices.append(layer_idx)
+
+        if not layer_indices:
+            return
+
+        import torch_xcpu
+
+        torch_xcpu.ops.reshape_and_cache_grouped(
+            keys,
+            values,
+            kv_caches,
+            active_slot_mappings,
+            layer_indices,
         )
