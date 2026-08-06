@@ -108,11 +108,6 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig | None = None,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support "
-                "defer_input_quant=True"
-            )
         return self.prepare_async(
             a1,
             topk_weights,
@@ -135,12 +130,17 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig | None = None,
         defer_input_quant: bool = False,
     ) -> mk.ReceiverType:
-        if defer_input_quant:
+        if (
+            not defer_input_quant
+            and quant_config is not None
+            and quant_config.quant_dtype is not None
+        ):
             raise NotImplementedError(
-                f"{self.__class__.__name__} does not support "
-                "defer_input_quant=True"
+                f"{self.__class__.__name__} does not support activation "
+                "quantization in Prepare. It only dispatches unquantized "
+                "activations."
             )
-        del quant_config
+
         assert not apply_router_weight_on_input
         # Linear EP still supplies the normal global-to-local expert map to
         # Experts. Prepare routes by the validated uniform global layout.

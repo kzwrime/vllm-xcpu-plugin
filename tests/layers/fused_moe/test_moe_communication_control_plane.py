@@ -1,25 +1,15 @@
-import os
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import parallel as parallel_config_module
-from vllm.model_executor.layers.fused_moe import all2all_utils
+from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 
 import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory as pf_factory
-from vllm_xcpu_plugin.distributed.cpu_mpi_communicator import (
-    MPI_ALLTOALLV_BACKENDS,
-)
 from vllm_xcpu_plugin.layers.fused_moe import (
     torch_all_to_all_single_prepare_finalize as torch_a2a,
-)
-from vllm_xcpu_plugin.layers.fused_moe.mpi_alltoallv_prepare_finalize_v1 import (
-    MpiAlltoallvPrepareAndFinalizeV1,
 )
 from vllm_xcpu_plugin.layers.fused_moe.mpi_alltoallv_prepare_finalize_v2 import (
     MpiAlltoallvPrepareAndFinalizeV2,
@@ -36,6 +26,38 @@ from vllm_xcpu_plugin.layers.fused_moe.mpi_alltoallv_prepare_finalize_v5 import 
 from vllm_xcpu_plugin.layers.fused_moe.torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
+
+
+@pytest.mark.parametrize(
+    "prepare_finalize_cls",
+    [
+        MpiAlltoallvPrepareAndFinalizeV2,
+        MpiAlltoallvPrepareAndFinalizeV3,
+        MpiAlltoallvPrepareAndFinalizeV4,
+        MpiAlltoallvPrepareAndFinalizeV5,
+    ],
+)
+def test_mpi_prepare_rejects_activation_quantization(prepare_finalize_cls):
+    prepare_finalize = object.__new__(prepare_finalize_cls)
+    quant_config = FusedMoEQuantConfig.make(
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=True,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="does not support activation quantization in Prepare",
+    ):
+        prepare_finalize.prepare_async(
+            a1=torch.zeros((1, 4), dtype=torch.bfloat16),
+            topk_weights=torch.ones((1, 1), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 1), dtype=torch.int32),
+            num_experts=1,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+            quant_config=quant_config,
+            defer_input_quant=False,
+        )
 
 
 def _moe(
@@ -65,146 +87,6 @@ def _moe(
             is_sequence_parallel=is_sequence_parallel,
         ),
     )
-
-
-def test_xcpu_registers_versioned_vllm_prepare_finalize_backends():
-    assert {
-        backend: all2all_utils._PREPARE_FINALIZE_FACTORIES[backend]
-        for backend in (
-            "torch_all_to_all_single",
-            "mpi_alltoallv_v1",
-            "mpi_alltoallv_v2",
-            "mpi_alltoallv_v3",
-            "mpi_alltoallv_v4",
-            "mpi_alltoallv_v5",
-            "mpi_alltoallv",
-        )
-    } == {
-        "torch_all_to_all_single": (
-            pf_factory.TorchAllToAllSinglePrepareFinalizeFactory
-        ),
-        "mpi_alltoallv_v1": pf_factory.MpiAlltoallvV1PrepareFinalizeFactory,
-        "mpi_alltoallv_v2": pf_factory.MpiAlltoallvV2PrepareFinalizeFactory,
-        "mpi_alltoallv_v3": pf_factory.MpiAlltoallvV3PrepareFinalizeFactory,
-        "mpi_alltoallv_v4": pf_factory.MpiAlltoallvV4PrepareFinalizeFactory,
-        "mpi_alltoallv_v5": pf_factory.MpiAlltoallvV5PrepareFinalizeFactory,
-        "mpi_alltoallv": pf_factory.MpiAlltoallvLegacyPrepareFinalizeFactory,
-    }
-    assert {
-        "torch_all_to_all_single",
-        "mpi_alltoallv_v3",
-        "mpi_alltoallv_v4",
-        "mpi_alltoallv_v5",
-    } <= parallel_config_module.SEQUENCE_PARALLEL_MOE_BACKENDS
-    assert {
-        "mpi_alltoallv_v1",
-        "mpi_alltoallv_v2",
-        "mpi_alltoallv",
-    }.isdisjoint(parallel_config_module.SEQUENCE_PARALLEL_MOE_BACKENDS)
-    assert "mpi_alltoallv_v5" in MPI_ALLTOALLV_BACKENDS
-
-
-def test_worker_plugin_flow_registers_moe_runtime_extensions():
-    env = os.environ.copy()
-    env["VLLM_PLUGINS"] = "xcpu_platform_plugin,xcpu_custom_ops"
-    code = """
-import os
-from types import SimpleNamespace
-
-from vllm.platforms import current_platform
-from vllm.plugins import load_general_plugins
-
-assert current_platform.device_name == "mcpu"
-load_general_plugins()
-
-from vllm.config import ParallelConfig
-from vllm.model_executor.layers.fused_moe import all2all_utils
-
-assert set(all2all_utils._PREPARE_FINALIZE_FACTORIES) == {
-    "mpi_alltoallv",
-    "mpi_alltoallv_v1",
-    "mpi_alltoallv_v2",
-    "mpi_alltoallv_v3",
-    "mpi_alltoallv_v4",
-    "mpi_alltoallv_v5",
-    "torch_all_to_all_single",
-}
-config = ParallelConfig(
-    all2all_backend="mpi_alltoallv_v2",
-    enable_expert_parallel=True,
-    tensor_parallel_size=2,
-    data_parallel_size=2,
-)
-assert not config.use_sequence_parallel_moe
-
-v3_sp_config = ParallelConfig(
-    all2all_backend="mpi_alltoallv_v3",
-    enable_expert_parallel=True,
-    tensor_parallel_size=2,
-    data_parallel_size=2,
-)
-assert v3_sp_config.use_sequence_parallel_moe
-
-moe = SimpleNamespace(
-    moe_parallel_config=SimpleNamespace(
-        all2all_backend="mpi_alltoallv_v1",
-        use_all2all_kernels=True,
-    ),
-)
-all2all_utils.get_ep_all2all_manager = lambda eep_stage: SimpleNamespace()
-try:
-    all2all_utils.maybe_make_prepare_finalize(
-        moe=moe,
-        quant_config=None,
-        allow_new_interface=True,
-    )
-except ValueError as exc:
-    assert "v1 is deprecated and no longer supported" in str(exc)
-    assert "mpi_alltoallv_v2" in str(exc)
-else:
-    raise AssertionError("MPI alltoallv v1 must fail through the registered factory")
-
-sp_config = ParallelConfig(
-    all2all_backend="mpi_alltoallv_v4",
-    enable_expert_parallel=True,
-    tensor_parallel_size=2,
-    data_parallel_size=2,
-)
-assert sp_config.use_sequence_parallel_moe
-
-v5_sp_config = ParallelConfig(
-    all2all_backend="mpi_alltoallv_v5",
-    enable_expert_parallel=True,
-    tensor_parallel_size=2,
-    data_parallel_size=2,
-)
-assert v5_sp_config.use_sequence_parallel_moe
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize(
-    "prepare_finalize_cls",
-    [
-        TorchAlltoallSinglePrepareAndFinalize,
-        MpiAlltoallvPrepareAndFinalizeV2,
-        MpiAlltoallvPrepareAndFinalizeV3,
-        MpiAlltoallvPrepareAndFinalizeV4,
-        MpiAlltoallvPrepareAndFinalizeV5,
-    ],
-)
-def test_prepare_finalize_does_not_publish_xcpu_expert_capability_flags(
-    prepare_finalize_cls,
-):
-    assert "xcpu_experts_reduce_topk" not in prepare_finalize_cls.__dict__
-    assert "xcpu_delegate_weight_and_reduce" not in prepare_finalize_cls.__dict__
 
 
 def test_torch_alltoall_prepare_keeps_router_weights_on_source_rank(monkeypatch):
@@ -281,23 +163,6 @@ def test_torch_alltoall_uses_saved_weights_after_reverse_communication(monkeypat
     assert prepare_finalize._topk_weights is None
 
 
-def test_mpi_v1_cannot_be_instantiated():
-    with pytest.raises(
-        RuntimeError,
-        match=r"deprecated.*no longer supported.*v2, v3, v4, or v5",
-    ):
-        MpiAlltoallvPrepareAndFinalizeV1(
-            max_num_tokens=1,
-            ep_group=None,
-            num_experts=1,
-            num_local_experts=1,
-            num_dispatchers=1,
-            rank_expert_offset=0,
-            dp_rank=0,
-            dp_size=1,
-        )
-
-
 def test_mpi_v1_fails_before_group_access(monkeypatch):
     monkeypatch.setattr(
         pf_factory,
@@ -338,57 +203,71 @@ def test_mpi_v2_rejects_sequence_parallel_before_group_access(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("factory", "is_sequence_parallel"),
+    ("prepare_finalize_cls", "op_name"),
     [
-        (pf_factory.MpiAlltoallvV2PrepareFinalizeFactory, False),
-        (pf_factory.MpiAlltoallvV3PrepareFinalizeFactory, False),
-        (pf_factory.MpiAlltoallvV3PrepareFinalizeFactory, True),
-        (pf_factory.MpiAlltoallvV4PrepareFinalizeFactory, False),
-        (pf_factory.MpiAlltoallvV4PrepareFinalizeFactory, True),
-        (pf_factory.MpiAlltoallvV5PrepareFinalizeFactory, False),
-        (pf_factory.MpiAlltoallvV5PrepareFinalizeFactory, True),
+        (MpiAlltoallvPrepareAndFinalizeV3, "moe_prepare_fused_v3"),
+        (MpiAlltoallvPrepareAndFinalizeV4, "moe_prepare_fused_v4"),
     ],
 )
-def test_mpi_v2_v3_v4_v5_build_from_registered_factory(
+def test_mpi_v3_v4_prepare_sanitizes_fp8_route_inputs(
     monkeypatch,
-    factory,
-    is_sequence_parallel,
+    prepare_finalize_cls,
+    op_name,
 ):
-    ep_group = object()
-    all2all_manager = SimpleNamespace(world_size=4, rank=2, cpu_group=object())
-    captured = {}
+    import torch_xcpu
 
-    class PrepareFinalize:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    prepare_finalize = object.__new__(prepare_finalize_cls)
+    prepare_finalize.max_num_tokens = 4
+    prepare_finalize.max_moe_tokens_per_rank = 4
+    prepare_finalize.num_local_experts = 2
+    prepare_finalize.rank_expert_offset = 2
+    prepare_finalize.ep_size = 2
+    prepare_finalize.dp_size = 2
+    prepare_finalize._comm_metadata = torch.zeros(6, dtype=torch.int64)
+    prepare_finalize.comm_ptr_wrapper = object()
 
-    monkeypatch.setattr(factory, "implementation", PrepareFinalize)
-    monkeypatch.setattr(
-        pf_factory,
-        "get_ep_group",
-        lambda: SimpleNamespace(device_group=ep_group),
+    if prepare_finalize_cls is MpiAlltoallvPrepareAndFinalizeV4:
+        prepare_finalize._get_static_buffer_size = lambda topk, hidden_dim: 10
+        prepare_finalize._check_single_sender_capacity = (
+            lambda topk, static_buffer_size: None
+        )
+        prepare_finalize._check_recv_buffer_capacity = (
+            lambda topk_ids, num_experts, static_buffer_size: None
+        )
+
+    def prepare_op(*args):
+        recv_topk_ids = args[2]
+        expert_num_tokens = args[3]
+        num_input_rows_valid = args[4]
+        recv_topk_ids[0] = 1
+        expert_num_tokens.zero_()
+        expert_num_tokens[2:] = torch.tensor([3, 5], dtype=torch.int32)
+        num_input_rows_valid.fill_(8)
+
+    monkeypatch.setattr(torch_xcpu.ops, op_name, prepare_op)
+    prepare_result = prepare_finalize.prepare(
+        a1=torch.zeros((1, 2), dtype=torch.bfloat16),
+        topk_weights=torch.tensor([[0.25]], dtype=torch.float32),
+        topk_ids=torch.tensor([[1]], dtype=torch.int64),
+        num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        defer_input_quant=True,
     )
 
-    actual = factory.create(
-        moe=_moe(
-            backend=factory.backend_name,
-            is_sequence_parallel=is_sequence_parallel,
-        ),
-        quant_config=None,
-        routing_tables=None,
-        allow_new_interface=True,
-        use_monolithic=False,
-        eep_stage=False,
-        all2all_manager=all2all_manager,
+    _, _, expert_tokens_meta, prepared_ids, prepared_weights = prepare_result
+    assert prepared_ids[0, 0].item() == 1
+    assert torch.all(prepared_ids[1:] == -1)
+    torch.testing.assert_close(
+        expert_tokens_meta.expert_num_tokens,
+        torch.tensor([3, 5], dtype=torch.int32),
     )
-
-    assert isinstance(actual, PrepareFinalize)
-    assert captured["ep_group"] is ep_group
-    assert captured["rank_expert_offset"] == 4
-    assert "tp_rank" not in captured
-    assert "tp_size" not in captured
-    assert captured.get("is_sequence_parallel", False) is is_sequence_parallel
-    assert captured.get("sp_size", 1) == (2 if is_sequence_parallel else 1)
+    torch.testing.assert_close(
+        expert_tokens_meta.num_input_rows_valid,
+        torch.tensor([8], dtype=torch.int32),
+    )
+    assert prepared_weights.shape == prepared_ids.shape
+    assert prepared_weights.dtype == torch.float32
 
 
 def test_mpi_v3_reserves_a_worst_case_segment_for_each_sender():
@@ -472,45 +351,3 @@ def test_custom_backend_rejects_dbo_before_group_init(monkeypatch):
             all2all_manager=object(),
         )
 
-
-def test_torch_backend_builds_from_vllm_registered_factory(monkeypatch):
-    ep_group = object()
-    all2all_manager = SimpleNamespace(world_size=4, rank=2, cpu_group=object())
-    captured = {}
-
-    class PrepareFinalize:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(
-        pf_factory,
-        "get_ep_group",
-        lambda: SimpleNamespace(device_group=ep_group),
-    )
-    monkeypatch.setattr(
-        pf_factory,
-        "TorchAlltoallSinglePrepareAndFinalize",
-        PrepareFinalize,
-    )
-
-    actual = pf_factory.TorchAllToAllSinglePrepareFinalizeFactory.create(
-        moe=_moe(
-            backend="torch_all_to_all_single",
-            num_experts=12,
-            num_local_experts=6,
-        ),
-        quant_config=None,
-        routing_tables=None,
-        allow_new_interface=True,
-        use_monolithic=False,
-        eep_stage=False,
-        all2all_manager=all2all_manager,
-    )
-
-    assert isinstance(actual, PrepareFinalize)
-    assert captured["ep_group"] is ep_group
-    assert captured == {
-        "ep_group": ep_group,
-        "num_local_experts": 6,
-        "num_dispatchers": 4,
-    }

@@ -6,11 +6,14 @@ NPU implementation can replace the phase-1 backend without changing vLLM.
 """
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
 from vllm.model_executor.utils import replace_parameter
+
+logger = init_logger(__name__)
 
 
 class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
@@ -24,7 +27,7 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         import torch_xcpu
 
-        if not torch_xcpu.ops.fp8_block_linear_supported():
+        if not torch_xcpu.ops.fp8_scaled_mm_supported():
             return (
                 False,
                 "No torch_xcpu FP8 block-linear backend is available.",
@@ -47,7 +50,7 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
                 "torch_xcpu FP8 kernel requires positive scale block sizes, "
                 f"got {weight_group_shape}.",
             )
-        backend = torch_xcpu.ops.resolve_fp8_linear_backend()
+        backend = torch_xcpu.ops.configured_fp8_linear_backend()
         scale_block_n = weight_group_shape.row
         scale_block_k = weight_group_shape.col
         portable_scale_block_supported = (
@@ -59,9 +62,23 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             128,
         )
         if (
-            (backend.startswith("portable_") and not portable_scale_block_supported)
+            (
+                backend
+                in (
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_LUT,
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_DIRECT,
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_PRE_SCALED,
+                )
+                and not portable_scale_block_supported
+            )
             or (
-                not backend.startswith("portable_") and not native_scale_block_supported
+                backend
+                not in (
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_LUT,
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_DIRECT,
+                    torch_xcpu.ops.Fp8LinearBackend.PORTABLE_PRE_SCALED,
+                )
+                and not native_scale_block_supported
             )
             or config.weight_shape[0] % 32 != 0
             or config.weight_shape[1] % 128 != 0
@@ -107,6 +124,11 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             tuple(self.weight_group_shape),
             bias_fp32,
         )
+        logger.warning_once(
+            "Using torch_xcpu FP8 linear backend=%s",
+            fp8_linear.params.backend.name.lower(),
+            scope="process",
+        )
 
         replace_parameter(
             layer,
@@ -118,12 +140,8 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             scale_attr,
             fp8_linear.params.weight_scale,
         )
-
         if bias_fp32 is not None:
-            layer.register_parameter(
-                "bias_fp32",
-                torch.nn.Parameter(bias_fp32, requires_grad=False),
-            )
+            replace_parameter(layer, "bias", bias_fp32)
 
         # Keep the initialized implementation on the layer, rather than on the
         # kernel instance, so its packed parameters cannot be mixed up if vLLM

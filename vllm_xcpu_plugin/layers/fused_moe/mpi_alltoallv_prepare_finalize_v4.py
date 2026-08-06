@@ -264,11 +264,6 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         """
         Synchronous wrapper for prepare_async.
         """
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
         receiver = self.prepare_async(
             a1,
             topk_weights,
@@ -277,6 +272,7 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         return receiver()
 
@@ -291,10 +287,15 @@ class MpiAlltoallvPrepareAndFinalizeV4(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig | None = None,
         defer_input_quant: bool = False,
     ) -> mk.ReceiverType:
-        if defer_input_quant:
+        if (
+            not defer_input_quant
+            and quant_config is not None
+            and quant_config.quant_dtype is not None
+        ):
             raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
+                f"{self.__class__.__name__} does not support activation "
+                "quantization in Prepare. It only dispatches unquantized "
+                "activations."
             )
 
         assert not apply_router_weight_on_input

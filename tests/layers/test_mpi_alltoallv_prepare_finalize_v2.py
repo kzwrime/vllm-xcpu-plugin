@@ -14,8 +14,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm_xcpu_plugin.layers.fused_moe import (
     mpi_alltoallv_prepare_finalize_v2 as mpi_v2,
 )
-from vllm_xcpu_plugin.layers.fused_moe.cpu_groupgemm_moe_v2 import (
-    CPUGroupGemmExperts,
+from vllm_xcpu_plugin.layers.fused_moe.grouped_gemm_experts import (
+    XcpuGroupedGemmExperts,
 )
 from vllm_xcpu_plugin.layers.fused_moe.mpi_alltoallv_prepare_finalize_v2 import (
     MpiAlltoallvPrepareAndFinalizeV2,
@@ -46,6 +46,31 @@ def _prepare_finalize():
     return prepare_finalize
 
 
+def _experts(use_ep: bool) -> XcpuGroupedGemmExperts:
+    gemm1 = SimpleNamespace(
+        params=SimpleNamespace(
+            experts=1,
+            weight_format=SimpleNamespace(name="BF16"),
+            backend=SimpleNamespace(name="ACC"),
+        )
+    )
+    return XcpuGroupedGemmExperts(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+        ),
+        quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
+        fused_moe=SimpleNamespace(
+            params=SimpleNamespace(
+                experts=1,
+                hidden=4,
+                intermediate=4,
+                gemm1=gemm1,
+            ),
+            resolved_backend="AccBf16MoeGroupedGemm",
+        ),
+    )
+
+
 def test_v2_reads_model_tp_coordinates_internally(monkeypatch):
     class Communicator:
         comm_ptr_wrapper = torch.tensor([0], dtype=torch.int64)
@@ -59,9 +84,7 @@ def test_v2_reads_model_tp_coordinates_internally(monkeypatch):
     monkeypatch.setattr(mpi_v2.dist, "get_rank", lambda group: 3)
     monkeypatch.setattr(mpi_v2.dist, "get_world_size", lambda group: 4)
     monkeypatch.setattr(mpi_v2, "get_tensor_model_parallel_rank", lambda: 1)
-    monkeypatch.setattr(
-        mpi_v2, "get_tensor_model_parallel_world_size", lambda: 2
-    )
+    monkeypatch.setattr(mpi_v2, "get_tensor_model_parallel_world_size", lambda: 2)
 
     prepare_finalize = MpiAlltoallvPrepareAndFinalizeV2(
         max_num_tokens=16,
@@ -83,12 +106,7 @@ def test_v2_reads_model_tp_coordinates_internally(monkeypatch):
 
 
 def test_unquantized_route_output_delegates_weight_and_reduce():
-    experts = CPUGroupGemmExperts(
-        moe_config=SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(use_ep=True),
-        ),
-        quant_config=object(),
-    )
+    experts = _experts(use_ep=True)
     assert isinstance(
         experts.finalize_weight_and_reduce_impl(),
         TopKWeightAndReduceDelegate,
@@ -106,12 +124,7 @@ def test_unquantized_route_output_delegates_weight_and_reduce():
 
 
 def test_unquantized_no_ep_reduces_topk_inside_experts():
-    experts = CPUGroupGemmExperts(
-        moe_config=SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(use_ep=False),
-        ),
-        quant_config=object(),
-    )
+    experts = _experts(use_ep=False)
     assert isinstance(
         experts.finalize_weight_and_reduce_impl(),
         TopKWeightAndReduceNoOP,
@@ -123,32 +136,6 @@ def test_unquantized_no_ep_reduces_topk_inside_experts():
         topk=2,
         global_num_experts=4,
         local_num_experts=4,
-        expert_tokens_meta=None,
-        activation=object(),
-    )[-1] == (3, 4)
-
-
-def test_unquantized_mpi_v5_reduces_destination_local_routes():
-    experts = CPUGroupGemmExperts(
-        moe_config=SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(
-                use_ep=True,
-                all2all_backend="mpi_alltoallv_v5",
-            ),
-        ),
-        quant_config=object(),
-    )
-    assert isinstance(
-        experts.finalize_weight_and_reduce_impl(),
-        TopKWeightAndReduceNoOP,
-    )
-    assert experts.workspace_shapes(
-        M=3,
-        N=8,
-        K=4,
-        topk=2,
-        global_num_experts=4,
-        local_num_experts=2,
         expert_tokens_meta=None,
         activation=object(),
     )[-1] == (3, 4)
@@ -172,12 +159,7 @@ def test_unquantized_experts_select_kernel_reduce_from_ep_mode(
         captured.update(kwargs)
 
     monkeypatch.setattr(xcpu_ops, "fused_moe_compute", fused_moe_compute)
-    experts = CPUGroupGemmExperts(
-        moe_config=SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
-        ),
-        quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
-    )
+    experts = _experts(use_ep=use_ep)
     output = torch.empty((expected_output_rows, 4), dtype=torch.bfloat16)
     experts.apply(
         output=output,
@@ -198,10 +180,66 @@ def test_unquantized_experts_select_kernel_reduce_from_ep_mode(
     )
 
     assert captured["topk_reduce"] is expected_topk_reduce
+    assert captured["backend"] is experts.fused_moe
+    assert captured["topk_ids"].dtype == torch.int32
+    assert "plan" not in captured
+    assert "w1_bias" not in captured
+    assert "w2_bias" not in captured
     expected_workspace_shape = (2, 4) if expected_topk_reduce else (0,)
     assert captured["workspace_unpermute_and_reduce"].shape == (
         expected_workspace_shape
     )
+
+
+def test_prepare_accepts_deferred_quant_and_preserves_tensor_contract(monkeypatch):
+    from torch_xcpu import ops as xcpu_ops
+
+    def prepare_op(*args):
+        recv_topk_ids = args[2]
+        expert_num_tokens_global = args[3]
+        num_input_rows_valid = args[4]
+        recv_split_sizes = args[5]
+        full_send_split_sizes = args[6]
+        # Only the valid prefix is written by communication.
+        recv_topk_ids[:2].copy_(torch.tensor([2, 3], dtype=torch.int32))
+        expert_num_tokens_global.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+        num_input_rows_valid.fill_(2)
+        recv_split_sizes.copy_(torch.tensor([4, 4], dtype=torch.int32))
+        full_send_split_sizes.copy_(torch.tensor([1, 0], dtype=torch.int32))
+
+    monkeypatch.setattr(xcpu_ops, "moe_prepare_fused_v2", prepare_op)
+    prepare_finalize = _prepare_finalize()
+    original_weights = torch.tensor([[0.75]], dtype=torch.float32)
+
+    result = prepare_finalize.prepare(
+        a1=torch.zeros((1, 4), dtype=torch.bfloat16),
+        topk_weights=original_weights,
+        topk_ids=torch.tensor([[2]], dtype=torch.int32),
+        num_experts=4,
+        expert_map=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+        apply_router_weight_on_input=False,
+        defer_input_quant=True,
+    )
+    _, scale, metadata, topk_ids, dispatched_weights = result
+
+    assert scale is None
+    assert metadata is not None
+    torch.testing.assert_close(
+        metadata.expert_num_tokens,
+        torch.tensor([1, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.num_input_rows_valid,
+        torch.tensor([2], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        topk_ids[:2], torch.tensor([[2], [3]], dtype=torch.int32)
+    )
+    assert torch.all(topk_ids[2:] == -1)
+    assert dispatched_weights.shape == topk_ids.shape
+    assert dispatched_weights.dtype == original_weights.dtype
+    assert dispatched_weights.device == topk_ids.device
+    assert prepare_finalize._topk_weights is original_weights
 
 
 def test_finalize_requires_delegate_and_uses_original_router_weights(

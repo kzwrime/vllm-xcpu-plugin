@@ -33,10 +33,9 @@ def register_ops():
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
-    from vllm_xcpu_plugin.layers.fp8_moe import (
-        register_fp8_moe_quantization,
-    )
+    from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
     import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
+    import vllm_xcpu_plugin.layers.fused_moe.routed_experts  # noqa: F401
     from vllm_xcpu_plugin.fake_triton.runtime import KernelVersionError
 
     def install_optional_integration(name, install):
@@ -55,8 +54,7 @@ def register_ops():
     # being installed for a model that needs them.
     install_optional_integration("GDN", maybe_patch_gdn_attention)
     install_optional_integration("FP8 linear", register_fp8_linear_kernel)
-    install_optional_integration("FP8 MoE", register_fp8_moe_quantization)
-
+    install_optional_integration("MXFP4 linear", register_mxfp4_linear_kernel)
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa

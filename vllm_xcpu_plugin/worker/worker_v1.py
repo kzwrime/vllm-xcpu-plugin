@@ -192,6 +192,12 @@ class McpuWorker(Worker):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
+        import torch_mcpu  # noqa
+        import torch_xcpu
+
+        num_pes = torch_xcpu.initialize_runtime()
+        logger.info("Initialized torch_xcpu runtime with %d xthd PEs.", num_pes)
+
         # Now take memory snapshot after NCCL is initialized
         gc.collect()
         torch.accelerator.empty_cache()
