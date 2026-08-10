@@ -1,9 +1,25 @@
 import torch
-from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNormGated
+from vllm.model_executor.layers.layernorm import (
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNormGated,
+)
 
 
 def _not_implemented(message: str):
     raise NotImplementedError(f"torch_xcpu {message}")
+
+
+@LayerNorm.register_oot
+class XcpuLayerNorm(LayerNorm):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        import torch_xcpu.ops as ops
+
+        if not x.is_contiguous() and not (x.dim() == 2 and x.stride(-1) == 1):
+            _not_implemented(
+                "LayerNorm only supports contiguous or row-strided 2D input"
+            )
+        return ops.layer_norm(x, self.weight.data, self.bias.data, self.eps)
 
 
 @GemmaRMSNorm.register_oot

@@ -13,6 +13,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from vllm.model_executor.layers.quantization.quark.quark_moe import (
+    QuarkOCP_MX_MoEMethod,
+)
 from vllm.platforms import current_platform
 
 
@@ -34,6 +37,20 @@ def xcpu_moe_method_factory(
         )
 
         return XcpuCompressedTensorsMxfp4MoEMethod(layer.moe_config)
+    if isinstance(upstream, QuarkOCP_MX_MoEMethod):
+        from vllm_xcpu_plugin.layers.quark_mxfp4 import (
+            XcpuQuarkOCPMXMoEMethod,
+            is_quark_mxfp4_w4a16,
+        )
+
+        if not is_quark_mxfp4_w4a16(upstream.weight_dtype, upstream.input_dtype):
+            return upstream
+
+        return XcpuQuarkOCPMXMoEMethod(
+            upstream.weight_quant,
+            None,
+            layer.moe_config,
+        )
     if isinstance(upstream, UnquantizedFusedMoEMethod):
         from .unquantized_fused_moe_method import (
             XcpuUnquantizedFusedMoEMethod,

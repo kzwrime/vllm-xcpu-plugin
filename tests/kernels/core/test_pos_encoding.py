@@ -296,7 +296,7 @@ for model_name, config in ALL_MODEL_CONFIGS.items():
         )
 
 
-@pytest.mark.parametrize("is_neox_style", [True])
+@pytest.mark.parametrize("is_neox_style", [True, False])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)

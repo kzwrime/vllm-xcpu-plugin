@@ -1,4 +1,4 @@
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,59 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+class _SparseIndexer(Protocol):
+    topk_indices_buffer: torch.Tensor
+    topk_tokens: int
+
+
+def xcpu_sparse_mla_attention(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    logical_topk: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+    value_dim: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Compute paged sparse MLA from request-relative logical indices."""
+    query_starts = query_start_loc.cpu().tolist()
+    sequence_lengths = seq_lens.cpu().tolist()
+    block_table_cpu = block_table.cpu().to(torch.long)
+    block_size = kv_cache.shape[1]
+    flat_cache = kv_cache.view(-1, kv_cache.shape[-1])
+    topk_cpu = logical_topk[: q.shape[0]].cpu().to(torch.long)
+
+    for request_idx, seq_len_value in enumerate(sequence_lengths):
+        token_start = int(query_starts[request_idx])
+        token_end = int(query_starts[request_idx + 1])
+        seq_len = int(seq_len_value)
+        for token_idx in range(token_start, token_end):
+            logical = topk_cpu[token_idx]
+            logical = logical[(logical >= 0) & (logical < seq_len)]
+            if logical.numel() == 0:
+                output[token_idx].zero_()
+                continue
+            physical = (
+                block_table_cpu[
+                    request_idx,
+                    logical // block_size,
+                ]
+                * block_size
+                + logical % block_size
+            ).to(device=kv_cache.device)
+            selected_kv = torch.index_select(flat_cache, 0, physical)
+            scores = torch.matmul(q[token_idx], selected_kv.transpose(0, 1))
+            probabilities = torch.softmax(scores.float() * scale, dim=-1)
+            sparse_output = torch.matmul(
+                probabilities.to(q.dtype),
+                selected_kv[:, :value_dim],
+            )
+            output[token_idx].copy_(sparse_output)
+    return output
 
 
 class XcpuTritonAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
@@ -108,6 +161,8 @@ class XcpuTritonMLABackend(MLACommonBackend):
 
 
 class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
+    impl: Any
+
     def __init__(
         self,
         num_heads: int,
@@ -122,10 +177,14 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         use_sparse: bool = False,
-        indexer: object | None = None,
+        indexer: _SparseIndexer | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         **extra_impl_args,
     ):
         super().__init__()
+        # AttentionLayerBase exposes ``impl`` as a writable attribute. Bypass
+        # nn.Module registration because this implementation is its own layer.
+        object.__setattr__(self, "impl", self)
         self.num_heads = num_heads
         self.scale = scale
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -137,6 +196,11 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+        self.topk_indices_buffer = (
+            indexer.topk_indices_buffer
+            if indexer is not None
+            else topk_indices_buffer
+        )
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -163,6 +227,15 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
 
         self.use_sparse = use_sparse
+        self.topk_tokens = (
+            indexer.topk_tokens
+            if indexer is not None
+            else getattr(
+                get_current_vllm_config().model_config.hf_config,
+                "index_topk",
+                0,
+            )
+        )
 
         vllm_config = get_current_vllm_config_or_none()
         self.dcp_a2a = (
@@ -197,7 +270,10 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        q_dcp_replicated: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if q_dcp_replicated is not None:
+            raise NotImplementedError("XCPU MLA does not support DCP query replication")
         assert self.use_direct_call
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -326,6 +402,27 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         )
         return output
 
+    def _forward_sparse(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reference-correct sparse MLA over request-relative DSA indices."""
+        assert self.topk_indices_buffer is not None
+        return xcpu_sparse_mla_attention(
+            q,
+            kv_cache,
+            self.topk_indices_buffer,
+            attn_metadata.block_table,
+            attn_metadata.query_start_loc,
+            attn_metadata.seq_lens,
+            self.scale,
+            self.kv_lora_rank,
+            output,
+        )
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -428,9 +525,14 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
 
             decode_q = torch.cat((decode_ql_nope, decode_q_pe), dim=-1)
 
-            attn_out = self._forward_decode(
-                decode_q, kv_cache, attn_metadata, decode_ql_nope
-            )
+            if self.use_sparse and attn_metadata.max_seq_len > self.topk_tokens:
+                attn_out = self._forward_sparse(
+                    decode_q, kv_cache, attn_metadata, decode_ql_nope
+                )
+            else:
+                attn_out = self._forward_decode(
+                    decode_q, kv_cache, attn_metadata, decode_ql_nope
+                )
 
             self._v_up_proj(attn_out, out=output)
         return output

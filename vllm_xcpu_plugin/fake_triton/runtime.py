@@ -96,6 +96,87 @@ class KernelLaunch:
 KernelDispatcher = Callable[[KernelLaunch], Any]
 
 
+class _ArgumentBinder:
+    """Bind the simple signatures used by Triton kernels without inspect.bind.
+
+    Triton kernels overwhelmingly use positional-or-keyword parameters plus
+    defaults for constexpr arguments.  ``inspect.Signature.bind`` is useful for
+    diagnostics, but walking ``inspect.Parameter`` objects on every launch is
+    disproportionately expensive.  Keep it as the exact error/fallback path
+    and use precomputed names and defaults for valid launches.
+    """
+
+    def __init__(self, signature: inspect.Signature) -> None:
+        self._signature = signature
+        parameters = tuple(signature.parameters.values())
+        self._fast_path = all(
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            for parameter in parameters
+        )
+        self._names = tuple(parameter.name for parameter in parameters)
+        self.parameter_names = frozenset(self._names)
+        self._positional_names = tuple(
+            parameter.name
+            for parameter in parameters
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+        self._keyword_names = frozenset(
+            parameter.name
+            for parameter in parameters
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
+        self._required_names = tuple(
+            parameter.name
+            for parameter in parameters
+            if parameter.default is inspect.Parameter.empty
+        )
+        self._defaults = {
+            parameter.name: parameter.default
+            for parameter in parameters
+            if parameter.default is not inspect.Parameter.empty
+        }
+
+    def __call__(
+        self, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if not self._fast_path or len(args) > len(self._positional_names):
+            return self._bind_with_inspect(args, kwargs)
+
+        arguments = dict(zip(self._positional_names, args, strict=False))
+        for name, value in kwargs.items():
+            if name not in self._keyword_names or name in arguments:
+                return self._bind_with_inspect(args, kwargs)
+            arguments[name] = value
+
+        if any(name not in arguments for name in self._required_names):
+            return self._bind_with_inspect(args, kwargs)
+
+        return {
+            name: arguments[name] if name in arguments else self._defaults[name]
+            for name in self._names
+        }
+
+    def _bind_with_inspect(
+        self, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        bound = self._signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+
+
 @dataclass(frozen=True)
 class KernelRegistration:
     dispatcher: KernelDispatcher
@@ -144,10 +225,7 @@ class KernelRegistry:
                 "then update only this kernel's hashes and source_version in "
                 "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
-        if (
-            not defer_version_check
-            and kernel.signature_hash != expected_signature_hash
-        ):
+        if not defer_version_check and kernel.signature_hash != expected_signature_hash:
             raise KernelVersionError(
                 f"{kernel.qualname}: signature fingerprint mismatch; "
                 f"expected {expected_signature_hash}, got {kernel.signature_hash}. "
@@ -206,15 +284,13 @@ class KernelRegistry:
                 "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
             )
 
-        kernel_kwargs = dict(kwargs)
+        kernel_kwargs = {}
         metadata = {}
-        for name in tuple(kernel_kwargs):
-            is_launch_metadata = (
-                name not in kernel.signature.parameters
-                and name in _TRITON_LAUNCH_METADATA
-            )
-            if is_launch_metadata:
-                metadata[name] = kernel_kwargs.pop(name)
+        for name, value in kwargs.items():
+            if name not in kernel.parameter_names and name in _TRITON_LAUNCH_METADATA:
+                metadata[name] = value
+            else:
+                kernel_kwargs[name] = value
         unsupported = set(metadata) - registration.allowed_metadata
         if unsupported:
             raise InvalidLaunchError(
@@ -222,11 +298,10 @@ class KernelRegistry:
             )
 
         try:
-            bound = kernel.signature.bind(*args, **kernel_kwargs)
+            arguments = kernel.bind_arguments(args, kernel_kwargs)
         except TypeError as exc:
             raise InvalidLaunchError(f"{kernel.qualname}: {exc}") from exc
-        bound.apply_defaults()
-        resolved_grid = _resolve_grid(grid, bound.arguments)
+        resolved_grid = _resolve_grid(grid, arguments)
         if len(resolved_grid) not in registration.allowed_grid_dims:
             raise InvalidLaunchError(
                 f"{kernel.qualname}: {len(resolved_grid)}D grid is not allowed"
@@ -235,7 +310,7 @@ class KernelRegistry:
         launch = KernelLaunch(
             kernel=kernel,
             grid=resolved_grid,
-            arguments=dict(bound.arguments),
+            arguments=arguments,
             metadata=metadata,
         )
         result = registration.dispatcher(launch)
@@ -256,10 +331,11 @@ def _resolve_grid(grid: Any, arguments: Mapping[str, Any]) -> tuple[int, ...]:
         grid = (grid,)
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
         raise InvalidLaunchError("grid must be an int or a 1D-3D tuple/list")
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in grid):
-        raise InvalidLaunchError("grid dimensions must be integers")
-    if any(value < 0 for value in grid):
-        raise InvalidLaunchError("grid dimensions must be non-negative")
+    for value in grid:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidLaunchError("grid dimensions must be integers")
+        if value < 0:
+            raise InvalidLaunchError("grid dimensions must be non-negative")
     return tuple(grid)
 
 
@@ -286,6 +362,8 @@ class FakeJITFunction:
         self.registry = registry or get_registry()
         self.jit_options = dict(jit_options or {})
         self.signature = inspect.signature(fn)
+        self._argument_binder = _ArgumentBinder(self.signature)
+        self.parameter_names = self._argument_binder.parameter_names
         self.source_hash = _source_fingerprint(fn)
         self.signature_hash = _signature_fingerprint(self.signature)
         self.constexpr_names = tuple(
@@ -295,6 +373,11 @@ class FakeJITFunction:
         )
         self.qualname = f"{fn.__module__}.{fn.__qualname__}"
         update_wrapper(self, fn)
+
+    def bind_arguments(
+        self, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._argument_binder(args, kwargs)
 
     def __getitem__(self, grid: Any) -> _KernelLauncher:
         return _KernelLauncher(self, grid)

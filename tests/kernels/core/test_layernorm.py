@@ -4,7 +4,7 @@
 import pytest
 import torch
 import torch_xcpu  # noqa: F401
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.plugins import load_general_plugins
 from vllm.utils.torch_utils import set_random_seed
 
@@ -42,6 +42,45 @@ CUDA_DEVICES = CUSTOM_OP_TEST_DEVICES
 # CUDA_DEVICES = [
 #     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 # ]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_layer_norm(dtype: torch.dtype, device: str, default_vllm_config) -> None:
+    x_cpu = torch.randn(7, 128, dtype=dtype)
+    layer = LayerNorm(128).to(device=device)
+    assert layer.__class__.__name__ == "XcpuLayerNorm"
+    layer.weight.data.normal_(mean=1.0, std=0.1)
+    layer.bias.data.normal_(mean=0.0, std=0.1)
+
+    expected = torch.nn.functional.layer_norm(
+        x_cpu.float(),
+        (128,),
+        layer.weight.cpu(),
+        layer.bias.cpu(),
+        layer.eps,
+    ).to(dtype)
+    actual = layer(x_cpu.to(device)).cpu()
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_layer_norm_row_strided(
+    dtype: torch.dtype, device: str, default_vllm_config
+) -> None:
+    storage_cpu = torch.randn(7, 129, dtype=dtype)
+    x_cpu = storage_cpu[:, :128]
+    assert x_cpu.stride() == (129, 1)
+    layer = LayerNorm(128).to(device=device)
+    layer.weight.data.normal_(mean=1.0, std=0.1)
+    layer.bias.data.normal_(mean=0.0, std=0.1)
+    expected = layer.forward_native(x_cpu.to(device)).cpu()
+    actual = layer(storage_cpu.to(device)[:, :128]).cpu()
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)

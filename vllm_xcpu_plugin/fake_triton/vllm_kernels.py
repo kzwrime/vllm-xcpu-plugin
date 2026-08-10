@@ -32,6 +32,35 @@ def _expect_grid(launch: KernelLaunch, expected: tuple[int, ...]) -> None:
     )
 
 
+def _per_token_group_quant_fp8(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    group_size = args["group_size"]
+    num_columns = args["y_num_columns"]
+    groups_per_row = num_columns // group_size
+    num_groups = launch.grid[0]
+    _expect_grid(launch, (num_groups,))
+    _expect(num_columns % group_size == 0, "group_size must divide columns")
+    _expect(num_groups % groups_per_row == 0, "grid does not cover whole rows")
+
+    rows = num_groups // groups_per_row
+    source = args["y_ptr"].as_strided(
+        (rows, num_columns),
+        (args["y_row_stride"], 1),
+    )
+    import torch_xcpu.ops as xcpu_ops
+
+    xcpu_ops.per_token_group_quant_fp8_out(
+        args["y_q_ptr"].reshape(rows, num_columns),
+        args["y_s_ptr"].reshape(rows, groups_per_row),
+        source,
+        group_size,
+        args["eps"],
+        args["fp8_min"],
+        args["fp8_max"],
+        args["use_ue8m0"],
+    )
+
+
 def _zero_kv_blocks(launch: KernelLaunch) -> None:
     args = launch.arguments
     n_blocks = args["n_blocks"]
@@ -1197,6 +1226,15 @@ def _prompt_logprob_token_ids(launch: KernelLaunch) -> None:
 _KERNELS: tuple[
     tuple[str, str, str, str, str, Callable[[KernelLaunch], Any], tuple[str, ...]], ...
 ] = (
+    (
+        "vllm.model_executor.layers.quantization.utils.fp8_utils",
+        "_per_token_group_quant_fp8",
+        "7717aa7f963f67003bcd95773ee448a344f772c0789b60abf4765c7abe5afb3b",
+        "ef21c8054336abd0321214df36f5ce0888919da816686b2a61e559a392b1d1fa",
+        "v0.25.0",
+        _per_token_group_quant_fp8,
+        ("num_stages", "num_warps"),
+    ),
     (
         "vllm.v1.worker.utils",
         "_zero_kv_blocks_kernel",

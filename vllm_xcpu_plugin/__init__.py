@@ -35,6 +35,9 @@ def register_ops():
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
+    from vllm_xcpu_plugin.layers.quark_mxfp4 import (
+        register_quark_mxfp4_linear_scheme,
+    )
     import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
     import vllm_xcpu_plugin.layers.fused_moe.routed_experts  # noqa: F401
     from vllm_xcpu_plugin.fake_triton.runtime import KernelVersionError
@@ -57,8 +60,12 @@ def register_ops():
     install_optional_integration("DFlash", maybe_patch_dflash_inputs)
     install_optional_integration("FP8 linear", register_fp8_linear_kernel)
     install_optional_integration("MXFP4 linear", register_mxfp4_linear_kernel)
+    install_optional_integration(
+        "Quark MXFP4 W4A16 linear", register_quark_mxfp4_linear_scheme
+    )
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
+    import vllm_xcpu_plugin.layers.sparse_attn_indexer  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.moe_runner  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.unquantized_fused_moe_method  # noqa

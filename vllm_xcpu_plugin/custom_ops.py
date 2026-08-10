@@ -1,5 +1,6 @@
 import torch
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -99,7 +100,11 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
 
         # Get the embeddings.
-        if isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+        unquantized_methods = (
+            UnquantizedEmbeddingMethod,
+            UnquantizedLinearMethod,
+        )
+        if isinstance(self.quant_method, unquantized_methods):
             import torch_xcpu.ops as ops
 
             assert isinstance(self.weight, torch.Tensor)
@@ -115,9 +120,7 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
         else:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
-        if self.tp_size > 1 and not isinstance(
-            self.quant_method, UnquantizedEmbeddingMethod
-        ):
+        if self.tp_size > 1 and not isinstance(self.quant_method, unquantized_methods):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         from vllm.distributed import tensor_model_parallel_all_reduce
