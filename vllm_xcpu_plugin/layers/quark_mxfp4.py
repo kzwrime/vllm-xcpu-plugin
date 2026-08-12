@@ -18,10 +18,19 @@ from vllm.model_executor.layers.quantization.quark.schemes.quark_ocp_mx import (
 )
 from vllm.model_executor.utils import replace_parameter
 
+import vllm_xcpu_plugin.envs as envs_xcpu
+
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
 from .fused_moe.setup import install_fused_moe, reject_fused_moe_hot_reload
 
 logger = init_logger(__name__)
+
+_FORCE_W4A16_ENV = "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16"
+
+
+def force_quark_mxfp4_w4a16() -> bool:
+    """Return whether MXFP4-activation checkpoints must run as W4A16."""
+    return envs_xcpu.VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16
 
 
 def is_quark_mxfp4_w4a16(
@@ -30,6 +39,20 @@ def is_quark_mxfp4_w4a16(
 ) -> bool:
     """Return whether the checkpoint natively declares MXFP4 weight-only."""
     return weight_dtype == "mxfp4" and input_dtype is None
+
+
+def should_use_quark_mxfp4_w4a16(
+    weight_dtype: str,
+    input_dtype: str | None,
+) -> bool:
+    """Select native W4A16 or explicitly forced W4A4-to-W4A16 execution."""
+    if is_quark_mxfp4_w4a16(weight_dtype, input_dtype):
+        return True
+    return (
+        force_quark_mxfp4_w4a16()
+        and weight_dtype == "mxfp4"
+        and input_dtype == "mxfp4"
+    )
 
 
 def _initialize_dummy_e8m0_scale(scale: torch.Tensor) -> None:
@@ -54,10 +77,28 @@ class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
             input_quant_spec,
             dynamic_mxfp4_quant=dynamic_mxfp4_quant,
         )
-        self._use_xcpu_w4a16 = (
+        force_w4a16 = (
+            force_quark_mxfp4_w4a16()
+            and self.weight_dtype == "mxfp4"
+            and self.input_dtype == "mxfp4"
+        )
+        self._use_xcpu_w4a16 = force_w4a16 or (
             is_quark_mxfp4_w4a16(self.weight_dtype, self.input_dtype)
             and not self.dynamic_mxfp4_quant
         )
+        if force_w4a16:
+            # The checkpoint's packed MXFP4 weights and E8M0 weight scales are
+            # unchanged. Only activation quantization is bypassed so torch_xcpu
+            # consumes BF16 activations through its W4A16 kernels.
+            self.input_quant_spec = None
+            self.input_dtype = None
+            self.dynamic_mxfp4_quant = False
+            logger.warning_once(
+                "Forcing Quark MXFP4 activation quantization off; executing "
+                "packed MXFP4 weights as W4A16 because %s is enabled",
+                _FORCE_W4A16_ENV,
+                scope="process",
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self._use_xcpu_w4a16:

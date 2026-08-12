@@ -5,12 +5,12 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch_mcpu  # noqa: F401
 
-from .runtime import InvalidLaunchError, KernelLaunch, get_registry
+from .runtime import FakeJITFunction, InvalidLaunchError, KernelLaunch, get_registry
 
 # Informational only: this is the baseline at which the manifest was created.
 # Never use it as a registration default or bulk-update it during a port. Each
@@ -192,6 +192,50 @@ def _compute_slot_mapping(launch: KernelLaunch) -> None:
         args["TOTAL_CP_RANK"],
         args["CP_KV_CACHE_INTERLEAVE_SIZE"],
         args["PAD_ID"],
+    )
+
+
+def _build_indexer_prefill_chunk_metadata(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = launch.grid[0]
+    _expect_grid(launch, (num_reqs,))
+    _expect(
+        args["BLOCK_SIZE"] == 1024,
+        "indexer prefill metadata BLOCK_SIZE must be 1024",
+    )
+    _expect(
+        args["uncompressed_seq_lens_ptr"].numel() == num_reqs,
+        "indexer prefill metadata request count mismatch",
+    )
+    _expect(
+        args["query_slice_stop"] >= args["query_slice_start"],
+        "indexer prefill metadata query slice is invalid",
+    )
+    _expect(
+        args["DCP_WORLD"] > 0 and 0 <= args["DCP_RANK"] < args["DCP_WORLD"],
+        "indexer prefill metadata DCP rank/world is invalid",
+    )
+    _expect(
+        args["DCP_INTERLEAVE"] > 0 and args["COMPRESS_RATIO"] > 0,
+        "indexer prefill metadata interleave/compression must be positive",
+    )
+
+    import torch_xcpu.ops as xcpu_ops
+
+    xcpu_ops.build_indexer_prefill_chunk_metadata(
+        args["token_to_seq_ptr"],
+        args["cu_compressed_seq_len_ks_ptr"],
+        args["cu_compressed_seq_len_ke_ptr"],
+        args["query_start_loc_ptr"],
+        args["uncompressed_seq_lens_ptr"],
+        args["cu_compressed_seq_lens_ptr"],
+        args["row_start_cu_compressed_seq_lens_ptr"],
+        args["query_slice_start"],
+        args["query_slice_stop"],
+        args["DCP_RANK"],
+        args["DCP_WORLD"],
+        args["DCP_INTERLEAVE"],
+        args["COMPRESS_RATIO"],
     )
 
 
@@ -1272,6 +1316,15 @@ _KERNELS: tuple[
         (),
     ),
     (
+        "vllm.v1.attention.backends.mla.indexer",
+        "BuildPrefillChunkMetadataKernel.kernel",
+        "385ac0d8e2a8f959b3e33d2dcfef5431eddf0fc02b76869201106ab43dbdc08d",
+        "32c266857225077009d2181fc4e291b34645db43cfa35b77e4d5b34eceb6ec03",
+        "v0.25.0",
+        _build_indexer_prefill_chunk_metadata,
+        (),
+    ),
+    (
         "vllm.v1.worker.gpu.block_table",
         "_compute_slot_mappings_kernel",
         "e7cfdd055ee4f32c0fb5b18091f508dd8754d58f9120034105d425e44cdaff9b",
@@ -1655,7 +1708,9 @@ def register_vllm_kernels() -> None:
     ) in _KERNELS:
         module = importlib.import_module(module_name)
         try:
-            kernel = getattr(module, name)
+            kernel = module
+            for component in name.split("."):
+                kernel = getattr(kernel, component)
         except AttributeError:
             logger.warning(
                 "Skipping unavailable optional Fake Triton kernel %s.%s; "
@@ -1664,8 +1719,9 @@ def register_vllm_kernels() -> None:
                 name,
             )
             continue
+        fake_kernel = cast(FakeJITFunction, kernel)
         registry.register(
-            kernel,
+            fake_kernel,
             adapter,
             expected_source_hash=source_hash,
             expected_signature_hash=signature_hash,

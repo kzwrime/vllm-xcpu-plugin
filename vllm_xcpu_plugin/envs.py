@@ -36,6 +36,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_MOE_MAX_RECV_TOKENS": lambda: int(
         os.getenv("VLLM_XCPU_MOE_MAX_RECV_TOKENS", "0")
     ),
+    # Force Quark checkpoints with dynamic MXFP4 activations to keep their
+    # packed MXFP4 weights but execute with BF16 activations (W4A16).
+    "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16": lambda: bool(
+        int(os.getenv("VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16", "0"))
+    ),
     # Reset block size alignment
     "BLOCK_SIZE_ALIGN": lambda: int(os.getenv("BLOCK_SIZE_ALIGN", "16")),
 }

@@ -65,40 +65,58 @@ def xcpu_sparse_mla_attention(
     value_dim: int,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute paged sparse MLA from request-relative logical indices."""
+    """Dispatch experimental paged sparse MLA prefill and decode kernels."""
     query_starts = query_start_loc.cpu().tolist()
-    sequence_lengths = seq_lens.cpu().tolist()
-    block_table_cpu = block_table.cpu().to(torch.long)
-    block_size = kv_cache.shape[1]
-    flat_cache = kv_cache.view(-1, kv_cache.shape[-1])
-    topk_cpu = logical_topk[: q.shape[0]].cpu().to(torch.long)
+    query_lens = [end - start for start, end in zip(query_starts, query_starts[1:])]
+    num_decodes = 0
+    while num_decodes < len(query_lens) and query_lens[num_decodes] == 1:
+        num_decodes += 1
+    if any(query_len == 1 for query_len in query_lens[num_decodes:]):
+        raise NotImplementedError(
+            "XCPU experimental sparse MLA requires decode requests before prefills"
+        )
 
-    for request_idx, seq_len_value in enumerate(sequence_lengths):
-        token_start = int(query_starts[request_idx])
-        token_end = int(query_starts[request_idx + 1])
-        seq_len = int(seq_len_value)
-        for token_idx in range(token_start, token_end):
-            logical = topk_cpu[token_idx]
-            logical = logical[(logical >= 0) & (logical < seq_len)]
-            if logical.numel() == 0:
-                output[token_idx].zero_()
-                continue
-            physical = (
-                block_table_cpu[
-                    request_idx,
-                    logical // block_size,
-                ]
-                * block_size
-                + logical % block_size
-            ).to(device=kv_cache.device)
-            selected_kv = torch.index_select(flat_cache, 0, physical)
-            scores = torch.matmul(q[token_idx], selected_kv.transpose(0, 1))
-            probabilities = torch.softmax(scores.float() * scale, dim=-1)
-            sparse_output = torch.matmul(
-                probabilities.to(q.dtype),
-                selected_kv[:, :value_dim],
-            )
-            output[token_idx].copy_(sparse_output)
+    assert q.shape[0] == query_starts[-1]
+    assert output.shape == (q.shape[0], q.shape[1], value_dim)
+    logical_topk = logical_topk[: q.shape[0]]
+
+    import torch_xcpu
+
+    if num_decodes:
+        torch_xcpu.ops.sparse_mla_decode(
+            q[:num_decodes].contiguous(),
+            kv_cache,
+            logical_topk[:num_decodes].contiguous(),
+            block_table[:num_decodes].contiguous(),
+            seq_lens[:num_decodes].contiguous(),
+            scale,
+            output[:num_decodes].contiguous(),
+        )
+
+    num_decode_tokens = query_starts[num_decodes]
+    if num_decode_tokens < q.shape[0]:
+        request_ids = [
+            request_idx
+            for request_idx, query_len in enumerate(query_lens)
+            for _ in range(query_len)
+        ]
+        req_id_per_token = torch.tensor(
+            request_ids[num_decode_tokens:],
+            dtype=torch.int32,
+            device=q.device,
+        )
+        torch_xcpu.ops.sparse_mla_prefill(
+            q[num_decode_tokens:].contiguous(),
+            kv_cache,
+            logical_topk[num_decode_tokens:].contiguous(),
+            block_table.contiguous(),
+            req_id_per_token,
+            query_start_loc.contiguous(),
+            seq_lens.contiguous(),
+            num_decode_tokens,
+            scale,
+            output[num_decode_tokens:].contiguous(),
+        )
     return output
 
 
@@ -160,6 +178,20 @@ class XcpuTritonMLABackend(MLACommonBackend):
         return stride_order
 
 
+# TODO(cwl): vLLM upstream has moved MLA orchestration into
+#   - `MLAAttention.forward_impl`
+#   -  split dense prefill behind `MLAPrefillBackend`,
+#   -  `SparseMLACommonMetadataBuilder` / `SparseMLACommonImpl`. 
+# This OOT class intentionally keeps the existing layout while sparse MLA is
+# experimental, so the original dense MLA owner can control the eventual sync.
+# 
+# It's recommended to create 3 files or more like vllm:
+#   - mla.py
+#   - mla_prefill.py
+#   - mla_sparse.py
+#
+# The target state should reuse vLLM's common forward orchestration, while each
+# XCPU file owns only its platform-specific kernels and compatibility checks.
 class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
     impl: Any
 
@@ -409,7 +441,7 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Reference-correct sparse MLA over request-relative DSA indices."""
+        """Experimental native sparse MLA over request-relative DSA indices."""
         assert self.topk_indices_buffer is not None
         return xcpu_sparse_mla_attention(
             q,

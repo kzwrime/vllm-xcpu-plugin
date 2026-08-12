@@ -40,10 +40,12 @@ def xcpu_moe_method_factory(
     if isinstance(upstream, QuarkOCP_MX_MoEMethod):
         from vllm_xcpu_plugin.layers.quark_mxfp4 import (
             XcpuQuarkOCPMXMoEMethod,
-            is_quark_mxfp4_w4a16,
+            should_use_quark_mxfp4_w4a16,
         )
 
-        if not is_quark_mxfp4_w4a16(upstream.weight_dtype, upstream.input_dtype):
+        if not should_use_quark_mxfp4_w4a16(
+            upstream.weight_dtype, upstream.input_dtype
+        ):
             return upstream
 
         return XcpuQuarkOCPMXMoEMethod(
