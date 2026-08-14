@@ -85,10 +85,15 @@ class McpuPlatform(Platform):
                 )
             return selected_backend.get_path()
 
+        if attn_selector_config.use_mla and attn_selector_config.use_sparse:
+            logger.info("Using FLASH_ATTN_MLA_SPARSE backend on MCPU")
+            return AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE.get_path()
         if attn_selector_config.use_mla:
             return AttentionBackendEnum.TRITON_MLA.get_path()
         if attn_selector_config.use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on CPU.")
+            raise NotImplementedError(
+                "Non-MLA Sparse Attention is not supported on CPU."
+            )
 
         return AttentionBackendEnum.TRITON_ATTN.get_path()
 

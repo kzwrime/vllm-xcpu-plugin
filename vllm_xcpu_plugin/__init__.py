@@ -72,7 +72,8 @@ def register_ops():
     import vllm_xcpu_plugin.topk_patch as topk_patch
     import vllm_xcpu_plugin.sampler_patch as sampler_patch
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
-    import vllm_xcpu_plugin.mla_patch as mla_patch
+    # import vllm_xcpu_plugin.mla_patch as mla_patch
+    import vllm_xcpu_plugin.flashattn_mla_sparse_patch as flashattn_mla_sparse_patch
 
     install_optional_integration(
         "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
@@ -83,6 +84,10 @@ def register_ops():
     install_optional_integration(
         "MoE grouped_topk", grouped_topk_patch.maybe_patch_vllm_grouped_topk
     )
+    # install_optional_integration(
+    #     "MLA attention", mla_patch.maybe_patch_vllm_mla_attention
+    # )
     install_optional_integration(
-        "MLA attention", mla_patch.maybe_patch_vllm_mla_attention
+        "flashattn_mla_sparse",
+        flashattn_mla_sparse_patch.maybe_patch_vllm_flashattn_mla_sparse,
     )
