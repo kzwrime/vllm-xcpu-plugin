@@ -3,6 +3,7 @@
 
 import os
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import multiprocess as mp
 import torch
@@ -18,12 +19,6 @@ WORLD_SIZE = 2
 COMMUNICATOR_CLASSES = (CpuCommunicator, CpuMPICommunicator)
 
 
-def _all_gather(input_: torch.Tensor, dim: int) -> torch.Tensor:
-    outputs = [torch.empty_like(input_) for _ in range(dist.get_world_size())]
-    dist.all_gather(outputs, input_)
-    return torch.cat(outputs, dim=dim)
-
-
 def _make_communicator(
     communicator_cls: type[CpuCommunicator] | type[CpuMPICommunicator],
 ) -> CpuCommunicator | CpuMPICommunicator:
@@ -35,11 +30,57 @@ def _make_communicator(
     if isinstance(communicator, CpuCommunicator):
         communicator.dist_module = dist
     else:
-        # CpuMPICommunicator.all_gather is backed by torch_xcpu/MPI. These tests
-        # exercise all_gatherv above that equal-size collective boundary.
-        communicator.all_gather = _all_gather
+        # This suite launches ranks with torch.multiprocessing rather than
+        # mpirun. The operator shims below exercise the communicator's shape
+        # handling and dispatch while torch_mpi_ext's own mpirun suite covers
+        # the native MPI kernels.
+        communicator.comm_ptr_wrapper = torch.tensor([0], dtype=torch.int64)
 
     return communicator
+
+
+@contextmanager
+def _cpu_mpi_operator_shims(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    import torch_mpi_ext
+    from torch_xcpu import ops as xcpu_ops
+
+    ops = torch_mpi_ext.ops
+    original_all_gatherv = xcpu_ops.all_gatherv_into_tensor_out_v2
+    original_reduce_scatter = ops.reduce_scatter_out_wrapper
+    original_reduce_scatterv = ops.reduce_scatterv_out_wrapper
+
+    def all_gatherv_out(output, input_, sizes, _comm_ptr, dim):
+        gathered: list[torch.Tensor | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, input_)
+        output.copy_(
+            torch.cat([tensor for tensor in gathered if tensor is not None], dim)
+        )
+
+    def reduce_scatter_out(output, input_, _comm_ptr, dim):
+        reduced = input_.clone()
+        dist.all_reduce(reduced)
+        output.copy_(reduced.chunk(dist.get_world_size(), dim=dim)[dist.get_rank()])
+
+    def reduce_scatterv_out(output, input_, sizes, _comm_ptr, dim):
+        reduced = input_.clone()
+        dist.all_reduce(reduced)
+        rank_sizes = sizes.tolist()
+        rank = dist.get_rank()
+        output.copy_(reduced.narrow(dim, sum(rank_sizes[:rank]), rank_sizes[rank]))
+
+    xcpu_ops.all_gatherv_into_tensor_out_v2 = all_gatherv_out
+    ops.reduce_scatter_out_wrapper = reduce_scatter_out
+    ops.reduce_scatterv_out_wrapper = reduce_scatterv_out
+    try:
+        yield
+    finally:
+        xcpu_ops.all_gatherv_into_tensor_out_v2 = original_all_gatherv
+        ops.reduce_scatter_out_wrapper = original_reduce_scatter
+        ops.reduce_scatterv_out_wrapper = original_reduce_scatterv
 
 
 def _all_gatherv_worker(rank: int, port: int) -> None:
@@ -56,18 +97,20 @@ def _all_gatherv_worker(rank: int, port: int) -> None:
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
             local_input = inputs[rank]
+            with _cpu_mpi_operator_shims(
+                isinstance(communicator, CpuMPICommunicator)
+            ):
+                actual = communicator.all_gatherv(local_input, dim=1, sizes=sizes)
+                torch.testing.assert_close(actual, expected)
 
-            actual = communicator.all_gatherv(local_input, dim=1, sizes=sizes)
-            torch.testing.assert_close(actual, expected)
-
-            actual_list = communicator.all_gatherv(
-                [local_input, local_input + 1000],
-                dim=1,
-                sizes=sizes,
-            )
-            assert isinstance(actual_list, list)
-            torch.testing.assert_close(actual_list[0], expected)
-            torch.testing.assert_close(actual_list[1], expected + 1000)
+                actual_list = communicator.all_gatherv(
+                    [local_input, local_input + 1000],
+                    dim=1,
+                    sizes=sizes,
+                )
+                assert isinstance(actual_list, list)
+                torch.testing.assert_close(actual_list[0], expected)
+                torch.testing.assert_close(actual_list[1], expected + 1000)
     finally:
         dist.destroy_process_group()
 
@@ -84,8 +127,11 @@ def _reduce_scatter_worker(rank: int, port: int) -> None:
 
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
-            actual = communicator.reduce_scatter(inputs[rank], dim=1)
-            torch.testing.assert_close(actual, expected)
+            with _cpu_mpi_operator_shims(
+                isinstance(communicator, CpuMPICommunicator)
+            ):
+                actual = communicator.reduce_scatter(inputs[rank], dim=1)
+                torch.testing.assert_close(actual, expected)
     finally:
         dist.destroy_process_group()
 
@@ -278,12 +324,15 @@ def _reduce_scatterv_worker(rank: int, port: int) -> None:
 
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
-            actual = communicator.reduce_scatterv(
-                inputs[rank],
-                dim=1,
-                sizes=sizes,
-            )
-            torch.testing.assert_close(actual, expected)
+            with _cpu_mpi_operator_shims(
+                isinstance(communicator, CpuMPICommunicator)
+            ):
+                actual = communicator.reduce_scatterv(
+                    inputs[rank],
+                    dim=1,
+                    sizes=sizes,
+                )
+                torch.testing.assert_close(actual, expected)
     finally:
         dist.destroy_process_group()
 
