@@ -17,6 +17,7 @@ MPI_ALLTOALLV_BACKENDS = {
     "mpi_alltoallv_v3",
     "mpi_alltoallv_v4",
     "mpi_alltoallv_v5",
+    "mpi_alltoallv_v6",
 }
 
 

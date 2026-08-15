@@ -46,7 +46,9 @@ def _prepare_finalize():
     return prepare_finalize
 
 
-def _experts(use_ep: bool) -> XcpuGroupedGemmExperts:
+def _experts(
+    use_ep: bool, all2all_backend: str = "mpi_alltoallv_v2"
+) -> XcpuGroupedGemmExperts:
     gemm1 = SimpleNamespace(
         params=SimpleNamespace(
             experts=1,
@@ -56,7 +58,10 @@ def _experts(use_ep: bool) -> XcpuGroupedGemmExperts:
     )
     return XcpuGroupedGemmExperts(
         moe_config=SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+            moe_parallel_config=SimpleNamespace(
+                use_ep=use_ep,
+                all2all_backend=all2all_backend,
+            ),
         ),
         quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
         fused_moe=SimpleNamespace(
@@ -136,6 +141,25 @@ def test_unquantized_no_ep_reduces_topk_inside_experts():
         topk=2,
         global_num_experts=4,
         local_num_experts=4,
+        expert_tokens_meta=None,
+        activation=object(),
+    )[-1] == (3, 4)
+
+
+@pytest.mark.parametrize("backend", ["mpi_alltoallv_v5", "mpi_alltoallv_v6"])
+def test_2d_token_ep_reduces_topk_inside_experts(backend):
+    experts = _experts(use_ep=True, all2all_backend=backend)
+    assert isinstance(
+        experts.finalize_weight_and_reduce_impl(),
+        TopKWeightAndReduceNoOP,
+    )
+    assert experts.workspace_shapes(
+        M=3,
+        N=8,
+        K=4,
+        topk=2,
+        global_num_experts=4,
+        local_num_experts=2,
         expert_tokens_meta=None,
         activation=object(),
     )[-1] == (3, 4)

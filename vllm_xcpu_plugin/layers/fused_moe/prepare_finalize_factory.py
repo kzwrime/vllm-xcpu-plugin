@@ -27,6 +27,7 @@ from .mpi_alltoallv_prepare_finalize_v2 import MpiAlltoallvPrepareAndFinalizeV2
 from .mpi_alltoallv_prepare_finalize_v3 import MpiAlltoallvPrepareAndFinalizeV3
 from .mpi_alltoallv_prepare_finalize_v4 import MpiAlltoallvPrepareAndFinalizeV4
 from .mpi_alltoallv_prepare_finalize_v5 import MpiAlltoallvPrepareAndFinalizeV5
+from .mpi_alltoallv_prepare_finalize_v6 import MpiAlltoallvPrepareAndFinalizeV6
 from .torch_all_to_all_single_prepare_finalize import (
     TorchAlltoallSinglePrepareAndFinalize,
 )
@@ -136,7 +137,8 @@ class _MpiAlltoallvPrepareFinalizeFactory(MoEPrepareFinalizeFactory):
             raise ValueError(
                 f"MPI alltoallv {cls.version} is deprecated and no longer supported; "
                 "use --all2all-backend mpi_alltoallv_v2, "
-                "mpi_alltoallv_v3, mpi_alltoallv_v4, or mpi_alltoallv_v5"
+                "mpi_alltoallv_v3, mpi_alltoallv_v4, mpi_alltoallv_v5, "
+                "or mpi_alltoallv_v6"
             )
 
         is_sequence_parallel = moe.moe_parallel_config.is_sequence_parallel
@@ -208,6 +210,14 @@ class MpiAlltoallvV5PrepareFinalizeFactory(_MpiAlltoallvPrepareFinalizeFactory):
     backend_name = "mpi_alltoallv_v5"
     version = "v5"
     implementation = MpiAlltoallvPrepareAndFinalizeV5
+    supports_sequence_parallel = True
+
+
+@register_moe_prepare_finalize_factory
+class MpiAlltoallvV6PrepareFinalizeFactory(_MpiAlltoallvPrepareFinalizeFactory):
+    backend_name = "mpi_alltoallv_v6"
+    version = "v6"
+    implementation = MpiAlltoallvPrepareAndFinalizeV6
     supports_sequence_parallel = True
 
 
