@@ -318,8 +318,9 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
     )
     prepare_finalize.comm_ptr_wrapper = torch.zeros(1, dtype=torch.int64)
     prepare_finalize._return_row_indices = None
-    prepare_finalize._recv_input_rows_per_source = None
-    prepare_finalize._send_input_rows_per_destination = None
+    prepare_finalize._recv_hidden_elements_per_src_rank = None
+    prepare_finalize._recv_hidden_element_offsets_per_src_rank = None
+    prepare_finalize._send_input_rows_per_dest_rank = None
     prepare_finalize._dispatch_send_buffer = None
     calls = []
 
@@ -346,7 +347,7 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
             apply_router_weight_on_input=False,
         )
 
-    prepare_finalize.prepare(
+    prepare_result = prepare_finalize.prepare(
         a1=torch.zeros((1, 4), dtype=torch.bfloat16),
         topk_weights=torch.ones((1, 6), dtype=torch.float32),
         topk_ids=torch.zeros((1, 6), dtype=torch.int32),
@@ -354,6 +355,10 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
         expert_map=None,
         apply_router_weight_on_input=False,
     )
+    _, _, expert_tokens_meta, _, _ = prepare_result
+    assert expert_tokens_meta.expert_num_tokens.numel() == 0
+    assert expert_tokens_meta.expert_num_tokens_cpu is None
+    assert expert_tokens_meta.num_input_rows_valid is calls[0][1][4]
     prepare_finalize.finalize(
         output=torch.empty((1, 4), dtype=torch.bfloat16),
         fused_expert_output=torch.empty((8, 4), dtype=torch.bfloat16),
@@ -374,9 +379,8 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
     assert prepare_args[2].dtype == torch.int32
     assert prepare_args[3].shape == (2 * 4, 6)
     assert prepare_args[3].dtype == torch.float32
-    assert prepare_args[4].shape == (4,)
-    assert prepare_args[4].dtype == torch.int32
-    assert prepare_args[5].shape == (1,)
+    assert prepare_args[4].shape == (1,)
+    assert prepare_args[5].shape == (2,)
     assert prepare_args[6].shape == (2,)
     assert prepare_args[7].shape == (2,)
 
@@ -387,13 +391,15 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
 
     finalize_args = calls[1][1]
     assert finalize_args[2] is return_row_indices
-    assert finalize_args[3] is prepare_args[6]
-    assert finalize_args[6].shape == (1, 4)
-    assert finalize_args[6].dtype == torch.float32
+    assert finalize_args[3] is prepare_args[5]
+    assert finalize_args[4] is prepare_args[6]
+    assert finalize_args[7].shape == (1, 4)
+    assert finalize_args[7].dtype == torch.float32
     assert finalize_args[-1] == prepare_finalize.max_moe_tokens_per_rank
     assert prepare_finalize._return_row_indices is None
-    assert prepare_finalize._recv_input_rows_per_source is None
-    assert prepare_finalize._send_input_rows_per_destination is None
+    assert prepare_finalize._recv_hidden_elements_per_src_rank is None
+    assert prepare_finalize._recv_hidden_element_offsets_per_src_rank is None
+    assert prepare_finalize._send_input_rows_per_dest_rank is None
     assert prepare_finalize._dispatch_send_buffer is None
     assert (
         pf_factory.MpiAlltoallvV6PrepareFinalizeFactory.implementation

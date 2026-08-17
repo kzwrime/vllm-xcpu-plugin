@@ -70,8 +70,9 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         self._return_row_indices: torch.Tensor | None = None
-        self._recv_input_rows_per_source: torch.Tensor | None = None
-        self._send_input_rows_per_destination: torch.Tensor | None = None
+        self._recv_hidden_elements_per_src_rank: torch.Tensor | None = None
+        self._recv_hidden_element_offsets_per_src_rank: torch.Tensor | None = None
+        self._send_input_rows_per_dest_rank: torch.Tensor | None = None
         self._dispatch_send_buffer: torch.Tensor | None = None
 
     @property
@@ -183,12 +184,14 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
             dtype=topk_weights.dtype,
             device=device,
         )
-        expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
         num_input_rows_valid = torch.empty(1, dtype=torch.int32, device=device)
-        recv_input_rows_per_source = torch.empty(
+        recv_hidden_elements_per_src_rank = torch.empty(
             self.ep_size, dtype=torch.int32, device=device
         )
-        send_input_rows_per_destination = torch.empty(
+        recv_hidden_element_offsets_per_src_rank = torch.empty(
+            self.ep_size, dtype=torch.int32, device=device
+        )
+        send_input_rows_per_dest_rank = torch.empty(
             self.ep_size, dtype=torch.int32, device=device
         )
 
@@ -210,10 +213,10 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
             recv_hidden_states,
             recv_topk_ids,
             recv_topk_weights,
-            expert_num_tokens,
             num_input_rows_valid,
-            recv_input_rows_per_source,
-            send_input_rows_per_destination,
+            recv_hidden_elements_per_src_rank,
+            recv_hidden_element_offsets_per_src_rank,
+            send_input_rows_per_dest_rank,
             dispatch_send_buffer,
             a1,
             topk_ids,
@@ -226,16 +229,16 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Keep all asynchronous kernel inputs/outputs alive until finalize.
         self._return_row_indices = return_row_indices
-        self._recv_input_rows_per_source = recv_input_rows_per_source
-        self._send_input_rows_per_destination = send_input_rows_per_destination
+        self._recv_hidden_elements_per_src_rank = recv_hidden_elements_per_src_rank
+        self._recv_hidden_element_offsets_per_src_rank = (
+            recv_hidden_element_offsets_per_src_rank
+        )
+        self._send_input_rows_per_dest_rank = send_input_rows_per_dest_rank
         self._dispatch_send_buffer = dispatch_send_buffer
 
-        local_expert_num_tokens = expert_num_tokens.narrow(
-            0, self.rank_expert_offset, self.num_local_experts
-        ).contiguous()
         expert_tokens_meta = XCPUExpertTokensMetadata(
-            expert_num_tokens=local_expert_num_tokens,
-            expert_num_tokens_cpu=local_expert_num_tokens.cpu(),
+            expert_num_tokens=num_input_rows_valid.new_empty(0),
+            expert_num_tokens_cpu=None,
             num_input_rows_valid=num_input_rows_valid,
         )
 
@@ -289,8 +292,9 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
             )
 
         assert self._return_row_indices is not None
-        assert self._recv_input_rows_per_source is not None
-        assert self._send_input_rows_per_destination is not None
+        assert self._recv_hidden_elements_per_src_rank is not None
+        assert self._recv_hidden_element_offsets_per_src_rank is not None
+        assert self._send_input_rows_per_dest_rank is not None
         assert self._dispatch_send_buffer is not None
 
         from torch_xcpu import ops as xcpu_ops
@@ -300,7 +304,8 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
             output,
             fused_expert_output,
             self._return_row_indices,
-            self._recv_input_rows_per_source,
+            self._recv_hidden_elements_per_src_rank,
+            self._recv_hidden_element_offsets_per_src_rank,
             self._comm_metadata,
             self.comm_ptr_wrapper,
             workspace,
@@ -308,7 +313,8 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         self._return_row_indices = None
-        self._recv_input_rows_per_source = None
-        self._send_input_rows_per_destination = None
+        self._recv_hidden_elements_per_src_rank = None
+        self._recv_hidden_element_offsets_per_src_rank = None
+        self._send_input_rows_per_dest_rank = None
         self._dispatch_send_buffer = None
         return (lambda: None), (lambda: None)
