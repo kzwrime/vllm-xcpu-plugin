@@ -44,12 +44,12 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
         self.topk_reduce = not parallel_config.use_ep or (
             parallel_config.all2all_backend in {"mpi_alltoallv_v5", "mpi_alltoallv_v6"}
         )
-        gemm1 = fused_moe.params.gemm1
+        backend_type = fused_moe.backend_type
         logger.warning_once(
             "Using XcpuGroupedGemmExperts: format=%s backend=%s "
             "implementation=%s use_ep=%s topk_reduce=%s",
-            gemm1.weight_format.name,
-            gemm1.backend.name.lower(),
+            backend_type.weight_format.name,
+            backend_type.backend.name.lower(),
             fused_moe.resolved_backend,
             parallel_config.use_ep,
             self.topk_reduce,
