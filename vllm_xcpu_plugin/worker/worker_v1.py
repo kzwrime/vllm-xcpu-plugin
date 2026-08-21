@@ -20,7 +20,7 @@ from vllm.v1.worker.workspace import clear_workspace, init_workspace_manager
 
 import vllm_xcpu_plugin.envs as envs_xcpu
 
-from .model_runner import McpuModelRunner, McpuModelRunnerV2
+from .model_runner import McpuMemoryStatsLogger, McpuModelRunner, McpuModelRunnerV2
 
 logger = init_logger(__name__)
 
@@ -224,6 +224,7 @@ class McpuWorker(Worker):
         self.model_runner = model_runner(  # type: ignore
             self.vllm_config, self.device
         )
+        self.memory_stats_logger = McpuMemoryStatsLogger(self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -264,3 +265,8 @@ class McpuWorker(Worker):
 
     def shutdown(self):
         return
+
+    def execute_model(self, scheduler_output):
+        output = super().execute_model(scheduler_output)
+        self.memory_stats_logger.maybe_log(scheduler_output)
+        return output
