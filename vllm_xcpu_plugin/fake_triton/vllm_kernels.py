@@ -753,8 +753,7 @@ def _rejection_compute_local_logits_stats(launch: KernelLaunch) -> None:
     else:
         _expect(draft_logits is None, "draft logits must be None")
         _expect(
-            args["draft_logits_stride_0"] == 0
-            and args["draft_logits_stride_1"] == 0,
+            args["draft_logits_stride_0"] == 0 and args["draft_logits_stride_1"] == 0,
             "absent draft logits must have zero strides",
         )
     for tensor_name, stride_name in (
@@ -768,7 +767,9 @@ def _rejection_compute_local_logits_stats(launch: KernelLaunch) -> None:
             args[stride_name] == args[tensor_name].stride(0),
             f"{tensor_name} stride mismatch",
         )
-    torch.ops.mcpu.vllm_rejection_compute_local_logits_stats(
+    import torch_xcpu.ops as xcpu_ops
+
+    xcpu_ops.vllm_rejection_compute_local_logits_stats(
         args["target_local_argmax_ptr"],
         args["target_local_max_ptr"],
         args["target_local_sumexp_ptr"],
@@ -881,8 +882,7 @@ def _rejection_v2(launch: KernelLaunch) -> None:
     else:
         _expect(draft_logits is None, "draft logits must be None")
         _expect(
-            args["draft_logits_stride_0"] == 0
-            and args["draft_logits_stride_1"] == 0,
+            args["draft_logits_stride_0"] == 0 and args["draft_logits_stride_1"] == 0,
             "absent draft logits must have zero strides",
         )
     torch.ops.mcpu.vllm_rejection(
@@ -940,11 +940,12 @@ def _rejection_resample(launch: KernelLaunch) -> None:
     else:
         _expect(draft_logits is None, "draft logits must be None")
         _expect(
-            args["draft_logits_stride_0"] == 0
-            and args["draft_logits_stride_1"] == 0,
+            args["draft_logits_stride_0"] == 0 and args["draft_logits_stride_1"] == 0,
             "absent draft logits must have zero strides",
         )
-    torch.ops.mcpu.vllm_rejection_resample(
+    import torch_xcpu.ops as xcpu_ops
+
+    xcpu_ops.vllm_rejection_resample(
         args["resampled_local_argmax_ptr"],
         args["resampled_local_max_ptr"],
         args["target_logits_ptr"],

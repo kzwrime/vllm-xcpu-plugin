@@ -15,9 +15,7 @@ def test_xcpu_topk_softmax_forwards_is_padding(monkeypatch):
 
     topk_weights = torch.empty(3, 2, dtype=torch.float32, device="cpu")
     topk_ids = torch.empty(3, 2, dtype=torch.int32, device="cpu")
-    token_expert_indices = torch.empty(
-        3, 2, dtype=torch.int32, device="cpu"
-    )
+    token_expert_indices = torch.empty(3, 2, dtype=torch.int32, device="cpu")
     gating_output = torch.empty(3, 8, dtype=torch.float32, device="cpu")
     is_padding = torch.tensor([False, True, False], device="cpu")
 

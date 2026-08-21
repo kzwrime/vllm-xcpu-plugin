@@ -12,18 +12,11 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 
 
-class XcpuSparseIndexerMetadataBuilder(
-    DeepseekV32IndexerMetadataBuilder
-):
+class XcpuSparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         parallel = vllm_config.parallel_config
         speculative = vllm_config.speculative_config
         compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
-        unvalidated = []
-        if parallel.tensor_parallel_size != 1:
-            unvalidated.append(f"TP={parallel.tensor_parallel_size}")
-        if parallel.data_parallel_size != 1:
-            unvalidated.append(f"DP={parallel.data_parallel_size}")
 
         missing_capabilities = []
         if compress_ratio != 1:
@@ -46,11 +39,6 @@ class XcpuSparseIndexerMetadataBuilder(
             )
 
         errors = []
-        if unvalidated:
-            errors.append(
-                "conservative restrictions, not yet validated end-to-end: "
-                + ", ".join(unvalidated)
-            )
         if missing_capabilities:
             errors.append(
                 "unsupported because required execution capabilities are missing: "

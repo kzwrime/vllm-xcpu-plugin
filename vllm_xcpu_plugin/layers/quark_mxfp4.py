@@ -49,9 +49,7 @@ def should_use_quark_mxfp4_w4a16(
     if is_quark_mxfp4_w4a16(weight_dtype, input_dtype):
         return True
     return (
-        force_quark_mxfp4_w4a16()
-        and weight_dtype == "mxfp4"
-        and input_dtype == "mxfp4"
+        force_quark_mxfp4_w4a16() and weight_dtype == "mxfp4" and input_dtype == "mxfp4"
     )
 
 
@@ -65,6 +63,11 @@ def _initialize_dummy_e8m0_scale(scale: torch.Tensor) -> None:
 
 class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
     """Execute Quark MXFP4 weights with BF16 activations in torch_xcpu."""
+
+    # These attributes are initialized by QuarkOCP_MX, whose imports are
+    # intentionally followed silently by mypy in this plugin.
+    input_dtype: str | None
+    dynamic_mxfp4_quant: bool
 
     def __init__(
         self,

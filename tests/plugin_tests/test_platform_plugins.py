@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 def test_ir_priority_uses_functional_kernel_for_compile():
     from types import SimpleNamespace
 

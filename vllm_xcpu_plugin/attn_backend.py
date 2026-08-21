@@ -181,10 +181,10 @@ class XcpuTritonMLABackend(MLACommonBackend):
 # TODO(cwl): vLLM upstream has moved MLA orchestration into
 #   - `MLAAttention.forward_impl`
 #   -  split dense prefill behind `MLAPrefillBackend`,
-#   -  `SparseMLACommonMetadataBuilder` / `SparseMLACommonImpl`. 
+#   -  `SparseMLACommonMetadataBuilder` / `SparseMLACommonImpl`.
 # This OOT class intentionally keeps the existing layout while sparse MLA is
 # experimental, so the original dense MLA owner can control the eventual sync.
-# 
+#
 # It's recommended to create 3 files or more like vllm:
 #   - mla.py
 #   - mla_prefill.py
@@ -229,9 +229,7 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         self.layer_name = prefix
         self.indexer = indexer
         self.topk_indices_buffer = (
-            indexer.topk_indices_buffer
-            if indexer is not None
-            else topk_indices_buffer
+            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
 
         self.num_kv_heads = 1

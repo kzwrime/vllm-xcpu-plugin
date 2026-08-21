@@ -97,9 +97,7 @@ def _all_gatherv_worker(rank: int, port: int) -> None:
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
             local_input = inputs[rank]
-            with _cpu_mpi_operator_shims(
-                isinstance(communicator, CpuMPICommunicator)
-            ):
+            with _cpu_mpi_operator_shims(isinstance(communicator, CpuMPICommunicator)):
                 actual = communicator.all_gatherv(local_input, dim=1, sizes=sizes)
                 torch.testing.assert_close(actual, expected)
 
@@ -127,9 +125,7 @@ def _reduce_scatter_worker(rank: int, port: int) -> None:
 
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
-            with _cpu_mpi_operator_shims(
-                isinstance(communicator, CpuMPICommunicator)
-            ):
+            with _cpu_mpi_operator_shims(isinstance(communicator, CpuMPICommunicator)):
                 actual = communicator.reduce_scatter(inputs[rank], dim=1)
                 torch.testing.assert_close(actual, expected)
     finally:
@@ -147,8 +143,7 @@ def _mcpu_sequence_parallel_collectives_worker(rank: int, port: int) -> None:
         import torch_mcpu  # noqa: F401
 
         inputs = [
-            torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
-            + process_rank * 100
+            torch.arange(24, dtype=torch.bfloat16).reshape(6, 4) + process_rank * 100
             for process_rank in range(WORLD_SIZE)
         ]
         expected_full = sum(inputs)
@@ -159,9 +154,7 @@ def _mcpu_sequence_parallel_collectives_worker(rank: int, port: int) -> None:
         torch.testing.assert_close(actual_chunk.cpu(), expected_chunk)
 
         actual_full = communicator.all_gather(actual_chunk, dim=0)
-        expected_gathered = torch.cat(
-            expected_full.chunk(WORLD_SIZE, dim=0), dim=0
-        )
+        expected_gathered = torch.cat(expected_full.chunk(WORLD_SIZE, dim=0), dim=0)
         torch.testing.assert_close(actual_full.cpu(), expected_gathered)
     finally:
         dist.destroy_process_group()
@@ -217,13 +210,15 @@ def _mcpu_replicated_shared_expert_worker(rank: int, port: int) -> None:
             )
 
             gate_weight = (
-                torch.arange(hidden_size, dtype=torch.float32, device="cpu")
+                torch
+                .arange(hidden_size, dtype=torch.float32, device="cpu")
                 .reshape(1, hidden_size)
                 .mul_(0.002)
                 .to(torch.bfloat16)
             )
             gate_proj_weight = (
-                torch.arange(
+                torch
+                .arange(
                     intermediate_size * hidden_size,
                     dtype=torch.float32,
                     device="cpu",
@@ -235,7 +230,8 @@ def _mcpu_replicated_shared_expert_worker(rank: int, port: int) -> None:
             )
             up_proj_weight = gate_proj_weight.flip(0).contiguous()
             down_proj_weight = (
-                torch.arange(
+                torch
+                .arange(
                     hidden_size * intermediate_size,
                     dtype=torch.float32,
                     device="cpu",
@@ -253,9 +249,7 @@ def _mcpu_replicated_shared_expert_worker(rank: int, port: int) -> None:
             layer.gate_up_proj.weight_loader(
                 layer.gate_up_proj.weight, up_proj_weight, 1
             )
-            layer.down_proj.weight_loader(
-                layer.down_proj.weight, down_proj_weight
-            )
+            layer.down_proj.weight_loader(layer.down_proj.weight, down_proj_weight)
 
             assert layer.gate_up_proj.tp_size == 1
             assert layer.gate_up_proj.tp_rank == 0
@@ -272,7 +266,8 @@ def _mcpu_replicated_shared_expert_worker(rank: int, port: int) -> None:
 
             # Each rank receives a different sequence chunk, as it does in SP.
             x_cpu = (
-                torch.arange(3 * hidden_size, dtype=torch.float32, device="cpu")
+                torch
+                .arange(3 * hidden_size, dtype=torch.float32, device="cpu")
                 .reshape(3, hidden_size)
                 .add_(rank * 17)
                 .mul_(0.01)
@@ -288,9 +283,7 @@ def _mcpu_replicated_shared_expert_worker(rank: int, port: int) -> None:
             gate, up = gate_up.chunk(2, dim=-1)
             expected = F.linear(F.silu(gate) * up, down_proj_weight)
             expected *= torch.sigmoid(F.linear(x_cpu, gate_weight))
-            torch.testing.assert_close(
-                actual.cpu(), expected, atol=2e-3, rtol=2e-2
-            )
+            torch.testing.assert_close(actual.cpu(), expected, atol=2e-3, rtol=2e-2)
 
             # Replicated weights must be byte-identical across TP ranks.
             for parameter in (
@@ -324,9 +317,7 @@ def _reduce_scatterv_worker(rank: int, port: int) -> None:
 
         for communicator_cls in COMMUNICATOR_CLASSES:
             communicator = _make_communicator(communicator_cls)
-            with _cpu_mpi_operator_shims(
-                isinstance(communicator, CpuMPICommunicator)
-            ):
+            with _cpu_mpi_operator_shims(isinstance(communicator, CpuMPICommunicator)):
                 actual = communicator.reduce_scatterv(
                     inputs[rank],
                     dim=1,
