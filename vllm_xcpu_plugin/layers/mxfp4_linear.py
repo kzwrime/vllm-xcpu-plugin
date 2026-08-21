@@ -25,9 +25,7 @@ class XcpuMxFp4LinearKernel(MxFp4LinearKernel):
         return True, None
 
     @classmethod
-    def can_implement(
-        cls, config: MxFp4LinearLayerConfig
-    ) -> tuple[bool, str | None]:
+    def can_implement(cls, config: MxFp4LinearLayerConfig) -> tuple[bool, str | None]:
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

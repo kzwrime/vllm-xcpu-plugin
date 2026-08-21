@@ -59,9 +59,7 @@ def test_sparse_indexer_arbitrary_long_context(seq_len: int) -> None:
     ).cpu()
 
     score = torch.matmul(q.to(torch.bfloat16), logical_k.T)
-    logits = (
-        torch.clamp(score, min=0).float() * weights.unsqueeze(-1)
-    ).sum(dim=1)
+    logits = (torch.clamp(score, min=0).float() * weights.unsqueeze(-1)).sum(dim=1)
     expected = torch.topk(logits, topk, dim=-1).indices.to(torch.int32)
     assert set(actual[0].tolist()) == set(expected[0].tolist())
 
@@ -115,12 +113,8 @@ def test_sparse_indexer_short_context_pads_with_minus_one() -> None:
         output,
     ).cpu()
 
-    expected_first = torch.tensor(
-        [0, 1, -1, -1, -1, -1, -1, -1], dtype=torch.int32
-    )
-    expected_second = torch.tensor(
-        [0, 1, 2, -1, -1, -1, -1, -1], dtype=torch.int32
-    )
+    expected_first = torch.tensor([0, 1, -1, -1, -1, -1, -1, -1], dtype=torch.int32)
+    expected_second = torch.tensor([0, 1, 2, -1, -1, -1, -1, -1], dtype=torch.int32)
     torch.testing.assert_close(actual[0], expected_first)
     torch.testing.assert_close(actual[1], expected_second)
 

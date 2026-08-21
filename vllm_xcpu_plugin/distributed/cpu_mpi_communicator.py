@@ -186,9 +186,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
 
         output_shape = list(input_.shape)
         output_shape[dim] = sum(sizes)
-        output = torch.empty(
-            output_shape, dtype=input_.dtype, device=input_.device
-        )
+        output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
         sizes_tensor = torch.tensor(sizes, dtype=torch.int64, device="cpu")
         xcpu_ops.all_gatherv_into_tensor_out_v2(
             output, input_, sizes_tensor, self.comm_ptr_wrapper, dim
@@ -212,9 +210,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
 
         output_shape = list(input_.shape)
         output_shape[dim] //= self.world_size
-        output = torch.empty(
-            output_shape, dtype=input_.dtype, device=input_.device
-        )
+        output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
         torch_mpi_ext.ops.reduce_scatter_out_wrapper(
             output, input_, self.comm_ptr_wrapper, dim
         )
@@ -245,9 +241,7 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
 
         output_shape = list(input_.shape)
         output_shape[dim] = sizes[self.rank_in_group]
-        output = torch.empty(
-            output_shape, dtype=input_.dtype, device=input_.device
-        )
+        output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
         sizes_tensor = torch.tensor(sizes, dtype=torch.int64, device="cpu")
         torch_mpi_ext.ops.reduce_scatterv_out_wrapper(
             output, input_, sizes_tensor, self.comm_ptr_wrapper, dim

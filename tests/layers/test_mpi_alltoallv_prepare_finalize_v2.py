@@ -50,11 +50,9 @@ def _experts(
     use_ep: bool, all2all_backend: str = "mpi_alltoallv_v2"
 ) -> XcpuGroupedGemmExperts:
     gemm1 = SimpleNamespace(
-        params=SimpleNamespace(
-            experts=1,
-            weight_format=SimpleNamespace(name="BF16"),
-            backend=SimpleNamespace(name="ACC"),
-        )
+        params=SimpleNamespace(experts=1),
+        weight_format=SimpleNamespace(name="BF16"),
+        backend=SimpleNamespace(name="ACC"),
     )
     return XcpuGroupedGemmExperts(
         moe_config=SimpleNamespace(
