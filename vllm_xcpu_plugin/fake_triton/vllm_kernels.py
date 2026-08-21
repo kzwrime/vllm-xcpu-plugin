@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -29,6 +30,80 @@ def _expect_grid(launch: KernelLaunch, expected: tuple[int, ...]) -> None:
     _expect(
         launch.grid == expected,
         f"{launch.kernel.qualname}: expected grid {expected}, got {launch.grid}",
+    )
+
+
+def _qwen3_vl_bilinear_pos_embed(launch: KernelLaunch) -> None:
+    """Validate and dispatch Qwen3-VL's fused position-embedding launch."""
+    args = launch.arguments
+    embed = args["embed_ptr"]
+    output = args["output_ptr"]
+    height = args["H"]
+    width = args["W"]
+    h_scale = args["h_scale"]
+    w_scale = args["w_scale"]
+    num_grid = args["NUM_GRID"]
+    merge_size = args["M_SIZE"]
+    hidden_dim = args["HIDDEN_DIM"]
+    block_d = args["BLOCK_D"]
+
+    _expect(embed.device.type == "mcpu", "embed must be an mcpu tensor")
+    _expect(output.device.type == "mcpu", "output must be an mcpu tensor")
+    _expect(embed.device == output.device, "embed/output device mismatch")
+    _expect(embed.ndim == 2, "embed must be 2D")
+    _expect(output.ndim == 2, "output must be 2D")
+    _expect(embed.is_contiguous(), "embed must be contiguous")
+    _expect(output.is_contiguous(), "output must be contiguous")
+    _expect(
+        embed.dtype in (torch.float32, torch.bfloat16),
+        "Qwen3-VL position embeddings require float32 or bfloat16",
+    )
+    _expect(output.dtype == embed.dtype, "embed/output dtype mismatch")
+    _expect(height > 0 and width > 0, "H/W must be positive")
+    _expect(num_grid > 0, "NUM_GRID must be positive")
+    _expect(merge_size > 0, "M_SIZE must be positive")
+    _expect(hidden_dim > 0, "HIDDEN_DIM must be positive")
+    _expect(height % merge_size == 0, "H must be divisible by M_SIZE")
+    _expect(width % merge_size == 0, "W must be divisible by M_SIZE")
+    _expect(embed.shape == (num_grid * num_grid, hidden_dim), "embed shape mismatch")
+    _expect(output.shape[1] == hidden_dim, "output hidden dimension mismatch")
+
+    total_spatial = height * width
+    total_out = output.shape[0]
+    _expect(
+        total_out > 0 and total_out % total_spatial == 0,
+        "output shape does not encode temporal repeat",
+    )
+    _expect_grid(launch, (total_out,))
+
+    expected_h_scale = (num_grid - 1) / (height - 1) if height > 1 else 0.0
+    expected_w_scale = (num_grid - 1) / (width - 1) if width > 1 else 0.0
+    _expect(
+        math.isclose(h_scale, expected_h_scale, rel_tol=1e-6, abs_tol=1e-6),
+        "h_scale does not match H/NUM_GRID",
+    )
+    _expect(
+        math.isclose(w_scale, expected_w_scale, rel_tol=1e-6, abs_tol=1e-6),
+        "w_scale does not match W/NUM_GRID",
+    )
+
+    expected_block_d = 1 << (hidden_dim - 1).bit_length()
+    _expect(
+        block_d == expected_block_d,
+        "BLOCK_D must be the next power of two of HIDDEN_DIM",
+    )
+
+    torch.ops.mcpu.vllm_qwen3_vl_bilinear_pos_embed(
+        embed,
+        output,
+        height,
+        width,
+        h_scale,
+        w_scale,
+        num_grid,
+        merge_size,
+        hidden_dim,
+        block_d,
     )
 
 
@@ -1270,6 +1345,15 @@ def _prompt_logprob_token_ids(launch: KernelLaunch) -> None:
 _KERNELS: tuple[
     tuple[str, str, str, str, str, Callable[[KernelLaunch], Any], tuple[str, ...]], ...
 ] = (
+    (
+        "vllm.model_executor.models.qwen3_vl",
+        "_bilinear_pos_embed_kernel",
+        "77637835fa2fb867fd9f9b97c12ada5ca063fc84b351654ad65427a42dd61721",
+        "6a8f4330010da11c2ae8d3cb6ae0fa86a3e1792b8eca8d97fb752dd709ac5eac",
+        "v0.25.1",
+        _qwen3_vl_bilinear_pos_embed,
+        (),
+    ),
     (
         "vllm.model_executor.layers.quantization.utils.fp8_utils",
         "_per_token_group_quant_fp8",
