@@ -64,6 +64,7 @@ def register_ops():
         "Quark MXFP4 W4A16 linear", register_quark_mxfp4_linear_scheme
     )
     import vllm_xcpu_plugin.layers.layernorm  # noqa
+    import vllm_xcpu_plugin.layers.mm_encoder_attention  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
     import vllm_xcpu_plugin.layers.sparse_attn_indexer  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa
