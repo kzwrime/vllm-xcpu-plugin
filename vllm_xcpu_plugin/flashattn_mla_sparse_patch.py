@@ -27,6 +27,7 @@ def _xcpu_do_kv_cache_update(
         k_pe.squeeze(1),  # [tokens, qk_rope]
         kv_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope]
         slot_mapping.flatten(),
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -131,6 +132,7 @@ def _xcpu_forward_mqa(
                 window_size=0,
                 block_table=attn_metadata.block_table,
                 logical_topk=logical_topk,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
         else:
             _xcpu_sparse_mla_attention(
@@ -163,6 +165,7 @@ def _xcpu_forward_mqa(
             window_size=0,
             block_table=block_table,
             logical_topk=logical_topk,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
 
     return output, None
