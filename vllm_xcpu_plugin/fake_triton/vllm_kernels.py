@@ -93,17 +93,15 @@ def _qwen3_vl_bilinear_pos_embed(launch: KernelLaunch) -> None:
         "BLOCK_D must be the next power of two of HIDDEN_DIM",
     )
 
-    torch.ops.mcpu.vllm_qwen3_vl_bilinear_pos_embed(
-        embed,
+    import torch_xcpu.ops as xcpu_ops
+
+    xcpu_ops.qwen3_vl_bilinear_pos_embed_out(
         output,
+        embed,
         height,
         width,
-        h_scale,
-        w_scale,
         num_grid,
         merge_size,
-        hidden_dim,
-        block_d,
     )
 
 
