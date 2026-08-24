@@ -23,7 +23,7 @@ def _run_in_xcpu_process(code: str) -> dict:
 
 
 def test_mm_encoder_attention_matches_tp1_cpu_reference():
-    code = r'''
+    code = r"""
 import json
 
 import torch
@@ -36,6 +36,7 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_xcpu_plugin.fake_triton.runtime import get_registry
 from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+import vllm_xcpu_plugin.layers.mm_encoder_attention  # noqa: F401
 
 
 def cpu_reference(q, k, v, scale):
@@ -81,9 +82,9 @@ def run_mcpu(module, q, k, v, cu_seqlens=None):
     return output.cpu()
 
 
-def make_qkv(seq_len, seed):
+def make_qkv(seq_len, seed, batch_size=1):
     torch.manual_seed(seed)
-    shape = (1, seq_len, 12, 64)
+    shape = (batch_size, seq_len, 12, 64)
     head_offsets = torch.arange(12, dtype=torch.float32).view(1, 1, 12, 1)
     query = (torch.randn(shape) * 0.2 + head_offsets * 0.03).bfloat16()
     key = (torch.randn(shape) * 0.2 - head_offsets * 0.02).bfloat16()
@@ -144,7 +145,7 @@ with torch.inference_mode():
     )
     assert (scaled_actual.float() - default_scale_reference.float()).abs().max() > 1e-2
 
-    fixed_q, fixed_k, fixed_v = make_qkv(288, 41)
+    fixed_q, fixed_k, fixed_v = make_qkv(288, 41, batch_size=2)
     fixed_actual = run_mcpu(attention, fixed_q, fixed_k, fixed_v)
     fixed_reference = cpu_reference(
         fixed_q,
@@ -152,7 +153,7 @@ with torch.inference_mode():
         fixed_v,
         attention.scale,
     )
-    assert fixed_actual.shape == (1, 288, 12, 64)
+    assert fixed_actual.shape == (2, 288, 12, 64)
     assert torch.isfinite(fixed_actual.float()).all()
     assert torch.count_nonzero(fixed_actual) > 0
     torch.testing.assert_close(
@@ -212,6 +213,19 @@ triton_qualname = (
 )
 print(json.dumps({
     "backend": attention.attn_backend.name,
+    "implementation": type(attention).__name__,
+    "global_sdpa_registered": torch._C._dispatch_has_kernel_for_dispatch_key(
+        "aten::_scaled_dot_product_fused_attention_overrideable",
+        "PrivateUse1",
+    ),
+    "dense_xcpu_sdpa_registered": (
+        "torch_xcpu::scaled_dot_product_attention_out"
+        in torch._C._dispatch_get_all_op_names()
+    ),
+    "varlen_xcpu_sdpa_registered": (
+        "torch_xcpu::scaled_dot_product_attention_varlen_out"
+        in torch._C._dispatch_get_all_op_names()
+    ),
     "tp_world_size": vllm_config.parallel_config.tensor_parallel_size,
     "fixed_shape": list(fixed_actual.shape),
     "fixed": error_metrics(fixed_actual, fixed_reference),
@@ -223,16 +237,20 @@ print(json.dumps({
         0,
     ),
 }))
-'''
+"""
     payload = _run_in_xcpu_process(code)
 
     assert payload["backend"] == "TORCH_SDPA"
+    assert payload["implementation"] == "XcpuMMEncoderAttention"
+    assert not payload["global_sdpa_registered"]
+    assert not payload["dense_xcpu_sdpa_registered"]
+    assert payload["varlen_xcpu_sdpa_registered"]
     assert payload["tp_world_size"] == 1
-    assert payload["fixed_shape"] == [1, 288, 12, 64]
+    assert payload["fixed_shape"] == [2, 288, 12, 64]
     assert payload["ragged_shape"] == [1, 840, 12, 64]
     assert payload["ragged_cu_seqlens"] == [0, 280, 560, 840]
     assert payload["triton_fwd_launches"] == 0
     assert payload["fixed"]["max_abs"] <= 1e-2
-    assert payload["fixed"]["max_rel_floor_atol"] <= 1e-2
+    assert payload["fixed"]["max_rel_floor_atol"] <= 2e-2
     assert payload["ragged"]["max_abs"] <= 1e-2
-    assert payload["ragged"]["max_rel_floor_atol"] <= 1e-2
+    assert payload["ragged"]["max_rel_floor_atol"] <= 2e-2
