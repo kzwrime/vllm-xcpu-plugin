@@ -337,8 +337,8 @@ print(json.dumps({
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
         "has_triton": True,
-        "registrations": 47,
-        "source_versions": ["v0.24.0", "v0.25.0", "v0.25.1"],
+        "registrations": 49,
+        "source_versions": ["7e6aceef36", "v0.24.0", "v0.25.0", "v0.25.1"],
         "expand_launches": 1,
         "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],
         "invalid_max_rejected": True,

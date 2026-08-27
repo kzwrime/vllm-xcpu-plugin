@@ -19,8 +19,8 @@ def _xcpu_gumbel_sample(
     seed: torch.Tensor,
     pos: torch.Tensor,
     apply_temperature: bool,
-    output_processed_logits: torch.Tensor | None = None,
-    output_processed_logits_col: torch.Tensor | None = None,
+    logits_cache: torch.Tensor | None = None,
+    logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -37,8 +37,8 @@ def _xcpu_gumbel_sample(
         seed=seed,
         pos=pos,
         apply_temperature=apply_temperature,
-        output_processed_logits=output_processed_logits,
-        output_processed_logits_col=output_processed_logits_col,
+        logits_cache=logits_cache,
+        logits_cache_col=logits_cache_col,
         use_fp64=use_fp64,
     )
 
@@ -104,8 +104,8 @@ def maybe_patch_vllm_gumbel_sample() -> None:
         seed: torch.Tensor,
         pos: torch.Tensor,
         apply_temperature: bool,
-        output_processed_logits: torch.Tensor | None = None,
-        output_processed_logits_col: torch.Tensor | None = None,
+        logits_cache: torch.Tensor | None = None,
+        logits_cache_col: torch.Tensor | None = None,
         use_fp64: bool = False,
     ) -> torch.Tensor:
         if _is_xcpu_device(logits):
@@ -116,8 +116,8 @@ def maybe_patch_vllm_gumbel_sample() -> None:
                 seed,
                 pos,
                 apply_temperature,
-                output_processed_logits,
-                output_processed_logits_col,
+                logits_cache,
+                logits_cache_col,
                 use_fp64,
             )
 
@@ -128,8 +128,8 @@ def maybe_patch_vllm_gumbel_sample() -> None:
             seed,
             pos,
             apply_temperature,
-            output_processed_logits,
-            output_processed_logits_col,
+            logits_cache,
+            logits_cache_col,
             use_fp64,
         )
 

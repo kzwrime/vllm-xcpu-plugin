@@ -1071,6 +1071,56 @@ def _rejection_insert(launch: KernelLaunch) -> None:
     )
 
 
+def _dflash2_selector_walk(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_reqs = launch.grid[0]
+    num_steps = args["num_steps"]
+    top_k = args["top_k"]
+    _expect_grid(launch, (num_reqs,))
+    _expect(args["BLOCK_K"] == 1 << (top_k - 1).bit_length(), "invalid BLOCK_K")
+    _expect(not args["SAMPLE_PROBABILISTIC"], "probabilistic DFlash2 is unsupported")
+
+    scores = args["scores_ptr"][:num_reqs]
+    candidates = args["candidate_ptr"][:num_reqs]
+    _expect(scores.shape == (num_reqs, num_steps, top_k, top_k), "score shape")
+    _expect(candidates.shape == (num_reqs, num_steps, top_k), "candidate shape")
+    torch.ops.mcpu.vllm_dflash2_selector_walk(
+        args["scores_ptr"],
+        args["candidate_ptr"],
+        args["sample_pos_ptr"],
+        args["req_state_ptr"],
+        args["temperature_ptr"],
+        args["seeds_ptr"],
+        args["tokens_ptr"],
+        args["realized_scores_ptr"],
+        num_reqs,
+        num_steps,
+        top_k,
+        args["SAMPLE_PROBABILISTIC"],
+        args["USE_FP64"],
+    )
+
+
+def _dflash2_cache_draft_logits(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    num_sample = launch.grid[0]
+    num_steps = args["num_steps"]
+    top_k = args["top_k"]
+    _expect_grid(launch, (num_sample,))
+    _expect(args["BLOCK_K"] == 1 << (top_k - 1).bit_length(), "invalid BLOCK_K")
+
+    torch.ops.mcpu.vllm_dflash2_cache_draft_logits(
+        args["draft_logits_ptr"],
+        args["cached_candidate_ptr"],
+        args["candidate_ptr"],
+        args["scores_ptr"],
+        args["req_state_ptr"],
+        num_sample,
+        num_steps,
+        top_k,
+    )
+
+
 def _rejection_flatten(launch: KernelLaunch) -> None:
     args = launch.arguments
     num_reqs = args["num_sampled_ptr"].numel()
@@ -1590,45 +1640,45 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_compute_local_logits_stats_kernel",
-        "d37d345853cbd4d215456059727b94ec42575c1e8dd5421991b489b0ba5e23bc",
+        "85f0c4a3cc706909fffb745b5b9a2e94b26c2eee8f1e6771185489cd14b00f92",
         "f7df3922cbf844c774e1d7746d88d1b93dd75a99b0232d955c69d91ef553aea8",
-        "v0.25.1",
+        "7e6aceef36",
         _rejection_compute_local_logits_stats,
         (),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_compute_cumulative_log_p_kernel",
-        "facbac093d0917b1ac05ed5946e5283983ac5df7c250a661ee92252c381f575a",
+        "260df7bbaf2d6f8008904ceac7950ab04350fdfdfdfdd74a46358dccb616411b",
         "9288fe68370ddebf205d8583a3fde34969f8d3535c2f208615598df7140bddd2",
-        "v0.25.1",
+        "7e6aceef36",
         _rejection_cumulative_log_p,
         ("num_warps",),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_compute_local_residual_mass_kernel",
-        "3c0f47a77b2d498787c90b06659a4dfeb2565079a4e9957f1811757766c19ef4",
+        "40057b9b19a3ab64fc9dc0c70914477ddc52918b2fda13cce74ccaa7e3bc5809",
         "bedaed3ba6a0b2032fac12cc9f5b33b47511463fb5385f5f57470104565869d5",
-        "v0.25.1",
+        "7e6aceef36",
         _rejection_local_residual_mass,
         (),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_rejection_kernel",
-        "3920098c7bd8c39df49c5ddd3a29ac5410b34589380ab5f45d595f2a9fc4a998",
+        "3d4dbcdc0d283809f462c8d9ebae30e2f477eab2baea07425692329a2e085a18",
         "ab95ffecb83ee24783fcfa2f1a52274a82888fc2763fd0669421935647b0ae5b",
-        "v0.25.1",
+        "7e6aceef36",
         _rejection_v2,
         ("num_warps",),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_resample_kernel",
-        "1b1246d50521edc32128655c5fc289d424b2ebba5aa785a98c16d6fb8439da53",
+        "7034a71604e0ed6a9c84668f40829d1344eb82e57aee897bf42bab9ce0ae4450",
         "2cb197288d2aabd1719d7dd1a599f48a5c059f1a8c4549196347eb95ea28af2a",
-        "v0.25.1",
+        "7e6aceef36",
         _rejection_resample,
         (),
     ),
@@ -1640,6 +1690,24 @@ _KERNELS: tuple[
         "v0.24.0",
         _rejection_insert,
         (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.dflash2.speculator",
+        "_selector_walk_kernel",
+        "4f35405bf300b137c3fcac12c9ba78efb2a2135c40e1f3b5abafa6ec8a374720",
+        "600d4f3329d7088336c4c2bbbea178eab7862f4f454c0fbd7ca5f9696be104ba",
+        "7e6aceef36",
+        _dflash2_selector_walk,
+        ("num_warps",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.dflash2.speculator",
+        "_cache_draft_logits_kernel",
+        "c024edcea71f86a71bc6eedb2f8d9764089cce65709673d0f40d704f9ac5df17",
+        "423da88d0a099305f654f9b17c52effe8f24128505c30b9630b9c71f92e4d2f1",
+        "7e6aceef36",
+        _dflash2_cache_draft_logits,
+        ("num_warps",),
     ),
     (
         "vllm.v1.sample.rejection_sampler",

@@ -114,7 +114,7 @@ def test_fake_triton_versions_are_literals_not_baseline_defaults():
         and node.target.id == "_KERNELS"
     )
     assert isinstance(manifest.value, ast.Tuple)
-    assert len(manifest.value.elts) == 47
+    assert len(manifest.value.elts) == 49
     assert all(
         isinstance(record, ast.Tuple)
         and isinstance(record.elts[4], ast.Constant)
