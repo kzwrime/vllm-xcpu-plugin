@@ -253,7 +253,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "1094d5116caa11a0fb49dd26c6f6c9c4d2b0de08f781abcec8aea21edf218111",
         "e78c65c5b4b4cb881b912ac288e342816961be7f9ff973fbb5a49b4dbf4b5fe5",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="7e6aceef36",
+        source_version="b389ac2946",
     ),
     _operator(
         "sample",
@@ -262,7 +262,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "aea83789f1de2c3fce3cd9dade9baaf3fe7eca7dd8ec0fcb3a73788d9ce4af07",
         "941e29daa4af9a8c903cab667a1bc8c277c332c8a5fe1e8e4425a87b2112d6e2",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="7e6aceef36",
+        source_version="b389ac2946",
     ),
     _operator(
         "sample",
@@ -271,7 +271,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "fab28fedc374d9fc532fcbcbad1bbf4db286199379234b9de56d93eee7fa74fd",
         "1b1e76557b629e78c3fc7aa4f65bc5a75a05b70d3b5d4405f66d1fbc4ff91127",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="7e6aceef36",
+        source_version="b389ac2946",
     ),
     _operator(
         "topk_topp",
@@ -325,7 +325,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "238266efc04dc1cda47c89ac89d14156989e500f0a163295e9771e5186b35a56",
         "32a56e99e045e5a031b623a3083fb1cc2144730a77ce113156bc0045fd38276c",
         "torch_xcpu.ops.dflash2_grouped_conv",
-        source_version="7e6aceef36",
+        source_version="b389ac2946",
     ),
     _operator(
         "qwen3_dflash2",
@@ -334,7 +334,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "f733826766f34777447b2de500c9fa74576f85afd6f3ad9c6be27e4175736106",
         "9eb583888e04087c87bb2a14ff69beb3933ca4a7de22a090b833a5d4e4fd6a2d",
         "torch_xcpu.ops.einsum_blpr_blcr_to_blpc",
-        source_version="7e6aceef36",
+        source_version="b389ac2946",
     ),
 )
 
