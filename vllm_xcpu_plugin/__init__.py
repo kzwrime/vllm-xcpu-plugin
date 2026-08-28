@@ -33,6 +33,7 @@ def register_ops():
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.dflash_patch import maybe_patch_dflash_inputs
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
+    from vllm_xcpu_plugin.qwen3_dflash2_patch import maybe_patch_qwen3_dflash2
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
     from vllm_xcpu_plugin.layers.quark_mxfp4 import (
@@ -58,6 +59,7 @@ def register_ops():
     # being installed for a model that needs them.
     install_optional_integration("GDN", maybe_patch_gdn_attention)
     install_optional_integration("DFlash", maybe_patch_dflash_inputs)
+    install_optional_integration("Qwen3 DFlash2", maybe_patch_qwen3_dflash2)
     install_optional_integration("FP8 linear", register_fp8_linear_kernel)
     install_optional_integration("MXFP4 linear", register_mxfp4_linear_kernel)
     install_optional_integration(
@@ -73,6 +75,7 @@ def register_ops():
     import vllm_xcpu_plugin.topk_patch as topk_patch
     import vllm_xcpu_plugin.sampler_patch as sampler_patch
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
+
     # import vllm_xcpu_plugin.mla_patch as mla_patch
     import vllm_xcpu_plugin.flashattn_mla_sparse_patch as flashattn_mla_sparse_patch
 
