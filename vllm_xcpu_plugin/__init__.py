@@ -78,6 +78,7 @@ def register_ops():
 
     # import vllm_xcpu_plugin.mla_patch as mla_patch
     import vllm_xcpu_plugin.flashattn_mla_sparse_patch as flashattn_mla_sparse_patch
+    import vllm_xcpu_plugin.flashattn_prefill_patch as flashattn_prefill_patch
 
     install_optional_integration(
         "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
@@ -94,4 +95,8 @@ def register_ops():
     install_optional_integration(
         "flashattn_mla_sparse",
         flashattn_mla_sparse_patch.maybe_patch_vllm_flashattn_mla_sparse,
+    )
+    install_optional_integration(
+        "flashattn_prefill",
+        flashattn_prefill_patch.maybe_patch_vllm_flashattn_prefill,
     )
