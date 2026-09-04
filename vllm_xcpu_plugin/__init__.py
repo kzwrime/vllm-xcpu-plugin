@@ -33,6 +33,7 @@ def register_ops():
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.dflash_patch import maybe_patch_dflash_inputs
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention
+    from vllm_xcpu_plugin.indexer_quant_patch import maybe_patch_indexer_quant
     from vllm_xcpu_plugin.qwen3_dflash2_patch import maybe_patch_qwen3_dflash2
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
@@ -65,6 +66,7 @@ def register_ops():
     install_optional_integration(
         "Quark MXFP4 W4A16 linear", register_quark_mxfp4_linear_scheme
     )
+    install_optional_integration("indexer quantization", maybe_patch_indexer_quant)
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.mm_encoder_attention  # noqa
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
@@ -78,6 +80,7 @@ def register_ops():
 
     # import vllm_xcpu_plugin.mla_patch as mla_patch
     import vllm_xcpu_plugin.flashattn_mla_sparse_patch as flashattn_mla_sparse_patch
+    import vllm_xcpu_plugin.flashattn_prefill_patch as flashattn_prefill_patch
 
     install_optional_integration(
         "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
@@ -94,4 +97,8 @@ def register_ops():
     install_optional_integration(
         "flashattn_mla_sparse",
         flashattn_mla_sparse_patch.maybe_patch_vllm_flashattn_mla_sparse,
+    )
+    install_optional_integration(
+        "flashattn_prefill",
+        flashattn_prefill_patch.maybe_patch_vllm_flashattn_prefill,
     )
