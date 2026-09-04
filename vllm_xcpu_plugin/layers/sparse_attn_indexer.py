@@ -117,6 +117,38 @@ def xcpu_indexer_decode(
     return output
 
 
+# TODO: impl as xcpu op
+@torch.library.custom_op(
+    "vllm_xcpu_plugin::indexer_insert_k", mutates_args=["kv_cache"]
+)
+def indexer_insert_k(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    head_dim: int,
+) -> None:
+    # Runs as a fallback kernel: inductor hands over the runtime tensor
+    # handles, so the (per-step varying) token count never enters the
+    # compiled graph as a static size.
+    slots_cpu = slot_mapping.flatten().cpu()
+    valid_token_indices_cpu = torch.nonzero(slots_cpu >= 0).flatten()
+    if valid_token_indices_cpu.numel() > 0:
+        valid_token_indices = valid_token_indices_cpu.to(device=k.device)
+        valid_slots = slots_cpu[valid_token_indices_cpu].to(device=k.device)
+        valid_k = torch.index_select(k, 0, valid_token_indices)
+        kv_cache.view(-1, head_dim).index_copy_(0, valid_slots, valid_k)
+
+
+@indexer_insert_k.register_fake
+def _(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    head_dim: int,
+) -> None:
+    return
+
+
 @SparseAttnIndexer.register_oot
 class XcpuSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -146,15 +178,15 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
         )
         assert isinstance(layer_metadata, DeepseekV32IndexerMetadata)
 
-        slots_cpu = layer_metadata.slot_mapping.flatten().cpu()
-        valid_token_indices_cpu = torch.nonzero(slots_cpu >= 0).flatten()
-        if valid_token_indices_cpu.numel() > 0:
-            valid_token_indices = valid_token_indices_cpu.to(device=k.device)
-            valid_slots = slots_cpu[valid_token_indices_cpu].to(device=k.device)
-            valid_k = torch.index_select(k, 0, valid_token_indices)
-            self.k_cache.kv_cache.view(-1, self.head_dim).index_copy_(
-                0, valid_slots, valid_k
-            )
+        # Kept behind the custom-op boundary: tracing the nonzero/index_copy
+        # chain would bake the compile-time token count into the graph as a
+        # static size and break reuse at other batch sizes.
+        indexer_insert_k(
+            k,
+            self.k_cache.kv_cache,
+            layer_metadata.slot_mapping,
+            self.k_cache.head_dim,
+        )
 
         if layer_metadata.prefill is not None:
             xcpu_indexer_prefill(
@@ -165,11 +197,19 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
                 output,
             )
         if layer_metadata.decode is not None:
+            if layer_metadata.prefill is None:
+                # Pure decode: the decode segment covers every row; derive the
+                # bound from the tensor shape so the compiled graph stays
+                # batch-size dynamic (equals num_decode_tokens here, whose
+                # metadata int is frozen at trace time).
+                num_decode_tokens = q_quant.shape[0]
+            else:
+                num_decode_tokens = layer_metadata.num_decode_tokens
             xcpu_indexer_decode(
-                q_quant[: layer_metadata.num_decode_tokens],
-                weights[: layer_metadata.num_decode_tokens],
+                q_quant[:num_decode_tokens],
+                weights[:num_decode_tokens],
                 self.k_cache.kv_cache,
                 layer_metadata.decode,
-                output[: layer_metadata.num_decode_tokens],
+                output[:num_decode_tokens],
             )
         return self.topk_indices_buffer
