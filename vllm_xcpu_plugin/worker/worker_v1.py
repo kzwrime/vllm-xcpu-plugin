@@ -196,7 +196,13 @@ class McpuWorker(Worker):
         import torch_xcpu
 
         num_pes = torch_xcpu.initialize_runtime()
-        logger.info("Initialized torch_xcpu runtime with %d xthd PEs.", num_pes)
+        num_compute_units = current_platform.num_compute_units(self.device.index)
+        logger.info(
+            "Initialized torch_xcpu runtime with %d xthd PEs; "
+            "device reports %d compute units for scheduling.",
+            num_pes,
+            num_compute_units,
+        )
 
         # Now take memory snapshot after NCCL is initialized
         gc.collect()

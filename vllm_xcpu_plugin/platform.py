@@ -33,6 +33,40 @@ class McpuPlatform(Platform):
     simple_compile_backend: str = "eager"
 
     @classmethod
+    def supports_sparse_attn_indexer_accelerated_path(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_sparse_attn_indexer_native_multi_token(cls) -> bool:
+        return True
+
+    @classmethod
+    def get_sparse_attn_indexer_metadata_shape(
+        cls, max_num_requests: int, max_model_len: int, num_sms: int
+    ) -> tuple[int, ...]:
+        max_splits = (max_model_len + 255) // 256
+        capacity = (max_num_requests * max_splits + num_sms - 1) // num_sms
+        return (num_sms, capacity + 1, 2)
+
+    @classmethod
+    def build_sparse_attn_indexer_metadata(
+        cls,
+        context_lens: torch.Tensor,
+        block_size: int,
+        num_sms: int,
+        output: torch.Tensor,
+    ) -> None:
+        import torch_xcpu  # noqa: F401
+
+        torch.ops.torch_xcpu.get_paged_mqa_logits_metadata_out(
+            context_lens, block_size, output
+        )
+
+    @classmethod
+    def get_sparse_mla_kernel_block_sizes(cls) -> list[int]:
+        return [64, 128]
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
@@ -296,7 +330,13 @@ class McpuPlatform(Platform):
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
-        return 4
+        # McpuWorker initializes torch_xcpu after thread/affinity setup and
+        # before constructing the model runner and attention metadata builders.
+        # The simulator reports its fixed xthd PE count; NPU builds own the
+        # hardware query in torch_xcpu_impl.
+        import torch_xcpu
+
+        return torch_xcpu.get_num_compute_units(device_id)
 
     @classmethod
     def memory_stats(cls, device_index=None, /) -> OrderedDict[str, Any]:
