@@ -20,29 +20,39 @@ def _xcpu_run_prefill_new_tokens(
     # v: [tokens, num_heads, v_head_dim], = 256
 
     import torch_xcpu  # noqa: E402
-    output = torch_xcpu.ops.attn_varlen_diff_headdims(
-        query=q,
-        key=k,
-        value=v,
-        cu_seqlens_q=self._prefill_metadata.query_start_loc,
-        cu_seqlens_k=self._prefill_metadata.query_start_loc,
-        is_causal=True,
-        scale=self.scale,
-        enable_gqa=False,
-    )
 
-    # Note: scaled_dot_product_attention_varlen is also usable
-    
-    # output = torch_xcpu.ops.scaled_dot_product_attention_varlen(
-    #     query=q,
-    #     key=k,
-    #     value=v,
-    #     cu_seqlens_q=self._prefill_metadata.query_start_loc,
-    #     cu_seqlens_k=self._prefill_metadata.query_start_loc,
-    #     is_causal=True,
-    #     scale=self.scale,
-    #     enable_gqa=False,
-    # )
+    # Note: scaled_dot_product_attention_varlen is faster and functionally equal with
+    # attn_varlen_diff_headdims (except that sparse_mla is not support in sdpa)
+    use_sdpa = True
+
+    if not use_sdpa:
+        # Note: maybe prefill backend needs to run with topk_indices_buffer,
+        # sparse_mla is supported in attn_varlen_diff_headdims
+
+        # logical_topk = getattr(self, "_xcpu_prefill_logical_topk", None)
+        output = torch_xcpu.ops.attn_varlen_diff_headdims(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens_q=self._prefill_metadata.query_start_loc,
+            cu_seqlens_k=self._prefill_metadata.query_start_loc,
+            is_causal=True,
+            scale=self.scale,
+            enable_gqa=False,
+            # logical_topk=logical_topk,
+        )
+    else: 
+        # TODO: maybe support sparse_mla
+        output = torch_xcpu.ops.scaled_dot_product_attention_varlen(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens_q=self._prefill_metadata.query_start_loc,
+            cu_seqlens_k=self._prefill_metadata.query_start_loc,
+            is_causal=True,
+            scale=self.scale,
+            enable_gqa=False,
+        )
 
     return output
 
@@ -57,4 +67,4 @@ def maybe_patch_vllm_flashattn_prefill() -> None:
         return
     prefill_any.is_available = _xcpu_is_available
     prefill_any.run_prefill_new_tokens = _xcpu_run_prefill_new_tokens
-    prefill_any._xcpu_flashattn_mla_sparse_patched = True
+    prefill_any._xcpu_flash_attn_prefill_patched = True

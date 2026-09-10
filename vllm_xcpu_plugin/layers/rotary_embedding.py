@@ -41,6 +41,54 @@ class XcpuRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
+    def mla_qk_rope_out(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k_pe: torch.Tensor,
+        q_rotary_offset: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Out-of-place RoPE for the MLA q_b output and the qkv_a rope slice.
+
+        The in-place ``forward_oot`` mutates views of the q_b / qkv_a GEMM
+        outputs; under torch.compile AOTAutograd functionalizes those
+        mutations into compiler generated clone/cat copy kernels. This variant
+        keeps the copy + rotate layout inside a single torch_xcpu op so the
+        compiled graph stays free of inductor copy kernels.
+        """
+        cos_sin_cache = self._match_cos_sin_cache_dtype(q)
+
+        import torch_xcpu
+
+        return torch_xcpu.ops.rotary_embedding_mla_qk(
+            positions,
+            q,
+            k_pe,
+            cos_sin_cache,
+            self.is_neox_style,
+            q_rotary_offset,
+        )
+
+    def indexer_k_rope_out(
+        self, positions: torch.Tensor, k: torch.Tensor
+    ) -> torch.Tensor:
+        """Out-of-place RoPE for the sparse-indexer MQA K.
+
+        Returns the rotated K directly (rope columns first, pass-through
+        columns after), replacing the in-place rope on a k_norm view plus the
+        follow-up ``torch.cat`` of the rotated/pass-through halves.
+        """
+        cos_sin_cache = self._match_cos_sin_cache_dtype(k)
+
+        import torch_xcpu
+
+        return torch_xcpu.ops.rotary_embedding_indexer_k(
+            positions,
+            k,
+            cos_sin_cache,
+            self.is_neox_style,
+        )
+
 
 @Llama3RotaryEmbedding.register_oot
 class XcpuLlama3RotaryEmbedding(Llama3RotaryEmbedding):
