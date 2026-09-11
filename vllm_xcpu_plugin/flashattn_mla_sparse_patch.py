@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Keep vLLM scheduling/cache ownership; bind XCPU metadata and attention together."""
+
+from dataclasses import dataclass
+from functools import wraps
 from typing import Any, cast
 
 import torch
@@ -6,6 +10,12 @@ from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
     FlashAttnMLASparseMetadata,
 )
+
+
+@dataclass
+class XcpuFlashAttnMLASparseMetadata(FlashAttnMLASparseMetadata):
+    xcpu_backend: Any = None
+    xcpu_schedule: Any = None
 
 
 def _xcpu_do_kv_cache_update(
@@ -19,82 +29,16 @@ def _xcpu_do_kv_cache_update(
 ) -> None:
     if kv_cache.numel() == 0:
         return
-
     import torch_xcpu
 
     torch_xcpu.ops.reshape_and_cache(
         kv_c_normed,  # [tokens, kv_lora_rank]
         k_pe.squeeze(1),  # [tokens, qk_rope]
-        kv_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope]
+        # Unquantized: [blocks, page_size, rank + rope]; FP8: [..., 656] bytes
+        kv_cache,
         slot_mapping.flatten(),
         kv_cache_dtype=kv_cache_dtype,
     )
-
-
-def _xcpu_sparse_mla_attention(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    logical_topk: torch.Tensor,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    scale: float,
-    value_dim: int,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    """Dispatch experimental paged sparse MLA prefill and decode kernels."""
-    query_starts = query_start_loc.cpu().tolist()
-    query_lens = [end - start for start, end in zip(query_starts, query_starts[1:])]
-    num_decodes = 0
-    while num_decodes < len(query_lens) and query_lens[num_decodes] == 1:
-        num_decodes += 1
-    if any(query_len == 1 for query_len in query_lens[num_decodes:]):
-        raise NotImplementedError(
-            "XCPU experimental sparse MLA requires decode requests before prefills"
-        )
-
-    assert q.shape[0] == query_starts[-1]
-    assert output.shape == (q.shape[0], q.shape[1], value_dim)
-    logical_topk = logical_topk[: q.shape[0]]
-
-    import torch_xcpu
-
-    if num_decodes:
-        torch_xcpu.ops.sparse_mla_decode(
-            q[:num_decodes].contiguous(),
-            kv_cache,
-            logical_topk[:num_decodes].contiguous(),
-            block_table[:num_decodes].contiguous(),
-            seq_lens[:num_decodes].contiguous(),
-            scale,
-            output[:num_decodes].contiguous(),
-        )
-
-    num_decode_tokens = query_starts[num_decodes]
-    if num_decode_tokens < q.shape[0]:
-        request_ids = [
-            request_idx
-            for request_idx, query_len in enumerate(query_lens)
-            for _ in range(query_len)
-        ]
-        req_id_per_token = torch.tensor(
-            request_ids[num_decode_tokens:],
-            dtype=torch.int32,
-            device=q.device,
-        )
-        torch_xcpu.ops.sparse_mla_prefill(
-            q[num_decode_tokens:].contiguous(),
-            kv_cache,
-            logical_topk[num_decode_tokens:].contiguous(),
-            block_table.contiguous(),
-            req_id_per_token,
-            query_start_loc.contiguous(),
-            seq_lens.contiguous(),
-            num_decode_tokens,
-            scale,
-            output[num_decode_tokens:].contiguous(),
-        )
-    return output
 
 
 def _xcpu_forward_mqa(
@@ -106,79 +50,131 @@ def _xcpu_forward_mqa(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if not isinstance(q, tuple):
         raise NotImplementedError(
-            "FlashAttnMLASparseImpl expects split (q_nope, q_rope) input."
+            "FlashAttnMLASparseImpl expects split (q_nope, q_rope)"
         )
-
     q_nope, q_rope = q
-    q = torch.cat((q_nope, q_rope), dim=-1)
-    output = torch.empty_like(q_nope)
-
+    # [tokens, heads, kv_lora_rank + qk_rope]
+    query = torch.cat((q_nope, q_rope), dim=-1)
+    output = torch.empty_like(q_nope)  # [tokens, heads, kv_lora_rank]
     logical_topk = None
     if self.is_sparse and attn_metadata.max_seq_len > attn_metadata.topk_tokens:
         assert self.topk_indices_buffer is not None
-        use_sparse_unified_attention = True
-        if use_sparse_unified_attention:
-            logical_topk = self.topk_indices_buffer[: q.shape[0]].contiguous()
-            import torch_xcpu
+        logical_topk = self.topk_indices_buffer[: query.shape[0]]
 
-            torch_xcpu.ops.unified_attention(
-                q=q,  # [tokens, q_num_heads, kv_lora_rank + qk_rope]
-                kv=kv_c_and_k_pe_cache,
-                out=output,  # [tokens, q_num_heads, kv_lora_rank]
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                seqused_k=attn_metadata.seq_lens,
-                softmax_scale=self.scale,
-                window_size=0,
-                block_table=attn_metadata.block_table,
-                logical_topk=logical_topk,
-                kv_cache_dtype=self.kv_cache_dtype,
+    if self.kv_cache_dtype == "fp8_ds_mla":
+        attn_metadata = cast(XcpuFlashAttnMLASparseMetadata, attn_metadata)
+        backend = attn_metadata.xcpu_backend
+        if backend is None or attn_metadata.xcpu_schedule is None:
+            raise RuntimeError(
+                "FP8 sparse MLA metadata must be built before layer execution"
             )
-        else:
-            _xcpu_sparse_mla_attention(
-                q,
-                kv_c_and_k_pe_cache,
-                self.topk_indices_buffer,
-                attn_metadata.block_table,
-                attn_metadata.query_start_loc,
-                attn_metadata.seq_lens,
-                self.scale,
-                self.kv_lora_rank,
-                output,
-            )
+        backend.run(
+            query,
+            kv_c_and_k_pe_cache,
+            logical_topk,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            self.scale,
+            output,
+            attn_metadata.xcpu_schedule,
+            max_query_len=attn_metadata.max_query_len,
+            max_seq_len=attn_metadata.max_seq_len,
+        )
     else:
-        cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_q = attn_metadata.max_query_len
-        block_table = attn_metadata.block_table
+        import torch_xcpu
 
-        import torch_xcpu  # noqa: E402
-
+        # The legacy kernel supports row stride, but requires unit column stride.
+        if logical_topk is not None:
+            logical_topk = logical_topk.contiguous()
         torch_xcpu.ops.unified_attention(
-            q=q,  # [tokens, q_num_heads, kv_lora_rank + qk_rope]
-            kv=kv_c_and_k_pe_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope]
+            q=query,  # [tokens, q_num_heads, kv_lora_rank + qk_rope]
+            kv=kv_c_and_k_pe_cache,
             out=output,  # [tokens, q_num_heads, kv_lora_rank]
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
             softmax_scale=self.scale,
             window_size=0,
-            block_table=block_table,
+            block_table=attn_metadata.block_table,
             logical_topk=logical_topk,
             kv_cache_dtype=self.kv_cache_dtype,
         )
-
     return output, None
 
 
 def maybe_patch_vllm_flashattn_mla_sparse() -> None:
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseImpl,
+        FlashAttnMLASparseMetadataBuilder,
     )
 
-    sparse_any = cast(Any, FlashAttnMLASparseImpl)
-    if getattr(sparse_any, "_xcpu_flashattn_mla_sparse_patched", False):
+    impl_cls = cast(Any, FlashAttnMLASparseImpl)
+    if getattr(impl_cls, "_xcpu_flashattn_mla_sparse_patched", False):
         return
-    sparse_any.do_kv_cache_update = _xcpu_do_kv_cache_update
-    sparse_any.forward_mqa = _xcpu_forward_mqa
-    sparse_any._xcpu_flashattn_mla_sparse_patched = True
+    builder_cls = cast(Any, FlashAttnMLASparseMetadataBuilder)
+    original_init = builder_cls.__init__
+    original_build = builder_cls.build
+
+    @wraps(original_init)
+    def initialize_builder(self, kv_cache_spec, layer_names, vllm_config, device):
+        original_init(self, kv_cache_spec, layer_names, vllm_config, device)
+        self._xcpu_backend = None
+        self._xcpu_buffers = None
+        if vllm_config.cache_config.cache_dtype in (
+            "fp8",
+            "fp8_e4m3",
+            "fp8_ds_mla",
+        ):
+            import torch_xcpu
+
+            dims = self.mla_dims
+            if dims.kv_lora_rank != 512 or dims.qk_rope_head_dim != 64:
+                raise NotImplementedError(
+                    "XCPU FP8 sparse MLA supports GLM5.2 D576/V512"
+                )
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.decode_context_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+            ):
+                raise NotImplementedError("XCPU FP8 sparse MLA requires DCP=PCP=1")
+            heads = self.model_config.get_num_attention_heads(parallel)
+            self.metadata_cls = XcpuFlashAttnMLASparseMetadata
+            self._xcpu_backend = torch_xcpu.ops.SparseMlaFp8(heads)
+            self._xcpu_buffers = self._xcpu_backend.allocate_metadata(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                device,
+            )
+
+    @wraps(original_build)
+    def build_metadata(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = original_build(
+            self, common_prefix_len, common_attn_metadata, fast_build
+        )
+        if self._xcpu_backend is not None:
+            # vLLM computes this CPU flag from computed_tokens < prompt_tokens.
+            # Query length and num_prefills describe kernel grouping, not phase.
+            is_prefilling = common_attn_metadata.is_prefilling
+            if is_prefilling is None or is_prefilling.device.type != "cpu":
+                raise ValueError(
+                    "XCPU sparse MLA requires vLLM CPU is_prefilling metadata"
+                )
+            has_prefill = bool(
+                is_prefilling[: common_attn_metadata.num_reqs].any().item()
+            )
+            metadata.xcpu_backend = self._xcpu_backend
+            metadata.xcpu_schedule = self._xcpu_backend.build_metadata(
+                metadata.query_start_loc,
+                metadata.num_actual_tokens,
+                query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+                has_prefill=has_prefill,
+                buffers=self._xcpu_buffers,
+                kv_slots_hint=min(metadata.max_seq_len, metadata.topk_tokens),
+            )
+        return metadata
+
+    builder_cls.__init__ = initialize_builder
+    builder_cls.build = build_metadata
+    impl_cls.do_kv_cache_update = _xcpu_do_kv_cache_update
+    impl_cls.forward_mqa = _xcpu_forward_mqa
+    impl_cls._xcpu_flashattn_mla_sparse_patched = True
