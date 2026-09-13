@@ -44,9 +44,12 @@ class McpuPlatform(Platform):
     def get_sparse_attn_indexer_metadata_shape(
         cls, max_num_requests: int, max_model_len: int, num_sms: int
     ) -> tuple[int, ...]:
-        max_splits = (max_model_len + 255) // 256
-        capacity = (max_num_requests * max_splits + num_sms - 1) // num_sms
-        return (num_sms, capacity + 1, 2)
+        from torch_xcpu.ops_defs.sparse_indexer import (
+            get_paged_mqa_logits_metadata_shape,
+        )
+
+        return get_paged_mqa_logits_metadata_shape(
+            max_num_requests, max_model_len, num_sms)
 
     @classmethod
     def build_sparse_attn_indexer_metadata(
