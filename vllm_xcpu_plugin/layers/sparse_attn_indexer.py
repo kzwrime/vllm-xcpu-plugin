@@ -3,17 +3,20 @@
 """Install XCPU kernels into vLLM's original sparse-indexer operator chain.
 
 This module intentionally defines no ``SparseAttnIndexer`` subclass and does
-not register an out-of-tree replacement layer.  vLLM keeps ownership of cache
-insertion, prefill chunking, workspace allocation, metadata, logits lifetime,
-TopK invocation and output merging.  We patch only the exact kernel functions
-that ``vllm/model_executor/layers/sparse_attn_indexer.py`` already calls.
+not register an out-of-tree replacement layer. vLLM keeps ownership of
+prefill chunking, workspace allocation, metadata, logits lifetime, TopK
+invocation and output merging. This module binds the named XCPU kernels and
+installs BF16 Q / fused K preprocessing for DeepSeek V3.2 and GLM DSA.
 """
 
 from __future__ import annotations
 
+import functools
+import os
 import sys
 
 import torch
+from vllm.forward_context import get_forward_context
 
 
 def _require_supported_q(q: torch.Tensor, *, topk: int | None = None) -> None:
@@ -150,20 +153,8 @@ def _unpack_seq_triton(packed_tensor, lengths, block_t=64, block_d=64):
         dtype=packed_tensor.dtype,
         device=packed_tensor.device,
     )
-    torch.ops.torch_xcpu.sparse_indexer_pack_seq(
-        packed_tensor, lengths, output, True
-    )
+    torch.ops.torch_xcpu.sparse_indexer_pack_seq(packed_tensor, lengths, output, True)
     return output
-
-
-def _get_paged_mqa_logits_metadata(
-    context_lens: torch.Tensor, block_size: int, num_sms: int, max_model_len: int
-) -> torch.Tensor:
-    import torch_xcpu
-
-    return torch_xcpu.ops.get_paged_mqa_logits_metadata(
-        context_lens, block_size, num_sms, max_model_len
-    )
 
 
 def _fp8_fp4_paged_mqa_logits(
@@ -242,8 +233,119 @@ def _fused_indexer_q_rope_quant_deepseek_v4(
     )
 
 
+@torch.library.custom_op("vllm_xcpu::indexer_k_cache", mutates_args=("cache",))
+def _indexer_k_cache(
+    k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    cache: torch.Tensor,
+    prefix: str,
+    eps: float,
+    is_neox: bool,
+) -> None:
+    # Resolve per-step metadata inside the opaque op, including after compile.
+    metadata = get_forward_context().attn_metadata
+    # Profiling has no slot mapping, so it must not write to the K cache.
+    if metadata is None:
+        return
+    assert isinstance(metadata, dict)
+    import torch_xcpu
+
+    torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
+        k,
+        weight,
+        bias,
+        positions,
+        cos_sin,
+        metadata[prefix].slot_mapping,
+        cache,
+        eps,
+        is_neox,
+    )
+
+
+@_indexer_k_cache.register_fake
+def _indexer_k_cache_fake(
+    k, weight, bias, positions, cos_sin, cache, prefix, eps, is_neox
+):
+    return None
+
+
+def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
+    import torch_xcpu
+
+    q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
+    kw = self.wk_weights_proj(hidden_states)[0]
+    k, weights = kw[:, : self.head_dim], kw[:, self.head_dim :]
+    q, weights = torch_xcpu.ops.fused_indexer_q_rope_quant(
+        positions,
+        q,
+        rotary_emb.cos_sin_cache,
+        weights,
+        self.softmax_scale,
+        self.n_head_scale,
+        rotary_emb.is_neox_style,
+        False,
+    )
+    if self._xcpu_fuse_k_cache:
+        _indexer_k_cache(
+            k,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            positions,
+            rotary_emb.cos_sin_cache,
+            self.k_cache.kv_cache,
+            self.k_cache.prefix,
+            self.k_norm.eps,
+            rotary_emb.is_neox_style,
+        )
+    else:
+        # Reference path for A/B validation; Q remains BF16 on both paths.
+        k = self.k_norm(k)
+        k_pe = k[:, : self.rope_dim].unsqueeze(1)
+        _, k_pe = rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        k = torch.cat((k_pe.reshape(-1, self.rope_dim), k[:, self.rope_dim :]), dim=-1)
+
+    # Reuse upstream scheduling/logits/TopK with XCPU kernel bindings. Calling
+    # the shared implementation explicitly avoids CustomOp's CUDA-only native
+    # dispatch guard on OOT platforms.
+    return self.indexer_op.forward_cuda(hidden_states, q, k, weights)
+
+
+def _install_indexer_preprocessing() -> None:
+    from vllm.model_executor.models.deepseek_v2 import Indexer
+
+    if getattr(Indexer, "_xcpu_preprocessing_installed", False):
+        return
+    original_init = Indexer.__init__
+
+    @functools.wraps(original_init)
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        parallel = self.vllm_config.parallel_config
+        if (
+            parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "XCPU DSA indexer preprocessing requires PCP=DCP=1"
+            )
+        if self.head_dim != 128 or self.rope_dim != 64 or self.n_head not in (32, 64):
+            raise NotImplementedError(
+                "XCPU DSA indexer requires H={32,64}, D=128, RoPE=64"
+            )
+        self._xcpu_fuse_k_cache = os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        self.indexer_op.skip_k_cache_insert = self._xcpu_fuse_k_cache
+
+    Indexer.__init__ = initialize
+    Indexer.forward = _indexer_forward
+    Indexer._xcpu_preprocessing_installed = True
+
+
 def maybe_patch_vllm_sparse_attn_indexer() -> None:
-    """Patch only the named kernel functions in vLLM's original chain."""
+    """Install sparse-indexer kernels and model preprocessing."""
 
     import vllm._custom_ops as ops
     import vllm.model_executor.layers.sparse_attn_indexer as indexer_module
@@ -291,4 +393,5 @@ def maybe_patch_vllm_sparse_attn_indexer() -> None:
             _fused_indexer_q_rope_quant_deepseek_v4
         )
 
+    _install_indexer_preprocessing()
     indexer_module._xcpu_sparse_kernel_patch_installed = True
