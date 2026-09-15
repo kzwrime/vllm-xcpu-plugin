@@ -96,6 +96,7 @@ def _top_k_per_row_prefill(
     stride0: int,
     stride1: int,
     topk_tokens: int,
+    seq_lens_cpu: torch.Tensor | None = None,
 ) -> None:
     import torch_xcpu
 
@@ -108,6 +109,7 @@ def _top_k_per_row_prefill(
         stride0,
         stride1,
         topk_tokens,
+        seq_lens_cpu,
     )
 
 
@@ -120,6 +122,7 @@ def _top_k_per_row_decode(
     stride0: int,
     stride1: int,
     topk_tokens: int,
+    seq_lens_cpu: torch.Tensor | None = None,
 ) -> None:
     del next_n
     import torch_xcpu
@@ -132,6 +135,7 @@ def _top_k_per_row_decode(
         stride0,
         stride1,
         topk_tokens,
+        seq_lens_cpu,
     )
 
 
