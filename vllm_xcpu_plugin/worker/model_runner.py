@@ -11,6 +11,8 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+import vllm_xcpu_plugin.envs as envs_xcpu
+
 if TYPE_CHECKING:
     pass
 
@@ -41,6 +43,34 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
     ):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        self._af_forward_allreduce = envs_xcpu.VLLM_XCPU_AF_FORWARD_ALLREDUCE
+
+    def execute_model(
+        self,
+        scheduler_output,
+        intermediate_tensors=None,
+        dummy_run=False,
+        skip_attn_for_dummy_run=False,
+        is_profile=False,
+    ):
+        if self._af_forward_allreduce and (
+            dummy_run or scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            from vllm_xcpu_plugin.af_ep.attn.runtime import (
+                get_remote_experts_client,
+            )
+
+            client = get_remote_experts_client()
+            if client is not None:
+                client.sync_forward_entry()
+
+        return super().execute_model(
+            scheduler_output,
+            intermediate_tensors,
+            dummy_run,
+            skip_attn_for_dummy_run,
+            is_profile,
+        )
 
 
 @contextmanager

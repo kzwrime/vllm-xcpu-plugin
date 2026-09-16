@@ -72,7 +72,29 @@ class XcpuRoutedExperts(RoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
+        from vllm_xcpu_plugin.af_ep.attn.runtime import get_remote_experts_client
+
+        af_client = get_remote_experts_client()
+        if af_client is not None:
+            from vllm_xcpu_plugin.af_ep.attn.remote_fused_moe import (
+                RemoteExpertsFusedMoEMethod,
+            )
+
+            return RemoteExpertsFusedMoEMethod(
+                moe_config,
+                layer_name=prefix,
+                client=af_client,
+            )
         upstream = super()._get_quant_method(prefix, quant_config, moe_config)
         if current_platform.device_name != "mcpu":
             return upstream
         return xcpu_moe_method_factory(upstream, quant_config, self)
+
+    def load_weights(self, weights):
+        from vllm_xcpu_plugin.af_ep.attn.remote_fused_moe import (
+            RemoteExpertsFusedMoEMethod,
+        )
+
+        if isinstance(self.quant_method, RemoteExpertsFusedMoEMethod):
+            return self.quant_method.skip_checkpoint_weights(weights)
+        return super().load_weights(weights)

@@ -42,7 +42,8 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
         # Their Experts stage performs the destination-local weighted reduce;
         # Finalize then sums only one partial per destination rank.
         self.topk_reduce = not parallel_config.use_ep or (
-            parallel_config.all2all_backend in {"mpi_alltoallv_v5", "mpi_alltoallv_v6"}
+            parallel_config.all2all_backend
+            in {"mpi_alltoallv_v5", "mpi_alltoallv_v6", "mpi_alltoallv_v7"}
         )
         backend_type = fused_moe.backend_type
         logger.warning_once(

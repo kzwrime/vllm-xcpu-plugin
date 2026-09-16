@@ -31,6 +31,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
+    # Enable XCPU AF-EP. Topology is derived from vLLM and the MPMD MPI world.
+    "VLLM_XCPU_ENABLE_AF_EP": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0"))
+    ),
+    # Optional global diagnostic barrier at every full A/F model pass entry.
+    "VLLM_XCPU_AF_FORWARD_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_XCPU_AF_FORWARD_ALLREDUCE", "0"))
+    ),
     # Maximum number of hidden-state tokens that mpi_alltoallv v4 prepare may
     # receive on each rank. A non-positive value keeps the legacy derived size.
     "VLLM_XCPU_MOE_MAX_RECV_TOKENS": lambda: int(

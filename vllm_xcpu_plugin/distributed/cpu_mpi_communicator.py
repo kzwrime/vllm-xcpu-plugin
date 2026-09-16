@@ -18,6 +18,7 @@ MPI_ALLTOALLV_BACKENDS = {
     "mpi_alltoallv_v4",
     "mpi_alltoallv_v5",
     "mpi_alltoallv_v6",
+    "mpi_alltoallv_v7",
 }
 
 
@@ -44,30 +45,34 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         assert num_ranks > 0
         logger.info("num_ranks: %d", num_ranks)
 
-        mpi_global_rank = MPI.COMM_WORLD.Get_rank()
+        from vllm_xcpu_plugin.distributed.mpi_world import require_mpi_world
 
-        global_rank_tensor = torch.tensor([mpi_global_rank], dtype=torch.int32)
+        mpi_world = require_mpi_world()
+        cluster_world_comm = mpi_world.cluster_comm
+        mpi_cluster_rank = cluster_world_comm.Get_rank()
+
+        cluster_rank_tensor = torch.tensor([mpi_cluster_rank], dtype=torch.int32)
 
         group_ranks_ = torch.zeros(num_ranks, dtype=torch.int32)
         dist.all_gather_into_tensor(
-            group_ranks_, global_rank_tensor, group=self.cpu_group
+            group_ranks_, cluster_rank_tensor, group=self.cpu_group
         )
         group_ranks = group_ranks_.tolist()
         logger.info("[%d] group_ranks: %s", self.global_rank, str(group_ranks))
         # mpi_group = MPI.COMM_WORLD.group.Incl(group_ranks)
         # self.mpi_group_comm = MPI.Intracomm.Create_from_group(mpi_group)
 
-        min_rank_in_group_ = torch.tensor([mpi_global_rank], dtype=torch.int32)
+        min_rank_in_group_ = torch.tensor([mpi_cluster_rank], dtype=torch.int32)
 
         dist.all_reduce(min_rank_in_group_, op=dist.ReduceOp.MIN, group=self.cpu_group)
         min_rank_in_group = int(min_rank_in_group_.item())
-        logger.info("[%d] min_rank_in_group: %d", mpi_global_rank, min_rank_in_group)
-        self.mpi_group_comm = MPI.COMM_WORLD.Split(min_rank_in_group)
+        logger.info("[%d] min_rank_in_group: %d", mpi_cluster_rank, min_rank_in_group)
+        self.mpi_group_comm = cluster_world_comm.Split(min_rank_in_group)
         group_ranks_verify = torch.zeros(num_ranks, dtype=torch.int32)
-        self.mpi_group_comm.Allgather(global_rank_tensor, group_ranks_verify)
+        self.mpi_group_comm.Allgather(cluster_rank_tensor, group_ranks_verify)
         logger.info(
             "[%d] group_ranks_verify: %s",
-            mpi_global_rank,
+            mpi_cluster_rank,
             str(group_ranks_verify.tolist()),
         )
 
@@ -85,6 +90,11 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         )
 
         if self.use_all2all:
+            if self.all2all_backend == "mpi_alltoallv_v7":
+                import vllm_xcpu_plugin.envs as envs_xcpu
+
+                if not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP:
+                    raise ValueError("mpi_alltoallv_v7 requires AF-EP")
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":

@@ -3,7 +3,7 @@
 import gc
 import os
 from contextlib import nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.envs as envs
@@ -21,6 +21,9 @@ from vllm.v1.worker.workspace import clear_workspace, init_workspace_manager
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 from .model_runner import McpuModelRunner, McpuModelRunnerV2
+
+if TYPE_CHECKING:
+    from vllm_xcpu_plugin.af_ep.attn.runtime import ExpertsClient
 
 logger = init_logger(__name__)
 
@@ -41,6 +44,7 @@ class McpuWorker(Worker):
         super().__init__(
             vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
         )
+        self._af_client: ExpertsClient | None = None
         device_config = self.device_config
         print(f"device_config: {device_config}")
         assert device_config.device_type == "privateuseone"
@@ -100,17 +104,33 @@ class McpuWorker(Worker):
         )
 
         if envs_xcpu.VLLM_CPU_USE_MPI:
-            import mpi4py.rc
+            from vllm_xcpu_plugin.distributed.mpi_world import (
+                ClusterType,
+                initialize_mpi_world,
+            )
 
-            mpi4py.rc.initialize = False
-            mpi4py.rc.finalize = False
+            mpi_world = initialize_mpi_world(ClusterType.ATTN)
             from mpi4py import MPI
 
-            if not MPI.Is_initialized():
-                MPI.Init()
             self.mpi_finalize = MPI.Finalize
             self.mpi_initialized = True
-            self.mpi_world_comm = MPI.COMM_WORLD
+            if envs_xcpu.VLLM_XCPU_ENABLE_AF_EP:
+                from vllm_xcpu_plugin.af_ep.attn.bootstrap import (
+                    bootstrap_attention_worker,
+                )
+
+                self._af_client = bootstrap_attention_worker(
+                    mpi_world=mpi_world,
+                    vllm_config=self.vllm_config,
+                    model_world_rank=world_rank_across_dp,
+                    model_world_size=world_size_across_dp,
+                )
+                logger.info(
+                    "AF-EP attention runtime initialized: world_rank=%d model_rank=%d",
+                    mpi_world.global_rank,
+                    world_rank_across_dp,
+                )
+            self.mpi_world_comm = mpi_world.cluster_comm
 
             # mpi_rank = self.mpi_world_comm.Get_rank()
             # mpi_size = self.mpi_world_comm.Get_size()
@@ -235,6 +255,14 @@ class McpuWorker(Worker):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        if self._af_client is not None:
+            config = self.model_config.hf_text_config
+            self._af_client.initialize(
+                config.hidden_size, config.num_experts_per_tok, self.model_config.dtype
+            )
+
     def determine_available_memory(self) -> int:
         available_memory = super().determine_available_memory()
 
@@ -269,4 +297,12 @@ class McpuWorker(Worker):
         return kv_cache_space_bytes
 
     def shutdown(self):
-        return
+        if self._af_client is not None:
+            from vllm_xcpu_plugin.af_ep.attn.runtime import (
+                unregister_remote_experts_client,
+            )
+
+            # Only detach Python registration. MPI cleanup needs all A/F ranks
+            # to stop together and must not run from this local shutdown hook.
+            unregister_remote_experts_client(self._af_client)
+            self._af_client = None
