@@ -8,6 +8,8 @@ from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 @RotaryEmbedding.register_oot
 class XcpuRotaryEmbedding(RotaryEmbedding):
+    supports_mla_rope_kvcache_fusion = True
+
     def __init__(
         self,
         head_size: int,
