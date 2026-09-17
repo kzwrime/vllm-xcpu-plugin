@@ -94,7 +94,7 @@ def _xcpu_forward_mqa(
     query = torch.cat((q_nope, q_rope), dim=-1)
     output = torch.empty_like(q_nope)  # [tokens, heads, kv_lora_rank]
     logical_topk = None
-    if self.is_sparse and attn_metadata.max_seq_len > attn_metadata.topk_tokens:
+    if self.is_sparse:
         assert self.topk_indices_buffer is not None
         logical_topk = self.topk_indices_buffer[: query.shape[0]]
 
