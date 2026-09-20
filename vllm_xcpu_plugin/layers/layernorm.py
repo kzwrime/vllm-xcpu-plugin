@@ -24,6 +24,36 @@ class XcpuLayerNorm(LayerNorm):
 
 @GemmaRMSNorm.register_oot
 class XcpuGemmaRMSNorm(GemmaRMSNorm):
+    @property
+    def supports_packed_residual(self) -> bool:
+        # A delayed aux sum must not bypass native dispatch or hooks that may
+        # observe/change the inputs and outputs at the original norm boundary.
+        from torch.nn.modules import module
+
+        return (
+            self._forward_method == self.forward_oot
+            and not self._forward_pre_hooks
+            and not self._forward_hooks
+            and not module._global_forward_pre_hooks
+            and not module._global_forward_hooks
+        )
+
+    def forward_with_residual_out(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        residual_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch_xcpu.ops as ops
+
+        return ops.gemma_rms_norm(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            residual,
+            residual_out=residual_out,
+        )
+
     def forward_oot(
         self,
         x: torch.Tensor,
