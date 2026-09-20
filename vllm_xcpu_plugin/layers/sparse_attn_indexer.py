@@ -38,12 +38,12 @@ def _indexer_k_quant_and_cache(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: str,
+    kv_cache_dtype: str,
 ) -> None:
     import torch_xcpu
 
     torch_xcpu.ops.indexer_k_quant_and_cache(
-        k, kv_cache, slot_mapping, quant_block_size, scale_fmt
+        k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
     )
 
 
@@ -215,10 +215,10 @@ def _fused_indexer_q_rope_quant_glm(
 def _fused_indexer_q_rope_quant_deepseek_v4(
     positions: torch.Tensor,
     index_q: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weights: torch.Tensor,
-    softmax_scale: float,
-    head_scale: float,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
     use_fp4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if use_fp4:
@@ -228,10 +228,10 @@ def _fused_indexer_q_rope_quant_deepseek_v4(
     return torch_xcpu.ops.fused_indexer_q_rope_quant(
         positions,
         index_q,
-        cos_sin_cache,
-        weights,
-        softmax_scale,
-        head_scale,
+        index_q_cos_sin_cache,
+        index_weights,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
         False,
         True,
     )
@@ -255,6 +255,10 @@ def _indexer_k_cache(
     if metadata is None:
         return
     assert isinstance(metadata, dict)
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+
+    layer_metadata = metadata[prefix]
+    assert isinstance(layer_metadata, DeepseekV32IndexerMetadata)
     import torch_xcpu
 
     torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
@@ -263,7 +267,7 @@ def _indexer_k_cache(
         bias,
         positions,
         cos_sin,
-        metadata[prefix].slot_mapping,
+        layer_metadata.slot_mapping,
         cache,
         eps,
         is_neox,
@@ -343,8 +347,8 @@ def _install_indexer_preprocessing() -> None:
         self._xcpu_fuse_k_cache = os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
         self.indexer_op.skip_k_cache_insert = self._xcpu_fuse_k_cache
 
-    Indexer.__init__ = initialize
-    Indexer.forward = _indexer_forward
+    Indexer.__init__ = initialize  # type: ignore[method-assign]
+    Indexer.forward = _indexer_forward  # type: ignore[method-assign]
     Indexer._xcpu_preprocessing_installed = True
 
 
@@ -398,4 +402,4 @@ def maybe_patch_vllm_sparse_attn_indexer() -> None:
         )
 
     _install_indexer_preprocessing()
-    indexer_module._xcpu_sparse_kernel_patch_installed = True
+    indexer_module._xcpu_sparse_kernel_patch_installed = True  # type: ignore[attr-defined]
