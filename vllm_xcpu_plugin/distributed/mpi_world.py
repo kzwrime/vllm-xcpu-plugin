@@ -1,4 +1,4 @@
-"""MPI process-world discovery for typed MPMD application clusters."""
+"""MPI process-world discovery for Attention and MoE role clusters."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class ClusterType(IntEnum):
 
 @dataclass(frozen=True)
 class MpiCluster:
-    """One executable group in the current MPMD MPI world."""
+    """One role group in the current MPI world."""
 
     instance_id: int
     cluster_type: ClusterType
@@ -72,7 +72,7 @@ def initialize_mpi():
 
 
 def initialize_mpi_world(cluster_type: ClusterType) -> MpiWorld:
-    """Discover process domains in the currently supported MPMD MPI world."""
+    """Split the global MPI world into Attention and MoE role domains."""
     global _MPI_WORLD
     cluster_type = ClusterType(cluster_type)
     if _MPI_WORLD is not None:
@@ -86,13 +86,10 @@ def initialize_mpi_world(cluster_type: ClusterType) -> MpiWorld:
         f"thread_provided={mpi.Query_thread()}",
         flush=True,
     )
-    cluster_instance_id = global_comm.Get_attr(mpi.APPNUM)
-    if cluster_instance_id is None:
-        cluster_instance_id = 0
-    assert cluster_instance_id >= 0
+    cluster_instance_id = int(cluster_type)
 
     local_comm = global_comm.Split(
-        color=cluster_instance_id,
+        color=int(cluster_type),
         key=global_comm.Get_rank(),
     )
 

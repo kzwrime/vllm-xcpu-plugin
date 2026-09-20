@@ -95,7 +95,7 @@ class AfV7Session:
             if cluster.cluster_type == ClusterType.MOE
             for rank in cluster.global_ranks
         )
-        assert attention_ranks and len(expert_ranks) > 1
+        assert attention_ranks and expert_ranks
         expected_attention_ranks = tuple(range(len(attention_ranks)))
         expected_expert_ranks = tuple(
             range(len(attention_ranks), len(attention_ranks) + len(expert_ranks))

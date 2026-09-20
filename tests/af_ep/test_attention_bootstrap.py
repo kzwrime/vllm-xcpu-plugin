@@ -1,8 +1,13 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
 
 from vllm_xcpu_plugin.af_ep.attn.client_v7 import ExpertsClientV7
+from vllm_xcpu_plugin.af_ep.attn.compatibility import (
+    AttentionSupport,
+    validate_attention_support,
+)
 
 
 def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_session):
@@ -28,3 +33,17 @@ def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_s
     worker.load_model()
 
     assert calls == ["load", "drain", ("initialize", 8, 16, 6, torch.bfloat16)]
+
+
+def test_attention_and_expert_rank_counts_are_independent():
+    support = AttentionSupport(
+        use_v2_model_runner=True,
+        enable_expert_parallel=True,
+        logical_ep_size=4,
+        eager=True,
+        dtype="torch.bfloat16",
+    )
+
+    validate_attention_support(1, support)
+    validate_attention_support(4, support)
+    validate_attention_support(4, replace(support, logical_ep_size=1))

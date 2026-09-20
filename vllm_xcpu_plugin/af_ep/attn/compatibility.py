@@ -71,13 +71,10 @@ def validate_attention_support(
     failures: list[str] = []
     if not support.use_v2_model_runner:
         failures.append("ModelRunner V2 is required")
-    if not support.enable_expert_parallel or support.logical_ep_size <= 1:
-        failures.append("expert parallelism with EP size > 1 is required")
-    if support.logical_ep_size != ep_size:
-        failures.append(
-            "logical EP size must equal the number of F ranks: "
-            f"{support.logical_ep_size} != {ep_size}"
-        )
+    if not support.enable_expert_parallel:
+        failures.append("expert parallelism must be enabled")
+    if ep_size <= 0:
+        failures.append("at least one F rank is required")
     if not support.eager:
         failures.append("compile is not supported; eager execution is required")
     if support.dtype.lower() not in {"bf16", "bfloat16", "torch.bfloat16"}:

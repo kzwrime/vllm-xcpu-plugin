@@ -34,7 +34,7 @@ class RoutedExpertsModel(torch.nn.Module):
             "torch.bfloat16",
         }:
             raise ValueError("AF-EP expert service supports only BF16")
-        if ep_size <= 1 or not 0 <= ep_rank < ep_size:
+        if ep_size <= 0 or not 0 <= ep_rank < ep_size:
             raise ValueError("invalid F-side EP topology")
         num_experts = getattr(config, "num_experts", None)
         if num_experts is None:

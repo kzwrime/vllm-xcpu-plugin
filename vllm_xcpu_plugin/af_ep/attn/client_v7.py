@@ -72,7 +72,7 @@ class ExpertsClientV7(ExpertsClient):
         assert topk_ids.shape == topk_weights.shape
         assert topk_ids.size(0) == hidden_states.size(0)
         assert topk_ids.size(1) in (6, 8)
-        assert num_experts == self._session.ep_size * num_local_experts
+        assert num_experts > 0 and num_local_experts > 0
         if not hidden_states.is_contiguous():
             raise ValueError("AF-EP hidden states must be contiguous")
         if not (hidden_states.device == topk_ids.device == topk_weights.device):
@@ -89,6 +89,11 @@ class ExpertsClientV7(ExpertsClient):
 
         num_rows, hidden_size = hidden_states.shape
         topk = topk_ids.size(1)
+        # The A-side layer is partitioned over A ranks; remote experts are
+        # independently partitioned over F ranks.
+        remote_num_local_experts = num_experts // self._session.ep_size
+        if num_experts % self._session.ep_size:
+            raise ValueError("AF-EP requires a uniform expert partition across F ranks")
 
         self._session.validate_initialized(hidden_size, topk, hidden_states.dtype)
         workspace = self._ensure_workspace(hidden_states, topk)
@@ -101,7 +106,7 @@ class ExpertsClientV7(ExpertsClient):
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.float().contiguous(),
             num_experts,
-            num_local_experts,
+            remote_num_local_experts,
             self._session.max_rows_per_attention_rank,
             layer_idx,
             self._session.metadata,

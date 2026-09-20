@@ -85,3 +85,36 @@ def test_attention_runs_remote_layers_without_local_weights_or_double_reduce(
     torch.testing.assert_close(
         outputs[1], torch.full((5, 16), 18, dtype=torch.bfloat16)
     )
+
+
+def test_attention_uses_remote_expert_partition_when_rank_counts_differ(
+    monkeypatch, make_af_session
+):
+    import torch_xcpu
+
+    observed = {}
+
+    def dispatch(*args):
+        observed["num_experts"] = args[6]
+        observed["num_local_experts"] = args[7]
+        args[0].zero_()
+
+    monkeypatch.setattr(torch_xcpu.ops, "moe_af_dispatch_send_v7", dispatch)
+    monkeypatch.setattr(
+        torch_xcpu.ops,
+        "moe_af_combine_recv_v7",
+        lambda output, *args: output.zero_(),
+    )
+    client = ExpertsClientV7(make_af_session(num_attention_ranks=4, num_expert_ranks=1))
+    client.initialize(16, 6, torch.bfloat16)
+
+    client.execute_layer(
+        layer_idx=1,
+        hidden_states=torch.ones(2, 16, dtype=torch.bfloat16),
+        topk_weights=torch.ones(2, 6, dtype=torch.float32),
+        topk_ids=torch.arange(6, dtype=torch.int64).expand(2, 6),
+        num_experts=8,
+        num_local_experts=2,
+    )
+
+    assert observed == {"num_experts": 8, "num_local_experts": 8}
