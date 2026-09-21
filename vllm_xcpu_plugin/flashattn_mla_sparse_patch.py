@@ -71,7 +71,15 @@ def _xcpu_do_kv_cache_update(
     torch_xcpu.ops.reshape_and_cache(
         kv_c_normed,  # [tokens, kv_lora_rank]
         k_pe.squeeze(1),  # [tokens, qk_rope]
-        # Unquantized: [blocks, page_size, rank + rope]; FP8: [..., 656] bytes
+        # [blocks, per_page_size] Bytes
+        # Per Page:
+        # Unquantized: page_size * (512 * BF16 + 64 * BF16 RoPE); 
+        #              per_page_size = page_size * 576 * 2 Bytes
+        # FP8 Layout1: page_size * (512 * FP8, 4 * FP32 Scale, 64 * BF16 Rope)
+        #              per_page_size = page_size * 656 Bytes
+        # FP8 Layout2: page_size * (512 * FP8, 64 * BF16 Rope);
+        #            & page_size * 4 * FP32 Scale
+        #              per_page_size = page_size * 656 Bytes
         kv_cache,
         slot_mapping.flatten(),
         kv_cache_dtype=kv_cache_dtype,
