@@ -23,6 +23,47 @@ def _xcpu_fused_mla_rope_kvcache_supported(self) -> bool:
     return True
 
 
+def _xcpu_fused_mla_rope_qproj_kvcache_supported(self) -> bool:
+    """Fused rope + q up-projection + concat + cache update (BF16 path)."""
+    return self.kv_cache_dtype in ("auto", "bfloat16")
+
+
+def _xcpu_do_fused_mla_rope_qproj_kvcache_update(
+    self,
+    q: torch.Tensor,
+    w_uk_t: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    out_q: torch.Tensor,
+) -> None:
+    # Shape and layout support is intentionally enforced by the operator. If
+    # this semantic path is selected but the kernel lacks shape coverage, fail
+    # loudly so the missing operator support is visible to developers.
+    del self, k_scale
+    import torch_xcpu
+
+    torch_xcpu.ops.fused_mla_rope_qproj_cat_cache(
+        q,
+        w_uk_t,
+        k_pe.squeeze(1),
+        kv_c_normed,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        kv_cache,
+        out_q,
+        "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
+        is_neox,
+    )
+
+
 def _xcpu_do_fused_mla_rope_kvcache_update(
     self,
     q_pe: torch.Tensor,
@@ -50,7 +91,7 @@ def _xcpu_do_fused_mla_rope_kvcache_update(
         cos_sin_cache,
         slot_mapping,
         kv_cache,
-        kv_cache_dtype,
+        "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
         is_neox,
     )
 
@@ -73,7 +114,7 @@ def _xcpu_do_kv_cache_update(
         k_pe.squeeze(1),  # [tokens, qk_rope]
         # [blocks, per_page_size] Bytes
         # Per Page:
-        # Unquantized: page_size * (512 * BF16 + 64 * BF16 RoPE); 
+        # Unquantized: page_size * (512 * BF16 + 64 * BF16 RoPE);
         #              per_page_size = page_size * 576 * 2 Bytes
         # FP8 Layout1: page_size * (512 * FP8, 4 * FP32 Scale, 64 * BF16 Rope)
         #              per_page_size = page_size * 656 Bytes
@@ -82,7 +123,7 @@ def _xcpu_do_kv_cache_update(
         #              per_page_size = page_size * 656 Bytes
         kv_cache,
         slot_mapping.flatten(),
-        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype="auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
     )
 
 
@@ -93,14 +134,19 @@ def _xcpu_forward_mqa(
     attn_metadata: FlashAttnMLASparseMetadata,
     layer: AttentionLayer,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if not isinstance(q, tuple):
-        raise NotImplementedError(
-            "FlashAttnMLASparseImpl expects split (q_nope, q_rope)"
-        )
-    q_nope, q_rope = q
-    # [tokens, heads, kv_lora_rank + qk_rope]
-    query = torch.cat((q_nope, q_rope), dim=-1)
-    output = torch.empty_like(q_nope)  # [tokens, heads, kv_lora_rank]
+    if isinstance(q, tuple):
+        q_nope, q_rope = q
+        # [tokens, heads, kv_lora_rank + qk_rope]
+        query = torch.cat((q_nope, q_rope), dim=-1)
+    else:
+        # Already the final query emitted by the fused rope + up-projection +
+        # concat op; [tokens, heads, kv_lora_rank + qk_rope].
+        query = q
+    output = torch.empty(
+        (query.shape[0], query.shape[1], self.kv_lora_rank),
+        dtype=query.dtype,
+        device=query.device,
+    )  # [tokens, heads, kv_lora_rank]
     logical_topk = None
     if self.is_sparse:
         assert self.topk_indices_buffer is not None
@@ -142,7 +188,9 @@ def _xcpu_forward_mqa(
             window_size=0,
             block_table=attn_metadata.block_table,
             logical_topk=logical_topk,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=(
+                "auto" if self.kv_cache_dtype == "bfloat16" else self.kv_cache_dtype
+            ),
         )
     return output, None
 
@@ -220,12 +268,14 @@ def maybe_patch_vllm_flashattn_mla_sparse() -> None:
 
     builder_cls.__init__ = initialize_builder
     builder_cls.build = build_metadata
-    impl_cls.fused_mla_rope_kvcache_supported = (
-        _xcpu_fused_mla_rope_kvcache_supported
+    impl_cls.fused_mla_rope_kvcache_supported = _xcpu_fused_mla_rope_kvcache_supported
+    impl_cls.fused_mla_rope_qproj_kvcache_supported = (
+        _xcpu_fused_mla_rope_qproj_kvcache_supported
     )
-    impl_cls.do_fused_mla_rope_kvcache_update = (
-        _xcpu_do_fused_mla_rope_kvcache_update
+    impl_cls.do_fused_mla_rope_qproj_kvcache_update = (
+        _xcpu_do_fused_mla_rope_qproj_kvcache_update
     )
+    impl_cls.do_fused_mla_rope_kvcache_update = _xcpu_do_fused_mla_rope_kvcache_update
     impl_cls.do_kv_cache_update = _xcpu_do_kv_cache_update
     impl_cls.forward_mqa = _xcpu_forward_mqa
     impl_cls._xcpu_flashattn_mla_sparse_patched = True

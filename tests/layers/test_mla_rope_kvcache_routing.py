@@ -84,3 +84,37 @@ def test_fused_mla_rope_cache_leaves_shape_validation_to_op(monkeypatch) -> None
     assert impl.call_args[1] is k_pe
     assert impl.call_args[2] is kv_c
     assert torch.equal(impl.call_args[7], slots)
+
+
+def test_qproj_plugin_normalizes_explicit_bfloat16_cache(monkeypatch):
+    import torch_xcpu
+
+    from vllm_xcpu_plugin.flashattn_mla_sparse_patch import (
+        _xcpu_do_fused_mla_rope_qproj_kvcache_update,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        torch_xcpu.ops,
+        "fused_mla_rope_qproj_cat_cache",
+        lambda *args: calls.append(args),
+    )
+    q = torch.empty(2, 8, 128)
+    k = torch.empty(2, 1, 64)
+    _xcpu_do_fused_mla_rope_qproj_kvcache_update(
+        None,
+        q,
+        torch.empty(8, 64, 512),
+        k,
+        torch.empty(2, 512),
+        torch.arange(2),
+        torch.empty(4, 64),
+        False,
+        torch.empty(1, 16, 576),
+        torch.arange(2),
+        "bfloat16",
+        torch.ones(1),
+        torch.empty(2, 8, 576),
+    )
+    assert calls[0][-2] == "auto"
+    assert calls[0][2].shape == (2, 64)
