@@ -59,7 +59,7 @@ def _xcpu_do_fused_mla_rope_qproj_kvcache_update(
         slot_mapping,
         kv_cache,
         out_q,
-        kv_cache_dtype,
+        "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
         is_neox,
     )
 
@@ -91,7 +91,7 @@ def _xcpu_do_fused_mla_rope_kvcache_update(
         cos_sin_cache,
         slot_mapping,
         kv_cache,
-        kv_cache_dtype,
+        "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
         is_neox,
     )
 
@@ -114,7 +114,7 @@ def _xcpu_do_kv_cache_update(
         k_pe.squeeze(1),  # [tokens, qk_rope]
         # [blocks, per_page_size] Bytes
         # Per Page:
-        # Unquantized: page_size * (512 * BF16 + 64 * BF16 RoPE); 
+        # Unquantized: page_size * (512 * BF16 + 64 * BF16 RoPE);
         #              per_page_size = page_size * 576 * 2 Bytes
         # FP8 Layout1: page_size * (512 * FP8, 4 * FP32 Scale, 64 * BF16 Rope)
         #              per_page_size = page_size * 656 Bytes
@@ -123,7 +123,7 @@ def _xcpu_do_kv_cache_update(
         #              per_page_size = page_size * 656 Bytes
         kv_cache,
         slot_mapping.flatten(),
-        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype="auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
     )
 
 
@@ -188,7 +188,9 @@ def _xcpu_forward_mqa(
             window_size=0,
             block_table=attn_metadata.block_table,
             logical_topk=logical_topk,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=(
+                "auto" if self.kv_cache_dtype == "bfloat16" else self.kv_cache_dtype
+            ),
         )
     return output, None
 
@@ -266,18 +268,14 @@ def maybe_patch_vllm_flashattn_mla_sparse() -> None:
 
     builder_cls.__init__ = initialize_builder
     builder_cls.build = build_metadata
-    impl_cls.fused_mla_rope_kvcache_supported = (
-        _xcpu_fused_mla_rope_kvcache_supported
-    )
+    impl_cls.fused_mla_rope_kvcache_supported = _xcpu_fused_mla_rope_kvcache_supported
     impl_cls.fused_mla_rope_qproj_kvcache_supported = (
         _xcpu_fused_mla_rope_qproj_kvcache_supported
     )
     impl_cls.do_fused_mla_rope_qproj_kvcache_update = (
         _xcpu_do_fused_mla_rope_qproj_kvcache_update
     )
-    impl_cls.do_fused_mla_rope_kvcache_update = (
-        _xcpu_do_fused_mla_rope_kvcache_update
-    )
+    impl_cls.do_fused_mla_rope_kvcache_update = _xcpu_do_fused_mla_rope_kvcache_update
     impl_cls.do_kv_cache_update = _xcpu_do_kv_cache_update
     impl_cls.forward_mqa = _xcpu_forward_mqa
     impl_cls._xcpu_flashattn_mla_sparse_patched = True
