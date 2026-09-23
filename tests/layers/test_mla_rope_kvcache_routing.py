@@ -15,7 +15,17 @@ class _Impl:
     def fused_mla_rope_kvcache_supported(self) -> bool:
         return self.supported
 
+    def fused_mla_rope_qproj_kvcache_supported(self) -> bool:
+        from vllm_xcpu_plugin.flashattn_mla_sparse_patch import (
+            _xcpu_fused_mla_rope_qproj_kvcache_supported,
+        )
+
+        return _xcpu_fused_mla_rope_qproj_kvcache_supported(self)
+
     def do_fused_mla_rope_kvcache_update(self, *args) -> None:
+        self.call_args = args
+
+    def do_fused_mla_rope_qproj_kvcache_update(self, *args) -> None:
         self.call_args = args
 
 
@@ -25,6 +35,12 @@ class _Layer:
     )
     maybe_fused_mla_rope_kvcache_update = (
         mla_attention.MLAAttention.maybe_fused_mla_rope_kvcache_update
+    )
+    fused_mla_rope_qproj_kvcache_supported = (
+        mla_attention.MLAAttention.fused_mla_rope_qproj_kvcache_supported
+    )
+    maybe_fused_mla_rope_qproj_kvcache_update = (
+        mla_attention.MLAAttention.maybe_fused_mla_rope_qproj_kvcache_update
     )
 
     def __init__(self, impl: _Impl) -> None:
@@ -36,6 +52,46 @@ class _Layer:
         self.kv_cache = torch.empty(1)
         self.kv_cache_dtype = "auto"
         self._k_scale = torch.ones(1)
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16", "fp8_ds_mla"])
+def test_qproj_fusion_routes_supported_cache_layouts(monkeypatch, kv_cache_dtype):
+    impl = _Impl()
+    impl.kv_cache_dtype = kv_cache_dtype
+    layer = _Layer(impl)
+    layer.kv_cache_dtype = kv_cache_dtype
+    layer.q_pad_num_heads = None
+    layer.W_UK_T = torch.empty(8, 64, 512)
+    layer.kv_lora_rank = 512
+    layer.qk_rope_head_dim = 64
+    fp8_cache = kv_cache_dtype == "fp8_ds_mla"
+    layer.kv_cache = torch.empty(
+        1,
+        16,
+        656 if fp8_cache else 576,
+        dtype=torch.uint8 if fp8_cache else torch.bfloat16,
+    )
+    slots = torch.arange(2, dtype=torch.int64)
+    monkeypatch.setattr(
+        mla_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(slot_mapping={layer.layer_name: slots}),
+    )
+
+    out = layer.maybe_fused_mla_rope_qproj_kvcache_update(
+        torch.arange(2, dtype=torch.int64),
+        torch.empty(2, 8, 128),
+        torch.empty(2, 1, 64),
+        torch.empty(2, 512),
+        torch.empty(8, 64),
+        False,
+    )
+
+    assert out is not None and out.shape == (2, 8, 576)
+    assert impl.call_args is not None
+    assert impl.call_args[8] is slots
+    assert impl.call_args[9] == kv_cache_dtype
+    assert impl.call_args[-1] is out
 
 
 @pytest.mark.parametrize(

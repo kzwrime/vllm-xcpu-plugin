@@ -24,8 +24,8 @@ def _xcpu_fused_mla_rope_kvcache_supported(self) -> bool:
 
 
 def _xcpu_fused_mla_rope_qproj_kvcache_supported(self) -> bool:
-    """Fused rope + q up-projection + concat + cache update (BF16 path)."""
-    return self.kv_cache_dtype in ("auto", "bfloat16")
+    """Fused rope + q up-projection + concat + cache update."""
+    return self.kv_cache_dtype in ("auto", "bfloat16", "fp8_ds_mla")
 
 
 def _xcpu_do_fused_mla_rope_qproj_kvcache_update(
