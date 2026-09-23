@@ -45,6 +45,15 @@ def rms_norm(
     return out
 
 
+def _supports_fused_add_rms_norm_layout(x: Tensor) -> bool:
+    return (
+        1 <= x.dim() <= 2
+        and x.shape[-1] > 0
+        and x.stride(-1) == 1
+        and (x.dim() == 1 or x.stride(0) >= x.shape[-1] or x.shape[0] <= 1)
+    )
+
+
 def _supports_fused_add_rms_norm(
     x: Tensor,
     x_residual: Tensor,
@@ -56,15 +65,16 @@ def _supports_fused_add_rms_norm(
     return (
         variance_size is None
         and weight is not None
-        and x.dim() <= 2
+        and _supports_fused_add_rms_norm_layout(x)
+        and _supports_fused_add_rms_norm_layout(x_residual)
         and x.shape == x_residual.shape
+        and weight.dim() == 1
+        and weight.shape[0] == x.shape[-1]
         and x.dtype in (torch.bfloat16, torch.float32)
         and x_residual.dtype == x.dtype
         and weight.dtype == x.dtype
         and x_residual.device == x.device
         and weight.device == x.device
-        and x.is_contiguous()
-        and x_residual.is_contiguous()
         and weight.is_contiguous()
     )
 
