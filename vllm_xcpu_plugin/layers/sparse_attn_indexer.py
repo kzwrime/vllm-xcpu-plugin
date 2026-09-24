@@ -237,7 +237,6 @@ def _fused_indexer_q_rope_quant_deepseek_v4(
     )
 
 
-@torch.library.custom_op("vllm_xcpu::indexer_k_cache", mutates_args=("cache",))
 def _indexer_k_cache(
     k: torch.Tensor,
     weight: torch.Tensor,
@@ -249,16 +248,18 @@ def _indexer_k_cache(
     eps: float,
     is_neox: bool,
 ) -> None:
-    # Resolve per-step metadata inside the opaque op, including after compile.
-    metadata = get_forward_context().attn_metadata
-    # Profiling has no slot mapping, so it must not write to the K cache.
-    if metadata is None:
+    forward_context = get_forward_context()
+    if forward_context.attn_metadata is None:
+        # Capturing this branch would permanently omit the cache write in AOT.
+        assert not torch.compiler.is_compiling(), (
+            "Indexer profiling without attention metadata must bypass compilation"
+        )
         return
-    assert isinstance(metadata, dict)
-    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
-
-    layer_metadata = metadata[prefix]
-    assert isinstance(layer_metadata, DeepseekV32IndexerMetadata)
+    # The uncompressed PCP=DCP=1 indexer uses its own KV-cache group's slots.
+    # Keep this Tensor as a graph input, refreshed from the live context each step.
+    slot_mappings = forward_context.slot_mapping
+    assert isinstance(slot_mappings, dict)
+    slots = slot_mappings[prefix]
     import torch_xcpu
 
     torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
@@ -267,18 +268,11 @@ def _indexer_k_cache(
         bias,
         positions,
         cos_sin,
-        layer_metadata.slot_mapping,
+        slots,
         cache,
         eps,
         is_neox,
     )
-
-
-@_indexer_k_cache.register_fake
-def _indexer_k_cache_fake(
-    k, weight, bias, positions, cos_sin, cache, prefix, eps, is_neox
-):
-    return None
 
 
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
