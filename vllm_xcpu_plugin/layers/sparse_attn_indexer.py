@@ -275,24 +275,63 @@ def _indexer_k_cache(
     )
 
 
+def _indexer_qk_cache(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    cache: torch.Tensor,
+    prefix: str,
+    eps: float,
+    softmax_scale: float,
+    head_scale: float,
+    is_neox: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_xcpu
+
+    forward_context = get_forward_context()
+    if forward_context.attn_metadata is None:
+        # Capturing this branch would permanently omit the cache write in AOT.
+        assert not torch.compiler.is_compiling(), (
+            "Indexer profiling without attention metadata must bypass compilation"
+        )
+        return torch_xcpu.ops.fused_indexer_q_rope_quant(
+            positions, q, cos_sin, weights, softmax_scale, head_scale, is_neox, False
+        )
+    # Like the K-only path, refresh this graph input from the live context.
+    slot_mappings = forward_context.slot_mapping
+    assert isinstance(slot_mappings, dict)
+    slots = slot_mappings[prefix]
+    return torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
+        positions,
+        q,
+        cos_sin,
+        weights,
+        k,
+        norm_weight,
+        norm_bias,
+        slots,
+        cache,
+        eps,
+        softmax_scale,
+        head_scale,
+        is_neox,
+    )
+
+
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
     import torch_xcpu
 
     q = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
     kw = self.wk_weights_proj(hidden_states)[0]
     k, weights = kw[:, : self.head_dim], kw[:, self.head_dim :]
-    q, weights = torch_xcpu.ops.fused_indexer_q_rope_quant(
-        positions,
-        q,
-        rotary_emb.cos_sin_cache,
-        weights,
-        self.softmax_scale,
-        self.n_head_scale,
-        rotary_emb.is_neox_style,
-        False,
-    )
-    if self._xcpu_fuse_k_cache:
-        _indexer_k_cache(
+    if self._xcpu_fuse_qk_cache:
+        q, weights = _indexer_qk_cache(
+            q,
+            weights,
             k,
             self.k_norm.weight,
             self.k_norm.bias,
@@ -301,14 +340,41 @@ def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
             self.k_cache.kv_cache,
             self.k_cache.prefix,
             self.k_norm.eps,
+            self.softmax_scale,
+            self.n_head_scale,
             rotary_emb.is_neox_style,
         )
     else:
-        # Reference path for A/B validation; Q remains BF16 on both paths.
-        k = self.k_norm(k)
-        k_pe = k[:, : self.rope_dim].unsqueeze(1)
-        _, k_pe = rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        k = torch.cat((k_pe.reshape(-1, self.rope_dim), k[:, self.rope_dim :]), dim=-1)
+        q, weights = torch_xcpu.ops.fused_indexer_q_rope_quant(
+            positions,
+            q,
+            rotary_emb.cos_sin_cache,
+            weights,
+            self.softmax_scale,
+            self.n_head_scale,
+            rotary_emb.is_neox_style,
+            False,
+        )
+        if self._xcpu_fuse_k_cache:
+            _indexer_k_cache(
+                k,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                positions,
+                rotary_emb.cos_sin_cache,
+                self.k_cache.kv_cache,
+                self.k_cache.prefix,
+                self.k_norm.eps,
+                rotary_emb.is_neox_style,
+            )
+        else:
+            # Reference path for A/B validation; Q remains BF16 on both paths.
+            k = self.k_norm(k)
+            k_pe = k[:, : self.rope_dim].unsqueeze(1)
+            _, k_pe = rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+            k = torch.cat(
+                (k_pe.reshape(-1, self.rope_dim), k[:, self.rope_dim :]), dim=-1
+            )
 
     # Reuse upstream scheduling/logits/TopK with XCPU kernel bindings. Calling
     # the shared implementation explicitly avoids CustomOp's CUDA-only native
@@ -339,6 +405,10 @@ def _install_indexer_preprocessing() -> None:
                 "XCPU DSA indexer requires H={32,64}, D=128, RoPE=64"
             )
         self._xcpu_fuse_k_cache = os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        self._xcpu_fuse_qk_cache = (
+            self._xcpu_fuse_k_cache
+            and os.getenv("VLLM_XCPU_FUSED_INDEXER_QK", "1") != "0"
+        )
         self.indexer_op.skip_k_cache_insert = self._xcpu_fuse_k_cache
 
     Indexer.__init__ = initialize  # type: ignore[method-assign]
