@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""MPI v5 EP with 2D token MoE prepare/finalize implementation."""
+"""MPI v5 fixed-record prepare with compact finalize return buffers."""
 
 from collections.abc import Callable
 
@@ -19,7 +19,7 @@ from .expert_tokens_metadata import XCPUExpertTokensMetadata
 
 
 class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
-    """V3-derived dispatch that sends a token once per destination rank."""
+    """Dispatch one fixed record per input row and destination rank."""
 
     version = "v5"
 
@@ -44,7 +44,6 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.rank_expert_offset = rank_expert_offset
         self.is_sequence_parallel = is_sequence_parallel
-
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.max_moe_tokens_per_rank = (
@@ -52,33 +51,29 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             if is_sequence_parallel
             else max_num_tokens
         )
+
         self.ep_rank = dist.get_rank(ep_group)
         self.ep_size = dist.get_world_size(ep_group)
-
         if num_experts != self.ep_size * num_local_experts:
             raise ValueError(f"MPI {self.version} requires a uniform expert partition")
 
         communicator = get_ep_group().device_communicator
         assert isinstance(communicator, CpuMPICommunicator)
         self.comm_ptr_wrapper = communicator.comm_ptr_wrapper
-        # [ep_size, ep_rank, moe_tp_rank, moe_tp_size, dp_rank, dp_size]
-        # v5 不使用模型级 TP 分片；TP 槽位仅为兼容底层公共元数据布局。
+        # [ep_size, ep_rank, moe_tp_rank, moe_tp_size, dp_rank, dp_size].
+        # V5 uses no model-level TP sharding; the TP fields preserve the common
+        # communication metadata layout.
         self._comm_metadata = torch.tensor(
-            [
-                self.ep_size,
-                self.ep_rank,
-                0,
-                1,
-                self.dp_rank,
-                self.dp_size,
-            ],
+            [self.ep_size, self.ep_rank, 0, 1, self.dp_rank, self.dp_size],
             dtype=torch.int64,
-            device="cpu",  # Keep on CPU for C++ access
+            device="cpu",
         )
 
-        self._send_record_input_rows: torch.Tensor | None = None
-        self._recv_input_rows_per_source: torch.Tensor | None = None
-        self._send_input_rows_per_destination: torch.Tensor | None = None
+        self._return_row_indices: torch.Tensor | None = None
+        self._recv_hidden_elements_per_src_rank: torch.Tensor | None = None
+        self._recv_hidden_element_offsets_per_src_rank: torch.Tensor | None = None
+        self._send_input_rows_per_dest_rank: torch.Tensor | None = None
+        self._dispatch_send_buffer: torch.Tensor | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -95,9 +90,6 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
 
     def output_is_reduced(self) -> bool:
         return True
-
-    def _send_record_mapping_capacity(self, num_input_rows: int, topk: int) -> int:
-        return num_input_rows * min(topk, self.ep_size)
 
     def supports_async(self) -> bool:
         return False
@@ -147,8 +139,8 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             )
 
         assert not apply_router_weight_on_input
-        # Linear EP still supplies the normal global-to-local expert map to
-        # Experts. Prepare routes by the validated uniform global layout.
+        # Linear EP supplies its normal global-to-local expert map to Experts;
+        # V5 routes using the validated uniform global expert layout.
         del expert_map
         if a1.size(0) > self.max_moe_tokens_per_rank:
             raise ValueError(
@@ -162,19 +154,16 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
 
         num_input_rows, hidden_dim = a1.shape
         topk = topk_ids.size(1)
-        if topk < 1:
-            raise ValueError(f"MPI {self.version} requires topk >= 1")
+        if topk not in (6, 8):
+            raise ValueError(f"MPI v5 supports only topk=6 or topk=8, got {topk}")
+
+        from torch_xcpu import ops as xcpu_ops
+
         device = a1.device
-
-        # A source rank can send each local input row to this destination at
-        # most once. Reserve one such segment for every source rank.
         recv_input_rows_capacity = self.ep_size * self.max_moe_tokens_per_rank
-        send_input_rows_capacity = self._send_record_mapping_capacity(
-            num_input_rows, topk
-        )
-
-        send_record_input_rows = torch.empty(
-            send_input_rows_capacity,
+        return_row_indices = torch.empty(
+            num_input_rows,
+            topk,
             dtype=torch.int32,
             device=device,
         )
@@ -185,66 +174,52 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             device=device,
         )
         recv_topk_ids = torch.full(
-            (
-                recv_input_rows_capacity,
-                topk,
-            ),
+            (recv_input_rows_capacity, topk),
             -1,
             dtype=torch.int32,
             device=device,
         )
         recv_topk_weights = torch.ones(
-            (
-                recv_input_rows_capacity,
-                topk,
-            ),
+            (recv_input_rows_capacity, topk),
             dtype=topk_weights.dtype,
             device=device,
         )
-        expert_num_tokens = torch.empty(num_experts, dtype=torch.int32, device=device)
         num_input_rows_valid = torch.empty(1, dtype=torch.int32, device=device)
-        recv_input_rows_per_source = torch.empty(
+        # Reverse-send metadata, in hidden elements. Prepare fills these from
+        # the compact per-source segments; finalize passes them to MPI.
+        recv_hidden_elements_per_src_rank = torch.empty(
             self.ep_size, dtype=torch.int32, device=device
         )
-        send_input_rows_per_destination = torch.empty(
+        recv_hidden_element_offsets_per_src_rank = torch.empty(
+            self.ep_size, dtype=torch.int32, device=device
+        )
+        send_input_rows_per_dest_rank = torch.empty(
             self.ep_size, dtype=torch.int32, device=device
         )
 
-        # V5 sends separate hidden-state, ID, and weight payloads.
-        # One source row can appear at most once in each destination segment.
-        send_hidden_states = torch.empty(
-            send_input_rows_capacity,
-            hidden_dim,
-            dtype=a1.dtype,
+        # Fixed record:
+        # [num_records, source_input_row, topk_ids, topk_weights, hidden_state].
+        dispatch_record_bytes = (
+            2 * torch.int32.itemsize
+            + topk * (torch.int32.itemsize + topk_weights.element_size())
+            + hidden_dim * a1.element_size()
+        )
+        dispatch_send_buffer = torch.empty(
+            self.ep_size * self.max_moe_tokens_per_rank * dispatch_record_bytes,
+            dtype=torch.uint8,
             device=device,
         )
-        send_topk_ids = torch.empty(
-            send_input_rows_capacity,
-            topk,
-            dtype=torch.int32,
-            device=device,
-        )
-        send_topk_weights = torch.empty(
-            send_input_rows_capacity,
-            topk,
-            dtype=topk_weights.dtype,
-            device=device,
-        )
-
-        from torch_xcpu import ops as xcpu_ops
 
         xcpu_ops.moe_prepare_fused_v5(
-            send_record_input_rows,
+            return_row_indices,
             recv_hidden_states,
             recv_topk_ids,
             recv_topk_weights,
-            expert_num_tokens,
             num_input_rows_valid,
-            recv_input_rows_per_source,
-            send_input_rows_per_destination,
-            send_hidden_states,
-            send_topk_ids,
-            send_topk_weights,
+            recv_hidden_elements_per_src_rank,
+            recv_hidden_element_offsets_per_src_rank,
+            send_input_rows_per_dest_rank,
+            dispatch_send_buffer,
             a1,
             topk_ids,
             topk_weights,
@@ -254,16 +229,18 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             self.comm_ptr_wrapper,
         )
 
-        self._send_record_input_rows = send_record_input_rows
-        self._recv_input_rows_per_source = recv_input_rows_per_source
-        self._send_input_rows_per_destination = send_input_rows_per_destination
+        # Keep all asynchronous kernel inputs/outputs alive until finalize.
+        self._return_row_indices = return_row_indices
+        self._recv_hidden_elements_per_src_rank = recv_hidden_elements_per_src_rank
+        self._recv_hidden_element_offsets_per_src_rank = (
+            recv_hidden_element_offsets_per_src_rank
+        )
+        self._send_input_rows_per_dest_rank = send_input_rows_per_dest_rank
+        self._dispatch_send_buffer = dispatch_send_buffer
 
-        local_expert_num_tokens = expert_num_tokens.narrow(
-            0, self.rank_expert_offset, self.num_local_experts
-        ).contiguous()
         expert_tokens_meta = XCPUExpertTokensMetadata(
-            expert_num_tokens=local_expert_num_tokens,
-            expert_num_tokens_cpu=local_expert_num_tokens.cpu(),
+            expert_num_tokens=num_input_rows_valid.new_empty(0),
+            expert_num_tokens_cpu=None,
             num_input_rows_valid=num_input_rows_valid,
         )
 
@@ -315,34 +292,32 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             raise TypeError(
                 f"MPI {self.version} requires expert-side local route reduction"
             )
-        assert self._send_record_input_rows is not None
-        assert self._recv_input_rows_per_source is not None
-        assert self._send_input_rows_per_destination is not None
+
+        assert self._return_row_indices is not None
+        assert self._recv_hidden_elements_per_src_rank is not None
+        assert self._recv_hidden_element_offsets_per_src_rank is not None
+        assert self._send_input_rows_per_dest_rank is not None
+        assert self._dispatch_send_buffer is not None
 
         from torch_xcpu import ops as xcpu_ops
 
-        _, hidden_dim = output.shape
-        recv_hidden_states = torch.empty(
-            self._send_record_input_rows.numel(),
-            hidden_dim,
-            dtype=output.dtype,
-            device=output.device,
-        )
         workspace = torch.empty_like(output, dtype=torch.float32)
         xcpu_ops.moe_finalize_v5(
             output,
             fused_expert_output,
-            self._send_record_input_rows,
-            self._recv_input_rows_per_source,
-            self._send_input_rows_per_destination,
+            self._return_row_indices,
+            self._recv_hidden_elements_per_src_rank,
+            self._recv_hidden_element_offsets_per_src_rank,
+            self._send_input_rows_per_dest_rank,
             self._comm_metadata,
             self.comm_ptr_wrapper,
-            recv_hidden_states,
             workspace,
+            self.max_moe_tokens_per_rank,
         )
 
-        self._send_record_input_rows = None
-        self._recv_input_rows_per_source = None
-        self._send_input_rows_per_destination = None
-
+        self._return_row_indices = None
+        self._recv_hidden_elements_per_src_rank = None
+        self._recv_hidden_element_offsets_per_src_rank = None
+        self._send_input_rows_per_dest_rank = None
+        self._dispatch_send_buffer = None
         return (lambda: None), (lambda: None)

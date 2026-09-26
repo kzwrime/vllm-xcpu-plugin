@@ -185,6 +185,8 @@ class MpiAlltoallvPrepareAndFinalizeV6(mk.FusedMoEPrepareAndFinalizeModular):
             device=device,
         )
         num_input_rows_valid = torch.empty(1, dtype=torch.int32, device=device)
+        # Reverse-send metadata, in hidden elements. Prepare fills these from
+        # the compact per-source segments; finalize passes them to MPI.
         recv_hidden_elements_per_src_rank = torch.empty(
             self.ep_size, dtype=torch.int32, device=device
         )

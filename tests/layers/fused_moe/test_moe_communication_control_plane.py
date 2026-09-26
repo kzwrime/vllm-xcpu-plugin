@@ -408,78 +408,111 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
     assert "mpi_alltoallv_v6" in MPI_ALLTOALLV_BACKENDS
 
 
-def test_mpi_v5_allocates_prepare_and_finalize_buffers_inline(monkeypatch):
+def test_mpi_v5_selects_dense_prepare_and_finalize_ops(monkeypatch):
     import torch_xcpu
 
     prepare_finalize = object.__new__(MpiAlltoallvPrepareAndFinalizeV5)
+    prepare_finalize.max_num_tokens = 4
     prepare_finalize.max_moe_tokens_per_rank = 4
     prepare_finalize.num_experts = 4
     prepare_finalize.num_local_experts = 2
+    prepare_finalize.num_dispatchers_ = 2
     prepare_finalize.rank_expert_offset = 0
     prepare_finalize.ep_size = 2
     prepare_finalize._comm_metadata = torch.tensor(
         [2, 0, 0, 1, 0, 1], dtype=torch.int64
     )
     prepare_finalize.comm_ptr_wrapper = torch.zeros(1, dtype=torch.int64)
-    prepare_calls = []
-    finalize_calls = []
+    prepare_finalize._return_row_indices = None
+    prepare_finalize._recv_hidden_elements_per_src_rank = None
+    prepare_finalize._recv_hidden_element_offsets_per_src_rank = None
+    prepare_finalize._send_input_rows_per_dest_rank = None
+    prepare_finalize._dispatch_send_buffer = None
+    calls = []
 
     def prepare_op(*args):
-        prepare_calls.append(args)
+        calls.append(("prepare", args))
         args[4].zero_()
         args[5].zero_()
         args[6].zero_()
         args[7].zero_()
 
     def finalize_op(*args):
-        finalize_calls.append(args)
+        calls.append(("finalize", args))
 
     monkeypatch.setattr(torch_xcpu.ops, "moe_prepare_fused_v5", prepare_op)
     monkeypatch.setattr(torch_xcpu.ops, "moe_finalize_v5", finalize_op)
-    prepare_finalize.prepare(
+
+    with pytest.raises(ValueError, match="topk=6 or topk=8"):
+        prepare_finalize.prepare(
+            a1=torch.zeros((1, 4), dtype=torch.bfloat16),
+            topk_weights=torch.ones((1, 7), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 7), dtype=torch.int32),
+            num_experts=4,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+    prepare_result = prepare_finalize.prepare(
         a1=torch.zeros((1, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 2), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+        topk_weights=torch.ones((1, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
         num_experts=4,
         expert_map=None,
         apply_router_weight_on_input=False,
     )
+    _, _, expert_tokens_meta, _, _ = prepare_result
+    assert expert_tokens_meta.expert_num_tokens.numel() == 0
+    assert expert_tokens_meta.expert_num_tokens_cpu is None
+    assert expert_tokens_meta.num_input_rows_valid is calls[0][1][4]
     prepare_finalize.finalize(
         output=torch.empty((1, 4), dtype=torch.bfloat16),
         fused_expert_output=torch.empty((8, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 2), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+        topk_weights=torch.ones((1, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
         apply_router_weight_on_input=False,
         weight_and_reduce_impl=TopKWeightAndReduceNoOP(),
     )
 
-    assert len(prepare_calls) == 1
-    prepare_args = prepare_calls[0]
-    send_record_input_rows = prepare_args[0]
-    assert send_record_input_rows.shape == (2,)
+    assert [name for name, _ in calls] == ["prepare", "finalize"]
+    prepare_args = calls[0][1]
+    return_row_indices = prepare_args[0]
+    assert return_row_indices.shape == (1, 6)
+    assert return_row_indices.dtype == torch.int32
     assert prepare_args[1].shape == (2 * 4, 4)
-    assert prepare_args[2].shape == (2 * 4, 2)
-    assert prepare_args[3].shape == (2 * 4, 2)
-    assert prepare_args[4].shape == (4,)
-    assert prepare_args[5].shape == (1,)
+    assert prepare_args[1].dtype == torch.bfloat16
+    assert prepare_args[2].shape == (2 * 4, 6)
+    assert prepare_args[2].dtype == torch.int32
+    assert prepare_args[3].shape == (2 * 4, 6)
+    assert prepare_args[3].dtype == torch.float32
+    assert prepare_args[4].shape == (1,)
+    assert prepare_args[5].shape == (2,)
     assert prepare_args[6].shape == (2,)
     assert prepare_args[7].shape == (2,)
-    assert prepare_args[8].shape == (2, 4)
-    assert prepare_args[9].shape == (2, 2)
-    assert prepare_args[10].shape == (2, 2)
 
-    assert len(finalize_calls) == 1
-    finalize_args = finalize_calls[0]
-    assert finalize_args[2] is send_record_input_rows
-    assert finalize_args[3] is prepare_args[6]
-    assert finalize_args[4] is prepare_args[7]
-    assert finalize_args[7].shape == (2, 4)
-    assert finalize_args[7].dtype == torch.bfloat16
+    dispatch_send_buffer = prepare_args[8]
+    assert dispatch_send_buffer.dtype == torch.uint8
+    # record_bytes = 2 int32 + 6 * (int32 + float32) + 4 * bf16 = 64.
+    assert dispatch_send_buffer.numel() == 2 * 4 * 64
+
+    finalize_args = calls[1][1]
+    assert finalize_args[2] is return_row_indices
+    assert finalize_args[3] is prepare_args[5]
+    assert finalize_args[4] is prepare_args[6]
+    assert finalize_args[5] is prepare_args[7]
     assert finalize_args[8].shape == (1, 4)
     assert finalize_args[8].dtype == torch.float32
-    assert prepare_finalize._send_record_input_rows is None
-    assert prepare_finalize._recv_input_rows_per_source is None
-    assert prepare_finalize._send_input_rows_per_destination is None
+    assert finalize_args[-1] == prepare_finalize.max_moe_tokens_per_rank
+    assert prepare_finalize._return_row_indices is None
+    assert prepare_finalize._recv_hidden_elements_per_src_rank is None
+    assert prepare_finalize._recv_hidden_element_offsets_per_src_rank is None
+    assert prepare_finalize._send_input_rows_per_dest_rank is None
+    assert prepare_finalize._dispatch_send_buffer is None
+    assert (
+        pf_factory.MpiAlltoallvV5PrepareFinalizeFactory.implementation
+        is MpiAlltoallvPrepareAndFinalizeV5
+    )
+    assert "mpi_alltoallv_v5" in MPI_ALLTOALLV_BACKENDS
 
 
 @pytest.mark.parametrize(
