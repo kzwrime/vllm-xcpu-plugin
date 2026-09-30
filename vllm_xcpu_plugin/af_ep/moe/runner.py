@@ -13,6 +13,7 @@ class ExpertServiceOptions:
     max_model_passes: int = 0
     load_format: str = "auto"
     trust_remote_code: bool = False
+    compile_model: bool = False
 
     def __post_init__(self) -> None:
         if self.max_num_batched_tokens <= 0:
@@ -101,8 +102,10 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
             f"loaded={audit.loaded_count} "
             f"remote={len(audit.remote_checkpoint_names)}"
         )
-    service = ExpertServiceV7(model, session)
+    service = ExpertServiceV7(model, session, compile_model=options.compile_model)
     print(f"AF-EP F{session.role_rank} weights ready: {weight_summary}", flush=True)
+    execution_mode = "compile" if options.compile_model else "eager"
+    print(f"AF-EP F{session.role_rank} execution mode: {execution_mode}", flush=True)
     service.initialize()
     return service
 

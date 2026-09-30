@@ -1,5 +1,7 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_xcpu_plugin.af_ep.moe.service_v7 import ExpertServiceV7
@@ -64,3 +66,70 @@ def test_expert_service_returns_computed_rows_for_each_moe_layer(
     torch.testing.assert_close(
         sent[1][1], torch.full((3, 16), 54, dtype=torch.bfloat16)
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_combine_send_survives_dead_code_elimination(monkeypatch, dtype):
+    """The remote window write must survive even with no tensor outputs."""
+    from torch._higher_order_ops.effects import _get_effect
+    from torch._library.effects import EffectType
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from torch_xcpu.ops_defs import moe_af_v7
+
+    monkeypatch.setattr(moe_af_v7, "_ENABLE_CHECKS", True)
+    output = torch.empty(8, 16, dtype=dtype)
+    elements = torch.empty(2, dtype=torch.int32)
+    offsets = torch.empty_like(elements)
+    metadata = torch.empty(8, dtype=torch.int64)
+    comm = torch.empty(1, dtype=torch.int64)
+
+    def send(output, elements, offsets, metadata, comm):
+        moe_af_v7.moe_af_combine_send_v7(
+            output, elements, offsets, metadata, comm, 4, 6, 1
+        )
+
+    graph = make_fx(send, tracing_mode="fake")(
+        output, elements, offsets, metadata, comm
+    )
+    graph.graph.eliminate_dead_code()
+    suffix = "bf16" if dtype == torch.bfloat16 else "fp32"
+    endpoint = getattr(torch.ops.torch_xcpu, f"moe_af_combine_send_v7_{suffix}").default
+    assert _get_effect(endpoint) == EffectType.ORDERED
+    assert [
+        node.target for node in graph.graph.nodes if node.op == "call_function"
+    ] == [endpoint]
+
+
+def test_expert_transaction_reuses_graph_across_many_layer_indices(
+    monkeypatch, make_af_session
+):
+    """An int schema used to specialize every layer and hit the 8-graph limit."""
+    from torch_xcpu.ops_defs import moe_af_v7
+
+    monkeypatch.setattr(moe_af_v7, "_ENABLE_CHECKS", True)
+
+    def compute(self, layer, ops):
+        self._buffers.output.copy_(self._buffers.hidden_states)
+
+    monkeypatch.setattr(ExpertServiceV7, "_compute", compute)
+    service = ExpertServiceV7(FakeModel(), make_af_session(ClusterType.MOE, max_rows=4))
+    service.initialize()
+    graphs = []
+
+    def capture(graph, inputs):
+        graphs.append(graph)
+        # Compile/guard regression only: never execute real MPI on CPU tensors.
+        return lambda *args: None
+
+    execute = torch.compile(
+        service._execute_layer, backend=capture, fullgraph=True, dynamic=True
+    )
+    for index in range(12):
+        execute(replace(service._layers[0], layer_idx=index))
+    assert len(graphs) <= 3
+    for graph in graphs:
+        targets = [
+            node.target for node in graph.graph.nodes if node.op == "call_function"
+        ]
+        assert torch.ops.torch_xcpu.moe_af_dispatch_recv_v7_bf16 in targets
+        assert torch.ops.torch_xcpu.moe_af_combine_send_v7_bf16 in targets

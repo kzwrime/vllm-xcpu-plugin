@@ -118,3 +118,41 @@ def test_attention_uses_remote_expert_partition_when_rank_counts_differ(
     )
 
     assert observed == {"num_experts": 8, "num_local_experts": 8}
+
+
+def test_attention_traces_dispatch_and_combine_with_checks_enabled(
+    monkeypatch, make_af_session
+):
+    """Tracing must keep both endpoints without reading FakeTensor metadata."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from torch_xcpu.ops_defs import moe_af_v7
+
+    monkeypatch.setattr(moe_af_v7, "_ENABLE_CHECKS", True)
+    client = ExpertsClientV7(make_af_session())
+    client.initialize(16, 6, torch.bfloat16)
+
+    def remote(x, weights, ids):
+        return client.execute_layer(
+            layer_idx=1,
+            hidden_states=x,
+            topk_weights=weights,
+            topk_ids=ids,
+            num_experts=8,
+            num_local_experts=4,
+        )
+
+    x = torch.ones(3, 16, dtype=torch.bfloat16)
+    weights = torch.ones(3, 6, dtype=torch.float32)
+    ids = torch.zeros(3, 6, dtype=torch.int32)
+    graph = make_fx(remote, tracing_mode="fake", _allow_non_fake_inputs=True)(
+        x, weights, ids
+    )
+    endpoints = [
+        node.target
+        for node in graph.graph.nodes
+        if node.op == "call_function" and "moe_af_" in str(node.target)
+    ]
+    assert endpoints == [
+        torch.ops.torch_xcpu.moe_af_dispatch_send_v7_bf16.default,
+        torch.ops.torch_xcpu.moe_af_combine_recv_v7_bf16.default,
+    ]

@@ -45,6 +45,8 @@ class ExpertServiceV7:
         self,
         model: RoutedExpertsModel,
         session: AfV7Session,
+        *,
+        compile_model: bool = False,
     ) -> None:
         assert session.cluster_type == ClusterType.MOE
         assert session.ep_size == model.ep_size
@@ -56,6 +58,23 @@ class ExpertServiceV7:
         self._layers = tuple(
             self._prepare_layer(layer_idx) for layer_idx in model.layer_indices
         )
+        self._run_layer = self._execute_layer
+        if compile_model:
+            # Layers share one transaction shape/backend. Dynamic scalar layer
+            # indices and tensor weight inputs let them reuse the compiled graph.
+            # The host layer loop keeps MPI transactions and buffer reuse ordered.
+            self._run_layer = torch.compile(
+                self._execute_layer,
+                backend="inductor",
+                fullgraph=True,
+                dynamic=True,
+                options={
+                    "epilogue_fusion": False,
+                    "pattern_matcher": False,
+                    "combo_kernels": False,
+                    "benchmark_combo_kernel": False,
+                },
+            )
 
     def initialize(self) -> None:
         self.session.initialize(
@@ -72,7 +91,7 @@ class ExpertServiceV7:
         )
         self.session.sync_forward_entry()
         for layer in self._layers:
-            self._execute_layer(layer)
+            self._run_layer(layer)
         # Same-stream ordering protects per-layer reuse. Bound host submissions
         # to one model pass so the infinite service loop cannot grow the queue.
         torch.accelerator.synchronize()

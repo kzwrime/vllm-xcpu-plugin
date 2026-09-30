@@ -17,8 +17,15 @@ def parse_args() -> argparse.Namespace:
         help="0 serves until the MPMD launcher terminates the process",
     )
     parser.add_argument("--load-format", default="auto")
-    parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction,
-                        default=False)
+    parser.add_argument(
+        "--compile",
+        dest="compile_model",
+        action="store_true",
+        help="compile each receive/experts/send transaction with Inductor",
+    )
+    parser.add_argument(
+        "--trust-remote-code", action=argparse.BooleanOptionalAction, default=False
+    )
     return parser.parse_args()
 
 

@@ -11,8 +11,8 @@ class AttentionSupport:
     use_v2_model_runner: bool
     enable_expert_parallel: bool
     logical_ep_size: int
-    eager: bool
     dtype: str
+    cudagraph_enabled: bool = False
     quantization: str | None = None
     enable_dbo: bool = False
     pipeline_parallel_size: int = 1
@@ -44,13 +44,16 @@ def support_from_vllm(vllm_config: Any) -> AttentionSupport:
     )
 
     import vllm.envs as vllm_envs
+    from vllm.config import CUDAGraphMode
 
     return AttentionSupport(
         use_v2_model_runner=vllm_config.use_v2_model_runner,
         enable_expert_parallel=parallel.enable_expert_parallel,
         logical_ep_size=parallel.world_size_across_dp,
-        eager=bool(model.enforce_eager),
         dtype=str(model.dtype),
+        cudagraph_enabled=(
+            vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ),
         quantization=model.quantization,
         enable_dbo=parallel.enable_dbo,
         pipeline_parallel_size=parallel.pipeline_parallel_size,
@@ -75,14 +78,12 @@ def validate_attention_support(
         failures.append("expert parallelism must be enabled")
     if ep_size <= 0:
         failures.append("at least one F rank is required")
-    if not support.eager:
-        failures.append("compile is not supported; eager execution is required")
+    if support.cudagraph_enabled:
+        failures.append("CUDAGraph capture is not supported")
     if support.dtype.lower() not in {"bf16", "bfloat16", "torch.bfloat16"}:
         failures.append(f"only BF16 is supported, got {support.dtype!r}")
     if support.quantization not in {None, "fp8", "compressed-tensors", "quark"}:
-        failures.append(
-            f"quantization {support.quantization!r} is not supported"
-        )
+        failures.append(f"quantization {support.quantization!r} is not supported")
     unsupported = {
         "DBO": support.enable_dbo,
         "pipeline parallelism": support.pipeline_parallel_size != 1,

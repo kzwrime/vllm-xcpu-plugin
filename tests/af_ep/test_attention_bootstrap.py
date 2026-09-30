@@ -1,11 +1,14 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
+from vllm.config import CUDAGraphMode
 
 from vllm_xcpu_plugin.af_ep.attn.client_v7 import ExpertsClientV7
 from vllm_xcpu_plugin.af_ep.attn.compatibility import (
     AttentionSupport,
+    support_from_vllm,
     validate_attention_support,
 )
 
@@ -40,10 +43,38 @@ def test_attention_and_expert_rank_counts_are_independent():
         use_v2_model_runner=True,
         enable_expert_parallel=True,
         logical_ep_size=4,
-        eager=True,
         dtype="torch.bfloat16",
     )
 
     validate_attention_support(1, support)
     validate_attention_support(4, support)
     validate_attention_support(4, replace(support, logical_ep_size=1))
+
+
+def test_attention_accepts_compile_and_rejects_graph_capture():
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            world_size_across_dp=2,
+            enable_dbo=False,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_eplb=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_experts=8),
+            enforce_eager=False,
+            dtype=torch.bfloat16,
+            quantization=None,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        lora_config=None,
+        speculative_config=None,
+    )
+    validate_attention_support(2, support_from_vllm(config))
+
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    with pytest.raises(ValueError, match="CUDAGraph capture is not supported"):
+        validate_attention_support(2, support_from_vllm(config))
