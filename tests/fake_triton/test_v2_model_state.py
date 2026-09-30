@@ -133,3 +133,57 @@ print(json.dumps({
         "launches": 1,
         "bad_block_rejected": True,
     }
+
+
+def test_autoregressive_sampling_key_advances_without_rotary_positions():
+    """Sampling keys advance for reused model positions, except at the final step."""
+    repo = Path(__file__).parents[2]
+    code = """
+import json
+from types import SimpleNamespace
+import torch
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    prepare_decode_inputs, update_draft_inputs,
+)
+from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+register_vllm_kernels()
+buffers = SimpleNamespace(
+    input_ids=torch.zeros(4, dtype=torch.int32, device='mcpu'),
+    positions=torch.tensor([20, 30, 0, 0], dtype=torch.int64, device='mcpu'),
+    query_start_loc=torch.zeros(5, dtype=torch.int32, device='mcpu'),
+    seq_lens=torch.zeros(4, dtype=torch.int32, device='mcpu'),
+)
+keys = torch.tensor([21, 31, 0, 0], dtype=torch.int64, device='mcpu')
+tokens = torch.tensor([[7, 8], [9, 10]], dtype=torch.int64, device='mcpu')
+prepare_decode_inputs(
+    tokens, torch.tensor([25, 35], dtype=torch.int32, device='mcpu'),
+    torch.tensor([1, 2], dtype=torch.int32, device='mcpu'), buffers, keys,
+    128, 4, advance_draft_positions=False,
+)
+assert keys.cpu().tolist() == [22, 32, 0, 0]
+assert buffers.positions.cpu().tolist() == [20, 30, 0, 0]
+step = torch.tensor(0, dtype=torch.int64, device='mcpu')
+output = torch.zeros(2, 2, dtype=torch.int64, device='mcpu')
+hidden = torch.ones(2, 4, device='mcpu')
+next_hidden = torch.zeros(4, 4, device='mcpu')
+for i, expected_keys in ((0, [23, 33, 0, 0]), (1, [23, 33, 0, 0])):
+    step.fill_(i)
+    update_draft_inputs(
+        tokens[:, i].contiguous(), step, hidden, output, next_hidden,
+        buffers, keys, 2, 128, 2, advance_draft_positions=False,
+    )
+    assert keys.cpu().tolist() == expected_keys
+    assert buffers.positions.cpu().tolist() == [20, 30, 0, 0]
+assert output.cpu().tolist() == [[7, 8], [9, 10]]
+print(json.dumps({'passed': True}))
+"""
+    env = dict(os.environ, PYTHONPATH=str(repo), VLLM_PLUGINS="xcpu_platform_plugin")
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=repo,
+    )
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {"passed": True}
