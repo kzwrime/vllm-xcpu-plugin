@@ -19,6 +19,7 @@ def _xcpu_gumbel_sample(
     seed: torch.Tensor,
     pos: torch.Tensor,
     apply_temperature: bool,
+    is_drafting: bool,
     logits_cache: torch.Tensor | None = None,
     logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
@@ -40,6 +41,7 @@ def _xcpu_gumbel_sample(
         logits_cache=logits_cache,
         logits_cache_col=logits_cache_col,
         use_fp64=use_fp64,
+        is_drafting=is_drafting,
     )
 
 
@@ -104,6 +106,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
         seed: torch.Tensor,
         pos: torch.Tensor,
         apply_temperature: bool,
+        is_drafting: bool,
         logits_cache: torch.Tensor | None = None,
         logits_cache_col: torch.Tensor | None = None,
         use_fp64: bool = False,
@@ -116,6 +119,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
                 seed,
                 pos,
                 apply_temperature,
+                is_drafting,
                 logits_cache,
                 logits_cache_col,
                 use_fp64,
@@ -128,6 +132,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
             seed,
             pos,
             apply_temperature,
+            is_drafting,
             logits_cache,
             logits_cache_col,
             use_fp64,

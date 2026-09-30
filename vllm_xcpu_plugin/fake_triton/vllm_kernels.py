@@ -478,6 +478,7 @@ def _autoregressive_prepare_decode_inputs(launch: KernelLaunch) -> None:
         args["max_num_reqs"] >= num_reqs,
         "max_num_reqs is smaller than active decode batch",
     )
+    args["sample_src_positions_ptr"][:num_reqs].add_(1)
     torch.ops.mcpu.vllm_autoregressive_prepare_decode_inputs(
         args["draft_tokens_ptr"],
         args["draft_tokens_stride"],
@@ -517,6 +518,11 @@ def _autoregressive_update_draft_inputs(launch: KernelLaunch) -> None:
     _expect(
         args["hidden_size"] == args["hidden_states_ptr"].shape[1],
         "hidden_size mismatch",
+    )
+    args["sample_src_positions_ptr"][:num_reqs].add_(
+        (args["current_draft_step_ptr"] < args["num_speculative_steps"] - 1).to(
+            dtype=torch.int64
+        )
     )
     torch.ops.mcpu.vllm_autoregressive_update_draft_inputs(
         args["output_draft_tokens_ptr"],
@@ -1072,19 +1078,20 @@ def _rejection_insert(launch: KernelLaunch) -> None:
 
 
 def _dflash2_selector_walk(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
     args = launch.arguments
     num_reqs = launch.grid[0]
     num_steps = args["num_steps"]
     top_k = args["top_k"]
     _expect_grid(launch, (num_reqs,))
     _expect(args["BLOCK_K"] == 1 << (top_k - 1).bit_length(), "invalid BLOCK_K")
-    _expect(not args["SAMPLE_PROBABILISTIC"], "probabilistic DFlash2 is unsupported")
 
     scores = args["scores_ptr"][:num_reqs]
     candidates = args["candidate_ptr"][:num_reqs]
     _expect(scores.shape == (num_reqs, num_steps, top_k, top_k), "score shape")
     _expect(candidates.shape == (num_reqs, num_steps, top_k), "candidate shape")
-    torch.ops.mcpu.vllm_dflash2_selector_walk(
+    torch.ops.torch_xcpu.dflash2_selector_walk(
         args["scores_ptr"],
         args["candidate_ptr"],
         args["sample_pos_ptr"],
@@ -1532,18 +1539,18 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
         "_prepare_decode_inputs_kernel",
-        "ac1dcb4ec4b02e6651b540fc1fce1b7a54c2b14f0ed2bfe40378a46a51a6f465",
-        "37e3c10b0abdfb8ba5e74337038cfbc91ffae15c4607e21b4d20554414bbd7a5",
-        "v0.24.0",
+        "2c95b42783b22ef2cc91f3e325f224b2a946986eadf12a77d84d374ef48d8897",
+        "f58f0edceb3bcc8c7bf97e4d490cdea52c65d36290490519b9c711d38da42d24",
+        "fe755c88995 (#54282)",
         _autoregressive_prepare_decode_inputs,
         (),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
         "_update_draft_inputs_kernel",
-        "4a61e8fbc62acf6639ef943db78daa82232c4682e7cf319ea2036ace56965522",
-        "fec4868f0636b79a8882919a16186c294ada21359a3b52655e4109cd6430beba",
-        "v0.24.0",
+        "6a01da77eb14e736abc6504c9c1cc53383e4cf92f6bec820bb7b1b42728fcdf1",
+        "e49d918e586c113607c416e118a54563d8c85e777383233579b60c850f667968",
+        "fe755c88995 (#54282)",
         _autoregressive_update_draft_inputs,
         (),
     ),
@@ -1676,9 +1683,9 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_resample_kernel",
-        "7034a71604e0ed6a9c84668f40829d1344eb82e57aee897bf42bab9ce0ae4450",
+        "f6f1c6654494ce131a001adf6a037cade8f7a93a5df7164eecf2028549a78bcc",
         "2cb197288d2aabd1719d7dd1a599f48a5c059f1a8c4549196347eb95ea28af2a",
-        "b389ac2946",
+        "fe755c88995 (#54282)",
         _rejection_resample,
         (),
     ),
@@ -1694,9 +1701,9 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.spec_decode.dflash2.speculator",
         "_selector_walk_kernel",
-        "4f35405bf300b137c3fcac12c9ba78efb2a2135c40e1f3b5abafa6ec8a374720",
+        "184f60427633418ff15fc8e6f07de0b9ea88a08637c10c9d7f62342ce9c538f7",
         "600d4f3329d7088336c4c2bbbea178eab7862f4f454c0fbd7ca5f9696be104ba",
-        "b389ac2946",
+        "fe755c88995 (#54282)",
         _dflash2_selector_walk,
         ("num_warps",),
     ),
