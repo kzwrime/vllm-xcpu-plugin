@@ -14,7 +14,38 @@ def _indexer_cache_forward(k, weight, bias, positions, cos_sin, cache):
     return cache
 
 
-def test_indexer_cache_aot_reads_current_slot_mapping(monkeypatch, tmp_path):
+def _indexer_qk_cache_forward(k, weight, bias, positions, cos_sin, cache, q, weights):
+    from vllm_xcpu_plugin.layers.sparse_attn_indexer import _indexer_qk_cache
+
+    rotated, scaled = _indexer_qk_cache(
+        q,
+        weights,
+        k,
+        weight,
+        bias,
+        positions,
+        cos_sin,
+        cache,
+        "indexer.k_cache",
+        1e-6,
+        128**-0.5,
+        32**-0.5,
+        False,
+    )
+    return cache, rotated, scaled
+
+
+@pytest.mark.parametrize(
+    "forward,op_name",
+    [
+        (_indexer_cache_forward, "fused_indexer_k_norm_rope_cache"),
+        (_indexer_qk_cache_forward, "fused_indexer_qk_rope_quant_cache_out"),
+    ],
+    ids=["k", "qk"],
+)
+def test_indexer_cache_aot_reads_current_slot_mapping(
+    monkeypatch, tmp_path, forward, op_name
+):
     from pathlib import Path
 
     import torch_mcpu  # noqa: F401
@@ -45,13 +76,18 @@ def test_indexer_cache_aot_reads_current_slot_mapping(monkeypatch, tmp_path):
         k = torch.randn(rows, 160, device="cpu").bfloat16().to("mcpu")[:, :128]
         positions = (torch.arange(rows, device="cpu") % 37).to("mcpu")
         cache = torch.full((2, 64, 132), 0xA5, dtype=torch.uint8, device="mcpu")
-        return (k, weight, bias, positions, cos_sin, cache), slots
+        args = (k, weight, bias, positions, cos_sin, cache)
+        if forward is _indexer_qk_cache_forward:
+            q = torch.randn(rows, 32, 128, device="cpu").bfloat16().to("mcpu")
+            weights = torch.randn(rows, 32, device="cpu").bfloat16().to("mcpu")
+            args += (q, weights)
+        return args, slots
 
     weight = torch.randn(128, device="cpu").to("mcpu")
     bias = torch.randn(128, device="cpu").to("mcpu")
     cos_sin = torch.randn(37, 64, device="cpu").bfloat16().to("mcpu")
     args, slots = inputs(9, [0, 2, 65, -1])
-    for tensor in (args[0], args[3], slots):
+    for tensor in (args[0], args[3], slots, *args[6:]):
         torch._dynamo.mark_dynamic(tensor, 0)
     torch._dynamo.reset()
     with (
@@ -60,17 +96,18 @@ def test_indexer_cache_aot_reads_current_slot_mapping(monkeypatch, tmp_path):
             cpp_wrapper=True, enable_auto_functionalized_v2=False
         ),
     ):
-        wrapper = torch.compile(_indexer_cache_forward, fullgraph=True, dynamic=False)
+        wrapper = torch.compile(forward, fullgraph=True, dynamic=False)
         compiled, code = run_and_get_code(wrapper.aot_compile, (args, {}))
         code = "\n".join(code)
-        assert "aoti_torch_mcpu_fused_indexer_k_norm_rope_cache" in code
+        assert f"aoti_torch_mcpu_{op_name}" in code
+        assert "from_metadata" not in code
         assert "PyObject_CallObject" not in code
         assert "vllm_xcpu.indexer_k_cache" not in code
         artifact = tmp_path / "indexer.aot"
         compiled.save_compiled_function(str(artifact))
         with artifact.open("rb") as handle:
             loaded = torch.compiler.load_compiled_function(
-                handle, f_globals=_indexer_cache_forward.__globals__
+                handle, f_globals=forward.__globals__
             )
         for target in (compiled, loaded):
             target.disable_guard_check()
@@ -84,14 +121,29 @@ def test_indexer_cache_aot_reads_current_slot_mapping(monkeypatch, tmp_path):
                 (7, [-1, -1, -1]),
             ):
                 args, slots = inputs(rows, values)
-                expected = args[-1].clone()
+                expected = args[5].clone()
                 torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
                     *args[:5], slots, expected, 1e-6, False
                 )
-                target(*args)
+                actual = target(*args)
                 torch.testing.assert_close(
-                    args[-1].cpu(), expected.cpu(), rtol=0, atol=0
+                    args[5].cpu(), expected.cpu(), rtol=0, atol=0
                 )
+                if forward is _indexer_qk_cache_forward:
+                    expected_qw = torch_xcpu.ops.fused_indexer_q_rope_quant(
+                        args[3],
+                        args[6],
+                        args[4],
+                        args[7],
+                        128**-0.5,
+                        32**-0.5,
+                        False,
+                        False,
+                    )
+                    for out, reference in zip(actual[1:], expected_qw):
+                        torch.testing.assert_close(
+                            out.cpu(), reference.cpu(), rtol=0, atol=0
+                        )
     torch._dynamo.reset()
 
 

@@ -10,10 +10,12 @@ semantics.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from vllm_xcpu_plugin.fake_triton.runtime import (
@@ -32,10 +34,36 @@ class UpstreamOperator:
     expected_source_hash: str
     expected_signature_hash: str
     replacement: str
+    alternate_signature_hashes: tuple[str, ...] = ()
 
     @property
     def qualname(self) -> str:
         return f"{self.module}.{self.name}"
+
+
+@dataclass(frozen=True)
+class UpstreamSourceFile:
+    category: str
+    module: str
+    expected_sha256: str
+
+
+# Pin whole files as well as functions: helper changes inside these modules
+# must stop a vLLM upgrade before the XCPU C++ implementation is used.
+# Reviewed 2026-09-30: c26996205 indexer / 23d899fdc metadata, including
+# sliced prefill reuse, native decode padding bounds and seq_lens_cpu hints.
+UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
+    UpstreamSourceFile(
+        "sparse_indexer",
+        "vllm.model_executor.layers.sparse_attn_indexer",
+        "dbd69b2a2fe5a11945ef5c68ab6b4f8159a47b12e70251187f5c16d71498fda2",
+    ),
+    UpstreamSourceFile(
+        "sparse_indexer",
+        "vllm.v1.attention.backends.mla.indexer",
+        "63e799dbe2bccd4d11d97409841858d51249a24f076ee0cf0cea2582e7d468f3",
+    ),
+)
 
 
 def _operator(
@@ -47,6 +75,7 @@ def _operator(
     replacement: str,
     *,
     source_version: str,
+    alternate_signature_hashes: tuple[str, ...] = (),
 ) -> UpstreamOperator:
     return UpstreamOperator(
         category=category,
@@ -56,6 +85,7 @@ def _operator(
         expected_source_hash=source_hash,
         expected_signature_hash=signature_hash,
         replacement=replacement,
+        alternate_signature_hashes=alternate_signature_hashes,
     )
 
 
@@ -63,6 +93,29 @@ def _operator(
 # field from Git topology or replace it with a package-wide version: XCPU vLLM
 # branches are assembled by cherry-pick and manual porting, and are not linear.
 UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
+    _operator(
+        "sparse_indexer",
+        "vllm.model_executor.layers.sparse_attn_indexer",
+        "sparse_attn_indexer",
+        "0d4612f7c0b932e9b944dd0e04015a28df69777fd2832268e85c1377e853ce48",
+        "b3a50a85cd381ff1d1e9130f0decfaf9e97aa7daddc84c4151d55767c8f4fe76",
+        "torch.ops.torch_xcpu.sparse_attn_indexer",
+        source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
+        # LayerNameType resolves to str when VLLM_USE_LAYERNAME=0 and to
+        # LayerName otherwise. Both are the same source-level annotation.
+        alternate_signature_hashes=(
+            "879834c9768957a7395adc410350e41218aa14ad7781c96622112fa3b1633b23",
+        ),
+    ),
+    _operator(
+        "sparse_indexer",
+        "vllm.v1.attention.backends.utils",
+        "split_decodes_and_prefills",
+        "e0d15f819bc568604d8fc3f3cd3c933992e73823551c17b19b0021157a390570",
+        "441a21b245c30963704e4bcc4aa2a1aa4c994b575954c3318efa2b3d045b08e5",
+        "torch.ops.torch_xcpu.sparse_attn_indexer",
+        source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
+    ),
     _operator(
         "attention",
         "vllm.v1.attention.ops.triton_unified_attention",
@@ -464,10 +517,13 @@ def _mismatch_message(
             "source hash "
             f"expected {target.expected_source_hash}, got {actual_source_hash}"
         )
-    if actual_signature_hash != target.expected_signature_hash:
+    if actual_signature_hash not in (
+        target.expected_signature_hash,
+        *target.alternate_signature_hashes,
+    ):
+        expected = (target.expected_signature_hash, *target.alternate_signature_hashes)
         changed.append(
-            "signature hash "
-            f"expected {target.expected_signature_hash}, got {actual_signature_hash}"
+            f"signature hash expected one of {expected}, got {actual_signature_hash}"
         )
     return (
         f"{target.qualname}: upstream operator compatibility mismatch "
@@ -487,6 +543,20 @@ def verify_upstream_compatibility(
     """Validate all selected non-Fake-Triton replacement dependencies."""
     selected = set(categories) if categories is not None else None
     checked = []
+    for source_file in UPSTREAM_SOURCE_FILES:
+        if selected is not None and source_file.category not in selected:
+            continue
+        module = importlib.import_module(source_file.module)
+        module_path = Path(inspect.getfile(module))
+        actual_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+        if actual_sha256 != source_file.expected_sha256:
+            raise KernelVersionError(
+                f"{source_file.module}: upstream source file changed "
+                f"(expected SHA256 {source_file.expected_sha256}, got "
+                f"{actual_sha256}). Review all helper and metadata changes "
+                "against the XCPU sparse-indexer translation before updating "
+                "the file hash in upstream_compatibility.py."
+            )
     for target in UPSTREAM_OPERATORS:
         if selected is not None and target.category not in selected:
             continue
@@ -506,7 +576,8 @@ def verify_upstream_compatibility(
         actual_signature_hash = _signature_fingerprint(inspect.signature(fn))
         if (
             actual_source_hash != target.expected_source_hash
-            or actual_signature_hash != target.expected_signature_hash
+            or actual_signature_hash
+            not in (target.expected_signature_hash, *target.alternate_signature_hashes)
         ):
             raise KernelVersionError(
                 _mismatch_message(

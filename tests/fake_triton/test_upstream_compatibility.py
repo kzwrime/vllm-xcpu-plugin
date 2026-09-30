@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import hashlib
 import inspect
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,48 @@ def test_non_registry_operator_version_is_per_target(monkeypatch):
     monkeypatch.setattr(compatibility, "UPSTREAM_OPERATORS", (target,))
 
     assert compatibility.verify_upstream_compatibility(("test",)) == (target,)
+
+
+def test_source_guard_accepts_only_listed_signature_variants(monkeypatch):
+    actual_signature = _signature_fingerprint(inspect.signature(_reference_kernel))
+    target = compatibility.UpstreamOperator(
+        category="test",
+        module=__name__,
+        name="_reference_kernel",
+        source_version="v0.25.1",
+        expected_source_hash=_source_fingerprint(_reference_kernel),
+        expected_signature_hash="other-environment-signature",
+        replacement="torch_xcpu.ops.reference",
+        alternate_signature_hashes=(actual_signature,),
+    )
+    monkeypatch.setattr(compatibility, "UPSTREAM_OPERATORS", (target,))
+    assert compatibility.verify_upstream_compatibility(("test",)) == (target,)
+
+    monkeypatch.setattr(
+        compatibility,
+        "UPSTREAM_OPERATORS",
+        (replace(target, alternate_signature_hashes=()),),
+    )
+    with pytest.raises(KernelVersionError, match="signature hash"):
+        compatibility.verify_upstream_compatibility(("test",))
+
+
+def test_source_file_guard_catches_helper_changes(monkeypatch):
+    monkeypatch.setattr(compatibility, "UPSTREAM_OPERATORS", ())
+    target = compatibility.UpstreamSourceFile(
+        category="test", module=__name__, expected_sha256="stale-file-hash"
+    )
+    monkeypatch.setattr(compatibility, "UPSTREAM_SOURCE_FILES", (target,))
+    with pytest.raises(KernelVersionError, match="source file changed"):
+        compatibility.verify_upstream_compatibility(("test",))
+
+    correct_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        compatibility,
+        "UPSTREAM_SOURCE_FILES",
+        (replace(target, expected_sha256=correct_hash),),
+    )
+    assert compatibility.verify_upstream_compatibility(("test",)) == ()
 
 
 def test_non_registry_source_drift_reports_manual_update(monkeypatch):
