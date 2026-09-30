@@ -237,6 +237,10 @@ def maybe_patch_gdn_attention() -> None:
         return
     verify_upstream_compatibility(("conv", "gdn"))
 
+    from vllm_xcpu_plugin.gdn_metadata_patch import maybe_patch_gdn_metadata
+
+    maybe_patch_gdn_metadata()
+
     _ = (
         gdn.fused_gdn_gating,
         gdn.fused_post_conv_prep,
