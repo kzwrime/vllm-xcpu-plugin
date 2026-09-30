@@ -50,13 +50,15 @@ class UpstreamSourceFile:
 
 # Pin whole files as well as functions: helper changes inside these modules
 # must stop a vLLM upgrade before the XCPU C++ implementation is used.
-# Reviewed 2026-09-30: c26996205 indexer / 23d899fdc metadata, including
+# Reviewed 2026-09-30: 2902aaaeb indexer / 23d899fdc metadata, including
 # sliced prefill reuse, native decode padding bounds and seq_lens_cpu hints.
+# 2902aaaeb only skips a redundant clear for fully overwritten XCPU decode rows;
+# the C++ core owns buffer initialization and is unaffected by that change.
 UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
-        "dbd69b2a2fe5a11945ef5c68ab6b4f8159a47b12e70251187f5c16d71498fda2",
+        "2f6336a9ebbfc0a7de6d7e38ba9502bde11b0ee7834d7ca94b3bf973bf9a5cd2",
     ),
     UpstreamSourceFile(
         "sparse_indexer",
@@ -97,7 +99,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
         "sparse_attn_indexer",
-        "0d4612f7c0b932e9b944dd0e04015a28df69777fd2832268e85c1377e853ce48",
+        "b2335060b3ad702f2dfe8b45eaab48e231ebfb1c1850260ad315c4641c64ec4a",
         "b3a50a85cd381ff1d1e9130f0decfaf9e97aa7daddc84c4151d55767c8f4fe76",
         "torch.ops.torch_xcpu.sparse_attn_indexer",
         source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
