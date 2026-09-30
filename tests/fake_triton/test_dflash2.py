@@ -104,11 +104,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import _selector_walk_ker
 from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
 register_vllm_kernels()
 torch.manual_seed(19)
-rows, steps, top_k, vocab = 12, 3, 4, 128
+rows, steps, top_k, vocab = 12, 3, 16, 128
 scores = torch.randn(rows, steps, top_k, top_k)
-candidates = torch.tensor(
-    [[[7, 29, 80, 3], [9, 33, 101, 12], [77, 42, 6, 119]]]
-).expand(rows, -1, -1).contiguous()
+candidates = torch.randperm(vocab)[:steps * top_k].view(1, steps, top_k)
+candidates = candidates.expand(rows, -1, -1).contiguous()
 positions = torch.arange(rows * steps, dtype=torch.int64) + 10
 states = torch.arange(rows, dtype=torch.int32).repeat_interleave(steps)
 states[-steps:] = -1
@@ -142,7 +141,7 @@ for use_fp64 in (False, True):
     _selector_walk_kernel[(rows,)](
         scores.to('mcpu'), candidates.to('mcpu'), positions.to('mcpu'),
         states.to('mcpu'), temperatures.to('mcpu'), seeds.to('mcpu'), tokens, realized,
-        num_steps=steps, top_k=top_k, BLOCK_K=4, SAMPLE_PROBABILISTIC=True,
+        num_steps=steps, top_k=top_k, BLOCK_K=16, SAMPLE_PROBABILISTIC=True,
         USE_FP64=use_fp64, num_warps=1,
     )
     assert torch.equal(tokens.cpu(), expected)
