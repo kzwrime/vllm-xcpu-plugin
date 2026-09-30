@@ -272,6 +272,6 @@ def maybe_patch_gdn_metadata() -> None:
 
     verify_upstream_compatibility(("gdn_metadata",))
     _ORIGINAL_GDN_METADATA_BUILD = GDNAttentionMetadataBuilder.build
-    GDNAttentionMetadataBuilder.build = wraps(_ORIGINAL_GDN_METADATA_BUILD)(
+    GDNAttentionMetadataBuilder.build = wraps(_ORIGINAL_GDN_METADATA_BUILD)(  # type: ignore[method-assign]
         _xcpu_gdn_metadata_build
     )
