@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""MPI v5 fixed-record prepare with compact finalize return buffers."""
+"""MPI v5 fixed-slot prepare/finalize sharing one receive window."""
 
 from collections.abc import Callable
 
