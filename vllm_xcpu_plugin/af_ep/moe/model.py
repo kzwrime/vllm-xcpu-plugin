@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -11,6 +11,8 @@ from .weights import RoutedExpertsWeightLoader, WeightLoadAudit
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_xcpu_plugin.layers.fused_moe.routed_experts import XcpuRoutedExperts
 
 
 class RoutedExpertsModel(torch.nn.Module):
@@ -62,12 +64,10 @@ class RoutedExpertsModel(torch.nn.Module):
         from vllm.config import set_current_vllm_config
 
         with set_current_vllm_config(vllm_config):
-            self.routed_experts = torch.nn.ModuleDict(
-                {
-                    str(layer_idx): self._build_routed_experts(layer_idx)
-                    for layer_idx in self.layer_indices
-                }
-            )
+            self.routed_experts = torch.nn.ModuleDict({
+                str(layer_idx): self._build_routed_experts(layer_idx)
+                for layer_idx in self.layer_indices
+            })
         self._weights_finalized = False
         self.weight_audit: WeightLoadAudit | None = None
 
@@ -82,13 +82,10 @@ class RoutedExpertsModel(torch.nn.Module):
         relative_name: str,
         weight: torch.Tensor,
     ) -> Collection[str]:
-        return tuple(
-            self.routed_experts[str(layer_idx)].load_weights([(relative_name, weight)])
-        )
+        layer = cast("XcpuRoutedExperts", self.routed_experts[str(layer_idx)])
+        return tuple(layer.load_weights([(relative_name, weight)]))
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if self._weights_finalized:
             raise RuntimeError("AF-EP F-side weights cannot be hot reloaded")
         audit = RoutedExpertsWeightLoader(self).load(weights)
@@ -105,7 +102,8 @@ class RoutedExpertsModel(torch.nn.Module):
         from vllm.config import set_current_vllm_config
 
         with set_current_vllm_config(self._vllm_config):
-            for layer in self.routed_experts.values():
+            for module in self.routed_experts.values():
+                layer = cast("XcpuRoutedExperts", module)
                 layer.quant_method.process_weights_after_loading(layer)
         self._weights_finalized = True
 
@@ -118,7 +116,7 @@ class RoutedExpertsModel(torch.nn.Module):
             raise RuntimeError("XCPU fused-MoE kernel was not installed")
         return fused_moe
 
-    def _build_routed_experts(self, layer_idx: int):
+    def _build_routed_experts(self, layer_idx: int) -> XcpuRoutedExperts:
         from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         from vllm.model_executor.layers.fused_moe.config import (
             FusedMoEConfig,

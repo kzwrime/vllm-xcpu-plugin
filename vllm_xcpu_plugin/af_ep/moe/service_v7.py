@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -12,6 +12,7 @@ from vllm_xcpu_plugin.distributed.mpi_world import ClusterType
 from ..common.session_v7 import AfV7Session
 
 if TYPE_CHECKING:
+    from vllm_xcpu_plugin.layers.fused_moe.routed_experts import XcpuRoutedExperts
     from vllm_xcpu_plugin.layers.fused_moe.workspace import FusedMoeWorkspace
 
     from .model import RoutedExpertsModel
@@ -137,7 +138,8 @@ class ExpertServiceV7:
         # torch.accelerator.synchronize()
 
     def _prepare_layer(self, layer_idx: int) -> _ExpertLayer:
-        expert_map = self.model.routed_experts[str(layer_idx)].expert_map
+        layer = cast("XcpuRoutedExperts", self.model.routed_experts[str(layer_idx)])
+        expert_map = layer.expert_map
         if expert_map is not None:
             expert_map = expert_map.to(
                 device=self._buffers.hidden_states.device,
