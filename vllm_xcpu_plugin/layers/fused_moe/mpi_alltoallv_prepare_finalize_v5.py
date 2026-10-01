@@ -173,13 +173,14 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             dtype=a1.dtype,
             device=device,
         )
-        recv_topk_ids = torch.full(
+        # Unpack overwrites every valid row; Experts only reads those rows via
+        # num_input_rows_valid, so the capacity tail needs no initialization.
+        recv_topk_ids = torch.empty(
             (recv_input_rows_capacity, topk),
-            -1,
             dtype=torch.int32,
             device=device,
         )
-        recv_topk_weights = torch.ones(
+        recv_topk_weights = torch.empty(
             (recv_input_rows_capacity, topk),
             dtype=topk_weights.dtype,
             device=device,
