@@ -274,7 +274,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         # Since recv_topk_ids is now 1D [total_tokens],
         # we treat it as topk=1 for the expert counter
         # The local expert execution will treat these as individual items.
-        # XCPU 不使用 Triton 计数；先将全局专家编号映射为本地编号。
         local_ids = recv_topk_ids.long()
         if expert_map is not None:
             local_ids = expert_map[local_ids].long()
@@ -294,7 +293,6 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
                 None,  # no quant scale
                 expert_tokens_meta,
                 ret_topk_ids,
-                # Experts 只使用 [C,1] shape; Finalize 使用原始 router weight。
                 torch.empty_like(ret_topk_ids, dtype=topk_weights.dtype),
             )
 

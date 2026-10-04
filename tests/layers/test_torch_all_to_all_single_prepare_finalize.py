@@ -1,5 +1,3 @@
-"""验证 EP 收包后的本地专家计数，不依赖 Triton 或分布式服务。"""
-
 import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
