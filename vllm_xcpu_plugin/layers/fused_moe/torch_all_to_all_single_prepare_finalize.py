@@ -293,6 +293,7 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
                 None,  # no quant scale
                 expert_tokens_meta,
                 ret_topk_ids,
+                # Experts 只使用 [C,1] shape; Finalize 使用原始 router weight。
                 torch.empty_like(ret_topk_ids, dtype=topk_weights.dtype),
             )
 
