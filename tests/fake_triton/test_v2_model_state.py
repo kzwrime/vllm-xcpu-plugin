@@ -55,6 +55,62 @@ print(json.dumps({
     }
 
 
+def test_postprocess_align_checkpoints_all_states_with_mapped_request_slot():
+    """State-zero reset must not change other layers' accepted-token position."""
+    repo = Path(__file__).parents[2]
+    code = """
+from types import SimpleNamespace
+import torch
+from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+
+register_vllm_kernels()
+def tensor(values, dtype=torch.int32):
+    return torch.tensor(values, dtype=dtype, device="mcpu")
+
+block_table = tensor([[1, 2, 3, 4], [0, 0, 0, 0]])
+states = [(torch.arange(20, dtype=torch.float32).reshape(5, 4) + i * 100)
+          .to("mcpu") for i in range(3)]
+before = [state.cpu().clone() for state in states]
+accepted = tensor([77, 88, 3])
+ctx = SimpleNamespace(
+    is_initialized=True, num_layers=3, num_state_types=1, block_size=4,
+    num_accepted_tokens_out=tensor([0, 0, 0]),
+    block_table_ptrs=tensor([block_table.data_ptr()], torch.int64),
+    block_table_stride_req=4,
+    state_base_addrs=tensor([s.data_ptr() for s in states], torch.int64),
+    state_block_strides=tensor([16] * 3, torch.int64),
+    state_elem_sizes=tensor([4] * 3),
+    state_inner_sizes=tensor([4] * 3, torch.int64),
+    state_conv_widths=tensor([0] * 3),
+    state_group_indices=tensor([0] * 3),
+    state_dim_row_count=tensor([0] * 3),
+    state_dim_row_stride=tensor([0] * 3, torch.int64),
+)
+MambaSpecDecodeGPUContext.run_fused_postprocess_align(
+    ctx, 2, accepted, tensor([0, 0, 0]), tensor([0, 0, 4]), tensor([2, -1]))
+torch.mcpu.synchronize()
+for state, original in zip(states, before):
+    expected = original.clone()
+    expected[1] = original[3]
+    torch.testing.assert_close(state.cpu(), expected)
+assert accepted.cpu().tolist() == [77, 88, 1]
+assert ctx.num_accepted_tokens_out.cpu().tolist() == [77, 88, 3]
+print("all layer states and acceptance snapshot are correct")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo)
+    env["VLLM_PLUGINS"] = "xcpu_platform_plugin"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "all layer states and acceptance snapshot are correct" in result.stdout
+
+
 def test_preprocess_mamba_align_dispatches_with_current_vllm_abi():
     repo = Path(__file__).parents[2]
     code = """

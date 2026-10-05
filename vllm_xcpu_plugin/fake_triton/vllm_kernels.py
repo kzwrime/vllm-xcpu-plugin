@@ -16,6 +16,8 @@ from .runtime import FakeJITFunction, InvalidLaunchError, KernelLaunch, get_regi
 # Informational only: this is the baseline at which the manifest was created.
 # Never use it as a registration default or bulk-update it during a port. Each
 # kernel below owns its literal source_version and may advance independently.
+# New audits record the reviewed label, local vLLM commit, and upstream commit; see
+# docs/TRITON_COMPATIBILITY_GUIDE.md for provenance and fingerprint rules.
 _MANIFEST_BASELINE_VERSION = "v0.24.0"
 
 logger = logging.getLogger(__name__)
@@ -716,7 +718,7 @@ def _postprocess_mamba(launch: KernelLaunch) -> None:
         and args["idx_mapping_ptr"] is not None
         and args["num_scheduled_tokens_ptr"] is None
         and args["num_draft_tokens_ptr"] is None
-        and args["num_accepted_tokens_out_ptr"] is None
+        and args["num_accepted_tokens_out_ptr"] is not None
     )
     _expect(
         v1_mode or v2_align_mode,
@@ -1593,9 +1595,11 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.mamba_utils",
         "postprocess_mamba_fused_kernel",
-        "fbb8149128bd42bc175a2e3ae42b8600634a0d973ce7098b7a076c1bfa7acf6c",
+        "4ea8ff600d9b0df472320d75c0f7b3a63f12a41991f6478173fb6ac0b45ec2c3",
         "34919a7a6f15f7639eb0ee59abebf561f2c48b1243eee651aa03adeafd7ec97b",
-        "v0.25.1",
+        # Audited vLLM snapshot and upstream #50432; full provenance is in
+        # docs/TRITON_AUDIT_MAMBA_ALIGN_20261005.md.
+        "v0.25.1; local=377c203f180c; upstream=c2881ce60302",
         _postprocess_mamba,
         (),
     ),
