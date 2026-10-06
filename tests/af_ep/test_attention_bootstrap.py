@@ -78,3 +78,35 @@ def test_attention_accepts_compile_and_rejects_graph_capture():
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     with pytest.raises(ValueError, match="CUDAGraph capture is not supported"):
         validate_attention_support(2, support_from_vllm(config))
+
+
+@pytest.mark.parametrize("version", [7, 8])
+def test_bootstrap_selects_requested_transport(monkeypatch, make_af_session, version):
+    from vllm_xcpu_plugin.af_ep.attn import bootstrap
+    from vllm_xcpu_plugin.af_ep.attn.client_v8 import ExpertsClientV8
+    from vllm_xcpu_plugin.distributed.mpi_world import ClusterType
+
+    # Reuse session construction while testing the real backend selection.
+    session = make_af_session(version=version)
+    monkeypatch.setattr(bootstrap, f"AfV{version}Session", lambda *a, **kw: session)
+    monkeypatch.setattr(bootstrap, "get_remote_experts_client", lambda: None)
+    registered = []
+    monkeypatch.setattr(bootstrap, "register_remote_experts_client", registered.append)
+    monkeypatch.setattr(bootstrap, "support_from_vllm", lambda config: None)
+    monkeypatch.setattr(bootstrap, "validate_attention_support", lambda *args: None)
+    client = bootstrap.bootstrap_attention_worker(
+        mpi_world=SimpleNamespace(
+            cluster_type=ClusterType.ATTN, cluster_size=2, cluster_rank=0
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                all2all_backend=f"mpi_alltoallv_v{version}"
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        ),
+        model_world_rank=0,
+        model_world_size=2,
+    )
+    assert isinstance(client, ExpertsClientV8 if version == 8 else ExpertsClientV7)
+    assert registered == [client]
+    assert client._session.metadata[0].item() == (2 if version == 8 else 1)

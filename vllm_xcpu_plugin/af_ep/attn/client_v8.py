@@ -1,4 +1,4 @@
-"""Attention-rank client for synchronous AF-EP V7 routed experts."""
+"""Attention-rank client for synchronous AF-EP V8 routed experts."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 
 from vllm_xcpu_plugin.distributed.mpi_world import ClusterType
 
-from ..common.session_v7 import AfV7Session
+from ..common.session_v8 import AfV8Session
 from .runtime import ExpertsClient
 
 # All A/F ranks enter dispatch/combine in the same model layer order.
@@ -36,7 +36,7 @@ class AttentionWorkspace:
     combine_workspace: torch.Tensor
 
 
-class ExpertsClientV7(ExpertsClient):
+class ExpertsClientV8(ExpertsClient):
     """Execute remote routed experts with one workspace shared across layers.
 
     Calls must be serialized on one device and one execution stream; this client
@@ -45,7 +45,7 @@ class ExpertsClientV7(ExpertsClient):
     Same-stream ordering keeps workspace reuse safe between consecutive layers.
     """
 
-    def __init__(self, session: AfV7Session) -> None:
+    def __init__(self, session: AfV8Session) -> None:
         assert session.cluster_type == ClusterType.ATTN
         self._session = session
         self._workspace: AttentionWorkspace | None = None
@@ -98,7 +98,7 @@ class ExpertsClientV7(ExpertsClient):
         self._session.validate_initialized(hidden_size, topk, hidden_states.dtype)
         workspace = self._ensure_workspace(hidden_states, topk)
         return_row_indices = workspace.return_row_indices[:num_rows]
-        xcpu_ops.moe_af_dispatch_send_v7(
+        xcpu_ops.moe_af_dispatch_send_v8(
             return_row_indices,
             workspace.send_rows_per_expert_rank,
             workspace.dispatch_send_buffer,
@@ -114,9 +114,10 @@ class ExpertsClientV7(ExpertsClient):
         )
 
         output = torch.empty_like(hidden_states)
-        xcpu_ops.moe_af_combine_recv_v7(
+        xcpu_ops.moe_af_combine_recv_v8(
             output,
             return_row_indices,
+            workspace.send_rows_per_expert_rank,
             self._session.metadata,
             self._session.communicator_handle,
             workspace.combine_workspace[:num_rows],
@@ -148,10 +149,9 @@ class ExpertsClientV7(ExpertsClient):
                 device=hidden_states.device,
             ),
             dispatch_send_buffer=torch.empty(
-                # 两种 pack 共用发送区；稠密空目标共用末尾的 int32 零计数。
+                # 固定槽和稠密 pack 共用缓冲区，按两者容量上界的较大值分配。
                 moe_prepare_dispatch_buffer_bytes(
-                    self._session.ep_size, capacity, topk, record_bytes,
-                    send_empty_header=True,
+                    self._session.ep_size, capacity, topk, record_bytes
                 ),
                 dtype=torch.uint8,
                 device=hidden_states.device,

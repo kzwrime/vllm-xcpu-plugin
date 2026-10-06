@@ -234,6 +234,18 @@ class MpiAfV7PrepareFinalizeFactory(MoEPrepareFinalizeFactory):
 
 
 @register_moe_prepare_finalize_factory
+class MpiAfV8PrepareFinalizeFactory(MoEPrepareFinalizeFactory):
+    """Reserve V8 for the AF client; it has no colocated prepare/finalize."""
+
+    backend_name = "mpi_alltoallv_v8"
+    supports_sequence_parallel = True
+
+    @classmethod
+    def create(cls, **kwargs: Any) -> FusedMoEPrepareAndFinalize:
+        raise RuntimeError("mpi_alltoallv_v8 requires the AF-EP remote experts client")
+
+
+@register_moe_prepare_finalize_factory
 class MpiAlltoallvLegacyPrepareFinalizeFactory(_MpiAlltoallvPrepareFinalizeFactory):
     backend_name = "mpi_alltoallv"
     version = "unversioned backend"

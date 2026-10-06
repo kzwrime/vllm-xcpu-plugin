@@ -14,8 +14,11 @@ class ExpertServiceOptions:
     load_format: str = "auto"
     trust_remote_code: bool = False
     compile_model: bool = False
+    all2all_backend: str = "mpi_alltoallv_v7"
 
     def __post_init__(self) -> None:
+        if self.all2all_backend not in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
+            raise ValueError(f"unsupported AF-EP backend: {self.all2all_backend}")
         if self.max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive")
         if self.max_model_passes < 0:
@@ -39,7 +42,10 @@ def run_expert_service(options: ExpertServiceOptions) -> None:
     _serve_model_passes(service, options.max_model_passes)
     import torch_xcpu
 
-    torch_xcpu.ops.moe_af_v7_cleanup()
+    if options.all2all_backend == "mpi_alltoallv_v8":
+        torch_xcpu.ops.moe_af_v8_cleanup()
+    else:
+        torch_xcpu.ops.moe_af_v7_cleanup()
     mpi_world.global_world_comm.Barrier()
     mpi.Finalize()
 
@@ -59,11 +65,18 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
     from vllm_xcpu_plugin.distributed.mpi_world import ClusterType
 
     from ..common.session_v7 import AfV7Session
+    from ..common.session_v8 import AfV8Session
     from .model import RoutedExpertsModel
     from .service_v7 import ExpertServiceV7
+    from .service_v8 import ExpertServiceV8
 
     assert mpi_world.cluster_type == ClusterType.MOE
-    session = AfV7Session(
+    session_type = (
+        AfV8Session
+        if options.all2all_backend == "mpi_alltoallv_v8"
+        else AfV7Session
+    )
+    session = session_type(
         mpi_world,
         max_rows_per_attention_rank=options.max_num_batched_tokens,
     )
@@ -88,6 +101,7 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
         ep_rank=session.role_rank,
         max_num_tokens=options.max_num_batched_tokens,
         device="mcpu",
+        all2all_backend=options.all2all_backend,
     )
     loader = get_model_loader(load_config)
     with set_current_vllm_config(vllm_config):
@@ -99,10 +113,13 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
         audit = model.weight_audit
         assert audit is not None
         weight_summary = (
-            f"loaded={audit.loaded_count} "
-            f"remote={len(audit.remote_checkpoint_names)}"
+            f"loaded={audit.loaded_count} remote={len(audit.remote_checkpoint_names)}"
         )
-    service = ExpertServiceV7(model, session, compile_model=options.compile_model)
+    service: ExpertServiceV8 | ExpertServiceV7
+    if isinstance(session, AfV8Session):
+        service = ExpertServiceV8(model, session, compile_model=options.compile_model)
+    else:
+        service = ExpertServiceV7(model, session, compile_model=options.compile_model)
     print(f"AF-EP F{session.role_rank} weights ready: {weight_summary}", flush=True)
     execution_mode = "compile" if options.compile_model else "eager"
     print(f"AF-EP F{session.role_rank} execution mode: {execution_mode}", flush=True)

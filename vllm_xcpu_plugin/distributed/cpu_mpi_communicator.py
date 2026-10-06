@@ -19,6 +19,7 @@ MPI_ALLTOALLV_BACKENDS = {
     "mpi_alltoallv_v5",
     "mpi_alltoallv_v6",
     "mpi_alltoallv_v7",
+    "mpi_alltoallv_v8",
 }
 
 
@@ -90,11 +91,11 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         )
 
         if self.use_all2all:
-            if self.all2all_backend == "mpi_alltoallv_v7":
+            if self.all2all_backend in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
                 import vllm_xcpu_plugin.envs as envs_xcpu
 
                 if not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP:
-                    raise ValueError("mpi_alltoallv_v7 requires AF-EP")
+                    raise ValueError(f"{self.all2all_backend} requires AF-EP")
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":
