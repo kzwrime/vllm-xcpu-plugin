@@ -92,8 +92,14 @@ def test_gdn_metadata_patch_fallback_forwards_original_arguments(
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align", "all"])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("use_full_cuda_graph", [False, True])
+@pytest.mark.parametrize("first_chunk", [False, True])
 def test_gdn_metadata_device_indices_match_cpu(
-    draft_counts, query_lens, mamba_cache_mode, strided, use_full_cuda_graph
+    draft_counts,
+    query_lens,
+    mamba_cache_mode,
+    strided,
+    use_full_cuda_graph,
+    first_chunk,
 ):
     """Exercise pure, padded, interleaved mixed, and non-spec metadata builds."""
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -154,6 +160,18 @@ def test_gdn_metadata_device_indices_match_cpu(
                 + torch.arange(batch, dtype=torch.int32) * 17,
                 device,
             ),
+            seq_lens_cpu_upper_bound=to_device(
+                torch.tensor(query_lens, dtype=torch.int32)
+                + torch.arange(batch, dtype=torch.int32) * 17,
+                "cpu",
+            ),
+            is_prefilling=(
+                torch.tensor([
+                    q > 0 and d < 0 for q, d in zip(query_lens, draft_counts)
+                ])
+                if first_chunk
+                else None
+            ),
             num_reqs=batch,
             num_actual_tokens=sum(query_lens),
             max_query_len=max(query_lens),
@@ -173,6 +191,11 @@ def test_gdn_metadata_device_indices_match_cpu(
         )
 
     reference, actual = build("cpu"), build("mcpu")
+    if first_chunk and query_lens[0] == 1 and all(d < 0 for d in draft_counts):
+        # An independent assertion prevents matching two broken classifiers.
+        assert actual.num_prefills > 0
+        assert actual.has_initial_state is not None
+        assert not actual.has_initial_state.cpu()[0].item()
 
     def assert_equal(expected, result, name):
         if isinstance(expected, torch.Tensor):

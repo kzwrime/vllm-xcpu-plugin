@@ -46,6 +46,18 @@ def _xcpu_gdn_metadata_build(
         FLA_CHUNK_SIZE,
     )
 
+    # A one-token first prefill must clear recycled state; a resumed chunk can
+    # use decode kernels. These are CPU scheduling facts, not device readbacks.
+    no_prior_state_cpu = None
+    if m.is_prefilling is not None:
+        assert m.seq_lens_cpu_upper_bound is not None
+        query_lens_cpu = query_start_loc_cpu.diff()
+        no_prior_state_cpu = (
+            (query_lens_cpu > 0)
+            & (m.seq_lens_cpu_upper_bound <= query_lens_cpu)
+            & m.is_prefilling
+        )
+
     # Keep this result order in sync with torch_xcpu/csrc/gdn_metadata.cpp.
     outputs = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
         query_start_loc,
@@ -54,6 +66,7 @@ def _xcpu_gdn_metadata_build(
         self.num_spec if self.use_spec_decode else 0,
         m.max_query_len,
         FLA_CHUNK_SIZE,
+        no_prior_state_cpu,
     )
     torch.ops.torch_xcpu.build_gdn_metadata_out(
         query_start_loc,
@@ -70,6 +83,7 @@ def _xcpu_gdn_metadata_build(
         else 0,
         FLA_CHUNK_SIZE,
         outputs,
+        no_prior_state_cpu,
     )
     *counts, present = outputs[21].tolist()
     tensors = [

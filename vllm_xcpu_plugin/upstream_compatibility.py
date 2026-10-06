@@ -297,10 +297,10 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "gdn_metadata",
         "vllm.v1.attention.backends.gdn_attn",
         "GDNAttentionMetadataBuilder.build",
-        "94479e086d8e8348ec804400967f650bea96bbe243fb57193c2e073cb1541a79",
+        "5db0fbae76ee85cae95d97aef25ec0521fc54322987331e2602cf11948d3e6e9",
         "6a9c419a47084c40387d3cf2cbdb4ea3bc55a2a15a4a237dab55d3e71585ea5a",
         "torch_xcpu::build_gdn_metadata_out",
-        source_version="2902aaaeb6",
+        source_version="v0.25.1; local=7649db558cbc; upstream=79468c20ef23",
     ),
     _operator(
         "gdn_metadata",
