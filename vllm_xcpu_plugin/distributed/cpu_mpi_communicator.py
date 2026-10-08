@@ -130,10 +130,13 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torch_mpi_ext
 
-        # logger.info(f"all_reduce rank: {self.mpi_group_rank}, "
-        #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
-        torch_mpi_ext.ops.all_reduce__wrapper(input_, self.comm_ptr_wrapper)
-        return input_
+        # Keep allocation visible to Inductor so it can plan/reuse the output
+        # without functionalizing a mutation of the input (which may be a view).
+        output = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)
+        torch_mpi_ext.ops.all_reduce_out_wrapper(
+            output, input_, self.comm_ptr_wrapper
+        )
+        return output
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         from torch_xcpu import ops as xcpu_ops

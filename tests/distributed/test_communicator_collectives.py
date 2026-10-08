@@ -49,9 +49,14 @@ def _cpu_mpi_operator_shims(enabled: bool):
     from torch_xcpu import ops as xcpu_ops
 
     ops = torch_mpi_ext.ops
+    original_all_reduce = ops.all_reduce_out_wrapper
     original_all_gatherv = xcpu_ops.all_gatherv_into_tensor_out_v2
     original_reduce_scatter = ops.reduce_scatter_out_wrapper
     original_reduce_scatterv = ops.reduce_scatterv_out_wrapper
+
+    def all_reduce_out(output, input_, _comm_ptr):
+        output.copy_(input_)
+        dist.all_reduce(output)
 
     def all_gatherv_out(output, input_, sizes, _comm_ptr, dim):
         gathered: list[torch.Tensor | None] = [None] * dist.get_world_size()
@@ -72,15 +77,40 @@ def _cpu_mpi_operator_shims(enabled: bool):
         rank = dist.get_rank()
         output.copy_(reduced.narrow(dim, sum(rank_sizes[:rank]), rank_sizes[rank]))
 
+    ops.all_reduce_out_wrapper = all_reduce_out
     xcpu_ops.all_gatherv_into_tensor_out_v2 = all_gatherv_out
     ops.reduce_scatter_out_wrapper = reduce_scatter_out
     ops.reduce_scatterv_out_wrapper = reduce_scatterv_out
     try:
         yield
     finally:
+        ops.all_reduce_out_wrapper = original_all_reduce
         xcpu_ops.all_gatherv_into_tensor_out_v2 = original_all_gatherv
         ops.reduce_scatter_out_wrapper = original_reduce_scatter
         ops.reduce_scatterv_out_wrapper = original_reduce_scatterv
+
+
+def _all_reduce_worker(rank: int, port: int) -> None:
+    _init_process_group(rank, port)
+    try:
+        communicator = _make_communicator(CpuMPICommunicator)
+        with _cpu_mpi_operator_shims(True):
+            for transpose in (False, True):
+                base = torch.arange(64, dtype=torch.float32).reshape(16, 4)
+                base += rank * 100
+                before = base.clone()
+                # A leading slice models the aligned linear output in DFlash.
+                input_ = base[:6]
+                if transpose:
+                    input_ = input_.t()
+                expected = WORLD_SIZE * input_ - rank * 200 + 100
+                actual = communicator.all_reduce(input_)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(base, before)
+                assert actual.is_contiguous()
+                assert actual.data_ptr() != input_.data_ptr()
+    finally:
+        dist.destroy_process_group()
 
 
 def _all_gatherv_worker(rank: int, port: int) -> None:
@@ -353,6 +383,10 @@ def _distributed_run(worker: Callable[[int, int], None]) -> None:
             process.kill()
             process.join()
         assert process.exitcode == 0
+
+
+def test_mpi_all_reduce_preserves_input() -> None:
+    _distributed_run(_all_reduce_worker)
 
 
 def test_all_gatherv() -> None:
