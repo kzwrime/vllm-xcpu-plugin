@@ -4,6 +4,7 @@
 > 当前记录见 [v0.25.1 Triton 兼容层迁移记录](TRITON_MIGRATION_V0.25.1.md)。
 > 增量回移示例见 [Mamba align 审计记录](TRITON_AUDIT_MAMBA_ALIGN_20261005.md)。
 > 元数据与后端算子同步适配示例见 [GDN 首个 chunk 审计](TRITON_AUDIT_GDN_FIRST_CHUNK_20261006.md)。
+> 调用方重排与融合路径同步适配示例见 [GDN 混批门控审计](TRITON_AUDIT_GDN_MIXED_GATES_20261008.md)。
 
 本文面向 `vllm-xcpu-plugin` 和 `torch_mcpu` 的维护者，说明如何使用当前 Fake Triton 兼容层、如何接入新的 vLLM Triton kernel，以及升级 vLLM、启用 `torch.compile` 时必须注意的边界。
 
