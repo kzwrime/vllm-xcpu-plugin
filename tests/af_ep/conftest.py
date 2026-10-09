@@ -45,6 +45,10 @@ def make_af_session(monkeypatch):
                 Get_rank=lambda: role_ranks[role_rank],
                 Get_size=lambda: num_attention_ranks + num_expert_ranks,
                 py2f=lambda: 7,
+                allgather=lambda proposal: (
+                    [proposal or max_rows] * num_attention_ranks
+                    + [0] * num_expert_ranks
+                ),
             ),
             clusters={
                 0: MpiCluster(0, ClusterType.ATTN, attention_ranks),

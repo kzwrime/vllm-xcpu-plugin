@@ -31,6 +31,13 @@ def use_fused_ep_moe(moe) -> bool:
     )
 
 
+def use_shared_moe_workspace(moe) -> bool:
+    return use_fused_ep_moe(moe) or moe.moe_parallel_config.all2all_backend in {
+        "mpi_alltoallv_v7",
+        "mpi_alltoallv_v8",
+    }
+
+
 def install_fused_moe(
     method,
     layer,

@@ -14,7 +14,7 @@ from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
 from .fused_moe.setup import (
     install_fused_moe,
     reject_fused_moe_hot_reload,
-    use_fused_ep_moe,
+    use_shared_moe_workspace,
 )
 
 
@@ -46,7 +46,7 @@ class XcpuCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
             layer.w2_weight_scale,
             scale_block_size=(1, 32),
             m_capacity=self.moe.max_num_tokens * self.moe.experts_per_token,
-            allocate_scratch=not use_fused_ep_moe(self.moe),
+            allocate_scratch=not use_shared_moe_workspace(self.moe),
         )
         del layer.w13_weight_packed
         del layer.w2_weight_packed

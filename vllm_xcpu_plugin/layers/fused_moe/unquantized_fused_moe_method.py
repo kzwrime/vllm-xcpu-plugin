@@ -8,7 +8,11 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
-from .setup import install_fused_moe, reject_fused_moe_hot_reload, use_fused_ep_moe
+from .setup import (
+    install_fused_moe,
+    reject_fused_moe_hot_reload,
+    use_shared_moe_workspace,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -42,7 +46,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w13,
             w2,
             m_capacity=self.moe.max_num_tokens * self.moe.experts_per_token,
-            allocate_scratch=not use_fused_ep_moe(self.moe),
+            allocate_scratch=not use_shared_moe_workspace(self.moe),
         )
         install_fused_moe(
             self,

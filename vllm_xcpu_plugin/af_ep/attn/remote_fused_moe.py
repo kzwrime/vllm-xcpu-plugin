@@ -61,6 +61,7 @@ class RemoteExpertsFusedMoEMethod(FusedMoEMethodBase):
         self.layer_idx = int(match.group("layer"))
         self.layer_name = layer_name
         self.client = client
+        client.register_layer_capacity(moe.moe_parallel_config.sp_size)
         self.moe_kernel = _RemoteKernelDescriptor()  # type: ignore[assignment]
         self._seen_checkpoint_names: set[str] = set()
         self._weight_loading_finalized = False

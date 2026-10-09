@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
 
 import torch
 
@@ -12,28 +12,6 @@ from ..common.session_v7 import AfV7Session
 from .runtime import ExpertsClient
 
 # All A/F ranks enter dispatch/combine in the same model layer order.
-
-
-def _dispatch_record_bytes(hidden_size: int, topk: int, dtype: torch.dtype) -> int:
-    """Match dispatch_record_bytes in torch_xcpu/csrc/moe_ep:
-
-    two int32 header fields, top-k IDs/weights, then one hidden-state row.
-    """
-    return (
-        2 * torch.int32.itemsize
-        + topk * (torch.int32.itemsize + torch.float32.itemsize)
-        + hidden_size * dtype.itemsize
-    )
-
-
-@dataclass(frozen=True)
-class AttentionWorkspace:
-    """Scratch buffers shared by all routed layers of one A worker."""
-
-    return_row_indices: torch.Tensor
-    send_rows_per_expert_rank: torch.Tensor
-    dispatch_send_buffer: torch.Tensor
-    combine_workspace: torch.Tensor
 
 
 class ExpertsClientV7(ExpertsClient):
@@ -48,13 +26,32 @@ class ExpertsClientV7(ExpertsClient):
     def __init__(self, session: AfV7Session) -> None:
         assert session.cluster_type == ClusterType.ATTN
         self._session = session
-        self._workspace: AttentionWorkspace | None = None
+        self._workspace: torch.Tensor | None = None
+        self._workspace_bytes = 0
+        self._op: Callable[..., None] | None = None
+
+    def register_layer_capacity(self, sp_size: int) -> None:
+        self._session.register_layer_capacity(sp_size)
 
     def sync_forward_entry(self) -> None:
         self._session.sync_forward_entry()
 
     def initialize(self, hidden_size: int, topk: int, dtype: torch.dtype) -> None:
         self._session.initialize(hidden_size, topk, dtype)
+        self._workspace_bytes = (
+            torch.ops.torch_xcpu.fused_af_a_dispatch_combine_v7_workspace_size(
+                self._session.ep_size,
+                self._session.max_rows_per_attention_rank,
+                topk,
+                hidden_size,
+                dtype.itemsize,
+            )
+        )
+        self._op = getattr(
+            torch.ops.torch_xcpu,
+            "fused_af_a_dispatch_combine_v7_"
+            + ("bf16" if dtype == torch.bfloat16 else "fp32"),
+        ).default
 
     def execute_layer(
         self,
@@ -81,86 +78,35 @@ class ExpertsClientV7(ExpertsClient):
             )
         if (
             self._workspace is not None
-            and self._workspace.return_row_indices.device != hidden_states.device
+            and self._workspace.device != hidden_states.device
         ):
             raise ValueError("AF-EP client cannot change workspace device")
 
-        from torch_xcpu import ops as xcpu_ops
-
         num_rows, hidden_size = hidden_states.shape
         topk = topk_ids.size(1)
-        # The A-side layer is partitioned over A ranks; remote experts are
-        # independently partitioned over F ranks.
-        remote_num_local_experts = num_experts // self._session.ep_size
         if num_experts % self._session.ep_size:
             raise ValueError("AF-EP requires a uniform expert partition across F ranks")
-
         self._session.validate_initialized(hidden_size, topk, hidden_states.dtype)
+        assert self._op is not None
         workspace = self._ensure_workspace(hidden_states, topk)
-        return_row_indices = workspace.return_row_indices[:num_rows]
-        xcpu_ops.moe_af_dispatch_send_v7(
-            return_row_indices,
-            workspace.send_rows_per_expert_rank,
-            workspace.dispatch_send_buffer,
+        output = torch.empty_like(hidden_states)
+        self._op(
+            output,
             hidden_states,
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.float().contiguous(),
             num_experts,
-            remote_num_local_experts,
             self._session.max_rows_per_attention_rank,
             layer_idx,
             self._session.metadata,
             self._session.communicator_handle,
-        )
-
-        output = torch.empty_like(hidden_states)
-        xcpu_ops.moe_af_combine_recv_v7(
-            output,
-            return_row_indices,
-            self._session.metadata,
-            self._session.communicator_handle,
-            workspace.combine_workspace[:num_rows],
-            self._session.max_rows_per_attention_rank,
-            layer_idx,
+            workspace,
         )
         return output
 
-    def _ensure_workspace(
-        self,
-        hidden_states: torch.Tensor,
-        topk: int,
-    ) -> AttentionWorkspace:
-        if self._workspace is not None:
-            return self._workspace
-
-        capacity = self._session.max_rows_per_attention_rank
-        from torch_xcpu.ops_defs.moe_prepare import moe_prepare_dispatch_buffer_bytes
-
-        hidden_size = hidden_states.size(1)
-        record_bytes = _dispatch_record_bytes(hidden_size, topk, hidden_states.dtype)
-        self._workspace = AttentionWorkspace(
-            return_row_indices=torch.empty(
-                capacity, topk, dtype=torch.int32, device=hidden_states.device
-            ),
-            send_rows_per_expert_rank=torch.empty(
-                self._session.ep_size,
-                dtype=torch.int32,
-                device=hidden_states.device,
-            ),
-            dispatch_send_buffer=torch.empty(
-                # 两种 pack 共用发送区；稠密空目标共用末尾的 int32 零计数。
-                moe_prepare_dispatch_buffer_bytes(
-                    self._session.ep_size, capacity, topk, record_bytes,
-                    send_empty_header=True,
-                ),
-                dtype=torch.uint8,
-                device=hidden_states.device,
-            ),
-            combine_workspace=torch.empty(
-                capacity,
-                hidden_size,
-                dtype=torch.float32,
-                device=hidden_states.device,
-            ),
-        )
+    def _ensure_workspace(self, hidden_states: torch.Tensor, topk: int) -> torch.Tensor:
+        if self._workspace is None:
+            self._workspace = torch.empty(
+                self._workspace_bytes, dtype=torch.uint8, device=hidden_states.device
+            )
         return self._workspace
