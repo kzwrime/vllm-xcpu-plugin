@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-import torch_xcpu
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 
@@ -11,6 +10,8 @@ class XcpuGateLinear(GateLinear):
     """Retain FP32 router accumulators when the model requests FP32 logits."""
 
     def forward(self, x):
+        import torch_xcpu
+
         if (
             self.out_dtype == torch.float32
             and self.bias is None
