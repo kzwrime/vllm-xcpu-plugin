@@ -31,6 +31,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
+    # Complete post-routing V5/V6 EP operation; set 0 for the legacy MK path.
+    "VLLM_XCPU_ENABLE_FUSED_EP_MOE": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ENABLE_FUSED_EP_MOE", "1"))
+    ),
     # Enable XCPU AF-EP. Topology is derived from vLLM and the MPMD MPI world.
     "VLLM_XCPU_ENABLE_AF_EP": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0"))

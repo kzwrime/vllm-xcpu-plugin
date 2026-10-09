@@ -17,7 +17,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
-from .fused_moe.setup import install_fused_moe, reject_fused_moe_hot_reload
+from .fused_moe.setup import (
+    install_fused_moe,
+    reject_fused_moe_hot_reload,
+    use_fused_ep_moe,
+)
 
 
 class XcpuFp8MoEMethod(Fp8MoEMethod):
@@ -94,6 +98,7 @@ class XcpuFp8MoEMethod(Fp8MoEMethod):
             w2_scale,
             scale_block_size=self.weight_block_size,
             m_capacity=self.moe.max_num_tokens * self.moe.experts_per_token,
+            allocate_scratch=not use_fused_ep_moe(self.moe),
         )
         install_fused_moe(
             self,
