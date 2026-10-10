@@ -2,6 +2,8 @@
 
 mpirun -np 4 python <file>; XCPU_AF_COMPILE=1 compiles both roles, fullgraph.
 XCPU_AF_QUANT=1 tests ACC/AMX FP8 and MXFP4. Each rank uses a fresh cache.
+XCPU_AF_MAX_ROWS selects comma-separated capacities (default: 17,128,129).
+Use 10 ranks and XCPU_AF_TOPK=6 to cover expert ranks > topk.
 """
 
 # ruff: noqa: E402
@@ -64,17 +66,23 @@ def direct_aoti(op):
     return invoke
 
 
-def run(version, num_a, sp, fmt="plain", backend=ops.MoeGroupedGemmBackend.PORTABLE):
+def run(
+    version,
+    num_a,
+    sp,
+    fmt="plain",
+    backend=ops.MoeGroupedGemmBackend.PORTABLE,
+    max_rows=17,
+):
     import importlib
 
     comm = MPI.COMM_WORLD
     rank, size = comm.rank, comm.size
-    num_f, h, i, topk, max_rows, local_e = (
+    num_f, h, i, topk, local_e = (
         size - num_a,
         128,
         128,
-        8,
-        int(os.getenv("XCPU_AF_MAX_ROWS", "17")),
+        int(os.getenv("XCPU_AF_TOPK", "8")),
         4,
     )
     experts = num_f * local_e
@@ -160,6 +168,10 @@ def run(version, num_a, sp, fmt="plain", backend=ops.MoeGroupedGemmBackend.PORTA
         client._ensure_workspace(
             torch.empty(0, h, device="mcpu", dtype=torch.bfloat16), topk
         )
+        guard = torch.full(
+            (client._workspace.numel() + 128,), 0xA5, dtype=torch.uint8, device="mcpu"
+        )
+        client._workspace = guard[64:-64]
         if os.getenv("XCPU_AF_AOTI") == "1":
             client._op = direct_aoti(client._op)
         execute = client.execute_layer
@@ -257,8 +269,7 @@ def run(version, num_a, sp, fmt="plain", backend=ops.MoeGroupedGemmBackend.PORTA
             service.execute_model_pass()
     for actual, expected in pending:
         torch.testing.assert_close(actual.cpu(), expected, rtol=0.03, atol=0.003)
-    if not is_a:
-        assert guard[:64].cpu().eq(0xA5).all() and guard[-64:].cpu().eq(0xA5).all()
+    assert guard[:64].cpu().eq(0xA5).all() and guard[-64:].cpu().eq(0xA5).all()
     torch.accelerator.synchronize()
     getattr(ops, f"moe_af_v{version}_cleanup")()
     cluster_comm.Free()
@@ -273,18 +284,21 @@ def run(version, num_a, sp, fmt="plain", backend=ops.MoeGroupedGemmBackend.PORTA
 if __name__ == "__main__":
     try:
         for version in (7, 8):
-            if os.getenv("XCPU_AF_QUANT") == "1":
-                for fmt in ("fp8", "mxfp4"):
-                    for backend in (
-                        ops.MoeGroupedGemmBackend.ACC,
-                        ops.MoeGroupedGemmBackend.INTEL_AMX,
-                    ):
-                        run(version, 2, 2, fmt, backend)
-            elif os.getenv("XCPU_AF_COMPILE") == "1":
-                run(version, 2, 2)
-            else:
-                for a, sp in ((2, 1), (2, 2), (1, 1), (3, 2)):
-                    run(version, a, sp)
+            for max_rows in map(
+                int, os.getenv("XCPU_AF_MAX_ROWS", "17,128,129").split(",")
+            ):
+                if os.getenv("XCPU_AF_QUANT") == "1":
+                    for fmt in ("fp8", "mxfp4"):
+                        for backend in (
+                            ops.MoeGroupedGemmBackend.ACC,
+                            ops.MoeGroupedGemmBackend.INTEL_AMX,
+                        ):
+                            run(version, 2, 2, fmt, backend, max_rows=max_rows)
+                elif os.getenv("XCPU_AF_COMPILE") == "1":
+                    run(version, 2, 2, max_rows=max_rows)
+                else:
+                    for a, sp in ((2, 1), (2, 2), (1, 1), (3, 2)):
+                        run(version, a, sp, max_rows=max_rows)
     except BaseException:
         import traceback
 

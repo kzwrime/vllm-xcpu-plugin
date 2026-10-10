@@ -2,6 +2,8 @@
 
 Run with mpirun -np 4 .venv/bin/python <this file>. Set XCPU_EP_COMPILE=1
 and optionally TORCHINDUCTOR_CPP_WRAPPER=1 to exercise fullgraph compilation.
+XCPU_EP_MAX_ROWS selects comma-separated capacities (default: 17,128,129).
+Use 8 ranks to cover EP > topk, and XCPU_EP_MAX_ROWS=1024 for large capacity.
 """
 
 # MPI must be initialized before importing the backend.
@@ -25,6 +27,7 @@ import torch
 import torch.nn.functional as F
 import torch_mcpu  # noqa: F401
 from torch_xcpu import ops
+from torch_xcpu.ops_defs.moe_prepare import moe_prepare_dispatch_buffer_bytes
 
 from vllm_xcpu_plugin.layers.fused_moe.ep_experts import XcpuEPExperts
 
@@ -79,7 +82,17 @@ def separate_stages(execution, x, weights, ids, baseline_compute):
     sends = torch.empty_like(counts)
     indices = torch.empty_like(ids)
     record_bytes = 8 + cfg.topk * 8 + hidden * x.element_size()
-    send = torch.empty(capacity * record_bytes, device=device, dtype=torch.uint8)
+    send = torch.empty(
+        moe_prepare_dispatch_buffer_bytes(
+            cfg.ep_size,
+            cfg.max_num_tokens,
+            cfg.topk,
+            record_bytes,
+            send_empty_header=cfg.version == 6,
+        ),
+        device=device,
+        dtype=torch.uint8,
+    )
     getattr(ops, f"moe_prepare_fused_v{cfg.version}")(
         indices,
         recv,
@@ -353,17 +366,30 @@ def run(
 if __name__ == "__main__":
     try:
         for version in (5, 6):
-            if os.getenv("XCPU_EP_QUANT", "0") == "1":
-                for fmt in ("fp8", "mxfp4"):
-                    for backend in (
-                        ops.MoeGroupedGemmBackend.ACC,
-                        ops.MoeGroupedGemmBackend.INTEL_AMX,
-                    ):
-                        run(MPI.COMM_WORLD, version, 8, torch.bfloat16, fmt, backend)
-            else:
-                for topk in (6, 8):
-                    for dtype in (torch.bfloat16, torch.float32):
-                        run(MPI.COMM_WORLD, version, topk, dtype)
+            # Exercise both sides of the fixed-slot/dense capacity boundary.
+            for bound in map(
+                int, os.getenv("XCPU_EP_MAX_ROWS", "17,128,129").split(",")
+            ):
+                shape = (128, 128, bound)
+                if os.getenv("XCPU_EP_QUANT", "0") == "1":
+                    for fmt in ("fp8", "mxfp4"):
+                        for backend in (
+                            ops.MoeGroupedGemmBackend.ACC,
+                            ops.MoeGroupedGemmBackend.INTEL_AMX,
+                        ):
+                            run(
+                                MPI.COMM_WORLD,
+                                version,
+                                8,
+                                torch.bfloat16,
+                                fmt,
+                                backend,
+                                shape,
+                            )
+                else:
+                    for topk in (6, 8):
+                        for dtype in (torch.bfloat16, torch.float32):
+                            run(MPI.COMM_WORLD, version, topk, dtype, shape=shape)
         MPI.Finalize()
     except BaseException:  # noqa: BLE001 -- abort peers on any rank's failure
         import traceback
