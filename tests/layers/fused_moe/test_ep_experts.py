@@ -233,21 +233,21 @@ def test_native_workspace_rejects_invalid_storage_before_dispatch(version):
         torch.ones(1, 6, device="mcpu", dtype=torch.float32),
         torch.zeros(1, 6, device="mcpu", dtype=torch.int32),
     )
-    assert len(captured) == 18
+    assert len(captured) == 19
     assert [
         a.name
         for a in native._schema.arguments
         if a.alias_info and a.alias_info.is_write
     ] == ["output", "workspace"]
-    workspace = captured[-1]
+    workspace = captured[-2]
     assert workspace.numel() == entry.workspace_bytes
     assert entry.workspace_bytes % 64 == 0
     with pytest.raises(RuntimeError, match="workspace too small"):
-        native(*captured[:-1], workspace[:-1])
+        native(*captured[:-2], workspace[:-1], captured[-1])
     with pytest.raises(RuntimeError, match="aligned 1D uint8"):
-        native(*captured[:-1], workspace[1:])
+        native(*captured[:-2], workspace[1:], captured[-1])
     with pytest.raises(RuntimeError, match="aligned 1D uint8"):
-        native(*captured[:-1], workspace.view(torch.int8))
+        native(*captured[:-2], workspace.view(torch.int8), captured[-1])
     alias_output = workspace[:256].view(torch.bfloat16).view(1, 128)
     with pytest.raises(RuntimeError, match="must not alias"):
         native(alias_output, *captured[1:])
@@ -341,3 +341,77 @@ def test_compact_workspace_ep64_capacity(version, local_experts, arena_gib):
     assert query(64, 1024, 8, 6144, 2048, local_experts, 2, 128, 128, False, False) == (
         int(arena_gib * 2**30) + metadata_bytes
     )
+
+
+@pytest.mark.parametrize("version", [5, 6])
+def test_chunk_workspace_bounds_and_disabled_compatibility(version):
+    query = getattr(
+        torch.ops.torch_xcpu,
+        f"fused_ep_moe_v{version}_workspace_size_AccFp8MoeGroupedGemm",
+    )
+    args = (64, 6144, 8, 6144, 2048, 4, 2, 128, 128, False, False)
+    # Only a size query: no multi-GiB allocation. Unchunked dispatch would
+    # exceed MPI's int32 displacement; the bounded layout must remain usable.
+    chunked = query(*args, 1024)
+    base = query(64, 1024, *args[2:])
+    # Full-input return indices, FP32 [M,H] accumulator, persistent dense send.
+    # The send arena cannot alias compute while later chunks still need it.
+    packed_bytes = 6144 * 8 * (8 + 8 * 8 + 6144 * 2) + 8
+    aligned_packed_bytes = (packed_bytes + 63) // 64 * 64
+    extra = (6144 - 1024) * 8 * 4 + 6144 * 6144 * 4 + aligned_packed_bytes
+    assert chunked == base + extra
+    # Persistent send and bounded receive have independent MPI int32 limits.
+    with pytest.raises(RuntimeError, match="receive window exceeds"):
+        query(128, 6144, *args[2:], 2048)
+    with pytest.raises(RuntimeError, match="dispatch capacity exceeds"):
+        query(64, 32768, *args[2:], 1024)
+    small = (4, 17, 8, 128, 128, 4, 2, 128, 128, False, False)
+    assert query(*small) == query(*small, 0) == query(*small, 17) == query(*small, 1024)
+    assert query(*small, 3) < query(*small)
+    with pytest.raises(RuntimeError, match="nonnegative"):
+        query(*small, -1)
+
+
+@pytest.mark.parametrize("version", [5, 6])
+def test_post_sp_input_bound_does_not_scale_receive_quota(monkeypatch, version):
+    monkeypatch.setenv("VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK", "8")
+    plan = ops.initialize_fused_moe(
+        torch.zeros(2, 256, 128, device="mcpu", dtype=torch.bfloat16),
+        torch.zeros(2, 128, 128, device="mcpu", dtype=torch.bfloat16),
+        backend=ops.MoeGroupedGemmBackend.PORTABLE,
+        allocate_scratch=False,
+    )
+    # ceil(33/2)=17 supplied by vLLM's SP prepare/finalize contract.
+    entry = XcpuEPExperts(
+        plan,
+        torch.tensor([2, 0]),
+        torch.tensor([0]),
+        torch.tensor([0, 1, -1, -1], device="mcpu", dtype=torch.int32),
+        version=version,
+        ep_size=2,
+        ep_rank=0,
+        max_num_tokens=17,
+        topk=6,
+    )
+    captured = []
+    entry._op = lambda *args: captured.extend(args)
+    entry(
+        torch.empty(17, 128, device="mcpu", dtype=torch.bfloat16),
+        torch.ones(17, 6, device="mcpu"),
+        torch.zeros(17, 6, device="mcpu", dtype=torch.int32),
+    )
+    assert captured[14] == 17
+    assert captured[-1] == 8
+    monkeypatch.setenv("VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK", "-1")
+    with pytest.raises(ValueError, match="nonnegative"):
+        XcpuEPExperts(
+            plan,
+            torch.tensor([2, 0]),
+            torch.tensor([0]),
+            torch.tensor([0, 1, -1, -1], device="mcpu", dtype=torch.int32),
+            version=version,
+            ep_size=2,
+            ep_rank=0,
+            max_num_tokens=17,
+            topk=6,
+        )

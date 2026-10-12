@@ -35,6 +35,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_ENABLE_FUSED_EP_MOE": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_FUSED_EP_MOE", "1"))
     ),
+    # V5/V6 fused EP quota per source/destination pair, in post-SP token rows.
+    # Zero disables chunking. This is independent of the V4 total receive cap.
+    "VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK": lambda: int(
+        os.getenv("VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK", "1024")
+    ),
     # Enable XCPU AF-EP. Topology is derived from vLLM and the MPMD MPI world.
     "VLLM_XCPU_ENABLE_AF_EP": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0"))

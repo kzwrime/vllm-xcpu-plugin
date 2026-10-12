@@ -9,8 +9,10 @@ Use 8 ranks to cover EP > topk, and XCPU_EP_MAX_ROWS=1024 for large capacity.
 # MPI must be initialized before importing the backend.
 # ruff: noqa: E402
 
+import ctypes
 import os
 import tempfile
+import time
 from dataclasses import replace
 
 import mpi4py
@@ -178,6 +180,8 @@ def run(
     torch._dynamo.reset()
     rank, peers = comm.Get_rank(), comm.Get_size()
     hidden, intermediate, bound = shape
+    bound = int(os.getenv("XCPU_EP_INPUT_BOUND", str(bound)))
+    shape = hidden, intermediate, bound
     experts = peers * local_experts
     torch.manual_seed(101)
     w1 = torch.randn(experts, 2 * intermediate, hidden, dtype=dtype) * 0.025
@@ -302,41 +306,212 @@ def run(
                 device="mcpu",
                 dtype=torch.uint8,
             )
-            native(*args[:-1], storage[64:-64])
+            native(*args[:-2], storage[64:-64], args[-1])
             guards.append(storage)
 
         execution._op = guarded
     if os.getenv("XCPU_EP_COMPILE", "0") == "1":
         forward = torch.compile(forward, fullgraph=True, dynamic=True)
 
+    mpi_probe = None
+    if os.getenv("XCPU_EP_MPI_PROBE", "0") == "1":
+        assert os.getenv("XCPU_EP_TRACE_ROUNDS", "0") == "1"
+        mpi_probe = ctypes.CDLL(None)
+        mpi_probe.ep_moe_probe_reset.argtypes = []
+        mpi_probe.ep_moe_probe_reset.restype = None
+        mpi_probe.ep_moe_probe_count.argtypes = [ctypes.c_int]
+        mpi_probe.ep_moe_probe_count.restype = ctypes.c_uint64
+
     # Rank 0 can have no tokens while still owning heavily requested experts.
     pending = []
-    for case in range(6):
+    submissions = []
+    for case in range(12):
         rows = (
             0
-            if (case == 1 and rank == 0) or case == 4
-            else (bound if case == 2 else bound - rank)
+            if (
+                (case == 1 and rank == 0)
+                or case == 4
+                or (case == 8 and rank != peers - 1)
+            )
+            else (bound if case in (2, 8, 11) else bound - rank)
         )
+        if case == 10:
+            # Small first chunks still plan routes even without dense counting.
+            rows = min(bound, 3)
         torch.manual_seed(301 + rank + case * 10)
         x = torch.randn(rows, hidden, dtype=dtype)
         ids = torch.full((rows, topk), -1, dtype=torch.int32)
         selected = min(experts, topk)
         ids[:, :selected] = torch.rand(rows, experts).argsort(dim=1)[:, :selected].int()
-        if case == 2:
+        if case in (2, 8):
             # Every sender fills the complete capacity and targets all local
             # experts on rank 0: exactly C*min(topk, local_experts) compute rows.
             ids.fill_(-1)
             selected = min(topk, local_experts)
             ids[:, :selected] = torch.arange(selected, dtype=torch.int32)
+        elif case == 11:
+            # Fill the dense send capacity exactly, leaving only the reserved
+            # empty-destination header beyond the last payload record.
+            ids.fill_(-1)
+            selected = min(peers, topk)
+            ids[:, :selected] = (
+                torch.arange(selected, dtype=torch.int32) * local_experts
+            )
+        elif case == 9:
+            # Nonempty input with all routes invalid still initializes output.
+            ids.fill_(-1)
+        elif case == 6:
+            # M > quota but balanced destinations can still fit one round.
+            ids.fill_(-1)
+            selected = min(topk, local_experts)
+            ids[:, :selected] = torch.arange(rows, dtype=torch.int32)[
+                :, None
+            ] % peers * local_experts + torch.arange(selected, dtype=torch.int32)
+        elif case == 7:
+            # Destinations for the same token can be assigned different rounds.
+            ids.fill_(-1)
+            ids[:, 0] = 0
+            ids[:, 1] = (
+                torch.arange(rows, dtype=torch.int32) % (peers - 1) + 1
+            ) * local_experts
         elif rows:
             ids[0] = -1
         weights = torch.softmax(torch.randn(rows, topk), dim=-1)
         xd, wd, ind = x.to("mcpu"), weights.to("mcpu"), ids.to("mcpu")
-        dummy = case == 5 and rank == 0
+        dummy = case in (5, 10) and rank == 0
         ops.set_dummy_run(dummy)
         baseline = separate_stages(execution, xd, wd, ind, baseline_compute)
+        expected = torch.zeros_like(x) if dummy else reference(x, weights, ids, w1, w2)
+        submissions.append((case, dummy, xd, wd, ind, ids, baseline, expected))
+    # The native transports deliberately bind one fixed-capacity window.
+    # Finish the unbounded reference batch before creating bounded windows.
+    torch.accelerator.synchronize()
+    getattr(ops, f"moe_prepare_fused_v{version}_cleanup")()
+    for case, dummy, xd, wd, ind, ids, baseline, expected in submissions:
+        ops.set_dummy_run(dummy)
         graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        trace_rounds = os.getenv("XCPU_EP_TRACE_ROUNDS", "0") == "1"
+        if trace_rounds:
+            torch.accelerator.synchronize()
+            torch.mcpu.reset_kernel_timing()
+            torch.mcpu.set_kernel_timing_enabled(True)
+        assert_async = case == 0 and os.getenv("XCPU_EP_ASSERT_ASYNC", "0") == "1"
+        if assert_async:
+            assert os.getenv("XCPU_EP_COMPILE", "0") != "1", (
+                "warm up compile before testing host submission latency"
+            )
+            blocker = torch.empty(1, device="mcpu", dtype=torch.int64)
+            torch.accelerator.synchronize()
+            torch.ops.mcpu.stream_sleep_fill_(blocker, 1, 2000)
+            submitted_at = time.perf_counter()
+        if mpi_probe is not None:
+            mpi_probe.ep_moe_probe_reset()
         new = forward(xd, wd, ind)
+        if assert_async:
+            elapsed = time.perf_counter() - submitted_at
+            assert elapsed < 1.0, (
+                f"EP submission waited on its blocked stream: {elapsed:.3f}s"
+            )
+            assert not torch.mcpu.current_stream().query()
+            if rank == 0:
+                print(
+                    f"ASYNC version={version} host_submit_ms={elapsed * 1000:.3f} "
+                    "blocker_ms=2000",
+                    flush=True,
+                )
+        if trace_rounds:
+            torch.accelerator.synchronize()
+            torch.mcpu.set_kernel_timing_enabled(False)
+            # Read before the reference MPI reduction below.
+            mpi_counts = (
+                [mpi_probe.ep_moe_probe_count(i) for i in range(4)]
+                if mpi_probe is not None
+                else None
+            )
+            quota = execution.max_recv_tokens_per_rank or bound
+            local_max = (
+                max(
+                    (
+                        int(
+                            (
+                                (ids >= d * local_experts)
+                                & (ids < (d + 1) * local_experts)
+                            )
+                            .any(dim=1)
+                            .sum()
+                        )
+                        for d in range(peers)
+                    ),
+                    default=0,
+                )
+                if not dummy
+                else 0
+            )
+            expected_rounds = max(
+                1, (comm.allreduce(local_max, op=MPI.MAX) + quota - 1) // quota
+            )
+            if mpi_counts is not None:
+                expected_counts = (
+                    [0, expected_rounds, 2 * expected_rounds, 0]
+                    if version == 5
+                    else [0, 0, 0, 4 * expected_rounds]
+                )
+                assert mpi_counts == expected_counts, (
+                    case,
+                    mpi_counts,
+                    expected_counts,
+                )
+                if rank == 0:
+                    print(
+                        f"COLLECTIVES version={version} case={case} "
+                        f"allreduce/alltoall/alltoallv/fence={mpi_counts}",
+                        flush=True,
+                    )
+            events = [
+                e
+                for thread in torch.mcpu.get_kernel_timing()
+                for e in thread["events"]
+                if e["end_time"] > e["begin_time"] > 0
+            ]
+            actual_rounds = sum(
+                e["name"] == f"mcpu::fused_ep_moe_v{version}_combine" for e in events
+            )
+            submitted_rounds = sum(
+                e["name"] == "mcpu::moe_ep_chunk_round" for e in events
+            )
+            assert submitted_rounds == (
+                (bound + quota - 1) // quota if quota < bound else 0
+            )
+            names = [e["name"] for e in events]
+            assert f"mcpu::moe_prepare_fused_v{version}_comm" not in names
+            assert f"mcpu::moe_finalize_v{version}_comm" not in names
+            assert "mcpu::moe_ep_chunk_rounds" not in names
+            assert "mcpu::moe_ep_chunk_plan" not in names
+            assert (
+                names.count(f"mcpu::fused_ep_moe_v{version}_dispatch")
+                == expected_rounds
+            )
+            assert names.count("mcpu::moe_prepare_hybrid_pack_v5_v8_impl") == 1
+            assert (
+                names.count("mcpu::moe_finalize_hybrid_reduce_v5_v8_impl")
+                == expected_rounds
+            )
+            assert "mcpu::moe_ep_chunk_filter" not in names
+            assert (
+                sum(name.startswith("mcpu::moe_grouped_gemm") for name in names)
+                == 2 * expected_rounds
+            )
+            assert actual_rounds == expected_rounds, (
+                case,
+                actual_rounds,
+                expected_rounds,
+            )
+            if rank == 0:
+                print(
+                    f"ROUNDS version={version} case={case} "
+                    f"submitted={submitted_rounds} actual={actual_rounds}",
+                    flush=True,
+                )
         if case == 3:
             assert (
                 torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs_before
@@ -344,10 +519,23 @@ def run(
         ops.set_dummy_run(False)
         # Keep multiple asynchronous invocations in flight and verify their
         # outputs only afterwards; workspace reuse must not corrupt old outputs.
-        expected = torch.zeros_like(x) if dummy else reference(x, weights, ids, w1, w2)
         pending.append((new, baseline, expected))
     for new, baseline, expected in pending:
-        torch.testing.assert_close(new.cpu(), baseline.cpu(), rtol=0, atol=0)
+        # AMX chooses brgemm vs tinygemm by expert tile row count. Chunking
+        # can cross that threshold, so its BF16 rounding differs near zero.
+        amx = compute.resolved_backend.startswith("IntelAmx")
+        torch.testing.assert_close(
+            new.cpu(),
+            baseline.cpu(),
+            rtol=0.008
+            if execution.max_recv_tokens_per_rank
+            and execution.max_recv_tokens_per_rank < bound
+            else 0,
+            atol=(1e-4 if amx else 1e-7)
+            if execution.max_recv_tokens_per_rank
+            and execution.max_recv_tokens_per_rank < bound
+            else 0,
+        )
         torch.testing.assert_close(new.cpu(), expected, rtol=0.03, atol=0.003)
     for storage in guards:
         assert torch.all(storage[:64].cpu() == 0xA5)

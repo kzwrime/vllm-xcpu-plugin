@@ -7,6 +7,8 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from torch import Tensor
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
+from vllm_xcpu_plugin import envs
+
 if TYPE_CHECKING:
     from torch_xcpu.ops import FusedMoe
 
@@ -44,6 +46,11 @@ class XcpuEPExperts(torch.nn.Module):
         self.ep_rank = ep_rank
         self.max_num_tokens = max_num_tokens
         self.topk = topk
+        # The input bound already accounts for SP; the receive quota must not
+        # be divided by SP again. Zero retains the original unchunked path.
+        self.max_recv_tokens_per_rank = envs.VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK
+        if self.max_recv_tokens_per_rank < 0:
+            raise ValueError("EP receive quota must be nonnegative")
         if (
             comm_metadata.device.type != "cpu"
             or comm_metadata.dtype != torch.int64
@@ -100,6 +107,7 @@ class XcpuEPExperts(torch.nn.Module):
             block_k,
             gemm1.bias is not None,
             gemm2.bias is not None,
+            self.max_recv_tokens_per_rank,
         )
 
     def forward(
@@ -146,6 +154,7 @@ class XcpuEPExperts(torch.nn.Module):
             self.comm_metadata,
             self.comm_ptr_wrapper,
             workspace,
+            self.max_recv_tokens_per_rank,
         )
         return output
 

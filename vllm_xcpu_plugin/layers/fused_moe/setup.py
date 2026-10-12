@@ -94,10 +94,14 @@ def install_fused_moe(
             prepare_finalize, experts, layer._xcpu_ep_experts
         )
         logger.info_once(
-            "Using XcpuEPExperts: version=%s transport=%s compute=%s",
+            "Using XcpuEPExperts: version=%s transport=%s compute=%s "
+            "post_sp_input_bound=%s recv_quota=%s workspace_bytes=%s",
             layer._xcpu_ep_experts.version,
             parallel.all2all_backend,
             fused_moe.resolved_backend,
+            layer._xcpu_ep_experts.max_num_tokens,
+            layer._xcpu_ep_experts.max_recv_tokens_per_rank,
+            layer._xcpu_ep_experts.workspace_bytes,
             scope="process",
         )
     else:
