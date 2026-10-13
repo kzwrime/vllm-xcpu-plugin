@@ -137,7 +137,6 @@ def separate_stages(execution, x, weights, ids, baseline_compute):
             routes, 2 * params.intermediate, device=device, dtype=dtype
         ),
         activated=torch.empty(routes, params.intermediate, device=device, dtype=dtype),
-        workspace_unpermute_and_reduce=torch.empty_like(recv, dtype=torch.float32),
     )
     output = torch.empty_like(x)
     tail = (

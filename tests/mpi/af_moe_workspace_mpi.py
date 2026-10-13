@@ -3,6 +3,7 @@
 mpirun -np 4 python <file>; XCPU_AF_COMPILE=1 compiles both roles, fullgraph.
 XCPU_AF_QUANT=1 tests ACC/AMX FP8 and MXFP4. Each rank uses a fresh cache.
 XCPU_AF_MAX_ROWS selects comma-separated capacities (default: 17,128,129).
+XCPU_AF_HIDDEN / XCPU_AF_INTERMEDIATE select dimensions (default: 128/128).
 Use 10 ranks and XCPU_AF_TOPK=6 to cover expert ranks > topk.
 """
 
@@ -80,8 +81,8 @@ def run(
     rank, size = comm.rank, comm.size
     num_f, h, i, topk, local_e = (
         size - num_a,
-        128,
-        128,
+        int(os.getenv("XCPU_AF_HIDDEN", "128")),
+        int(os.getenv("XCPU_AF_INTERMEDIATE", "128")),
         int(os.getenv("XCPU_AF_TOPK", "8")),
         4,
     )
@@ -124,7 +125,8 @@ def run(
             (w1 / 0.025).to(torch.float8_e4m3fn),
             (w2 / 0.025).to(torch.float8_e4m3fn),
         )
-        s1, s2 = torch.full((experts, 2, 1), 0.025), torch.full((experts, 1, 1), 0.025)
+        s1 = torch.full((experts, (2 * i + 127) // 128, (h + 127) // 128), 0.025)
+        s2 = torch.full((experts, (h + 127) // 128, (i + 127) // 128), 0.025)
         w1, w2 = (q1.float() * 0.025).bfloat16(), (q2.float() * 0.025).bfloat16()
         block = (128, 128)
     elif fmt == "mxfp4":
@@ -230,13 +232,17 @@ def run(
     capacity = (max_rows + sp - 1) // sp
     assert session.max_rows_per_attention_rank == capacity
     pending = []
-    for case in range(4):
+    for case in range(7):
         if is_a:
             rows = (
                 capacity
                 if case in (0, 1)
-                else (0 if case == 2 or role_rank == 0 else 3)
+                else (0 if case == 2 or (case == 3 and role_rank == 0) else 3)
             )
+            # Nonempty dummy inputs must send no routed tokens. Follow mixed
+            # and all-dummy passes with real work to detect stale runtime state.
+            dummy = case == 5 or (case == 4 and role_rank == 0)
+            ops.set_dummy_run(dummy)
             torch.manual_seed(300 + case * 17 + role_rank)
             x = torch.randn(rows, h, dtype=torch.bfloat16)
             ids = torch.full((rows, topk), -1, dtype=torch.int32)
@@ -255,6 +261,8 @@ def run(
                     r,
                     ((nnf.silu(gate) * up) @ w2[e].float().T) * weights[r, k, None],
                 )
+            if dummy:
+                ref.zero_()
             for layer in (1, 3, 12):
                 result = execute(
                     layer_idx=layer,
@@ -265,6 +273,7 @@ def run(
                     num_local_experts=local_e,
                 )
                 pending.append((result, ref.bfloat16()))
+            ops.set_dummy_run(False)
         else:
             service.execute_model_pass()
     for actual, expected in pending:

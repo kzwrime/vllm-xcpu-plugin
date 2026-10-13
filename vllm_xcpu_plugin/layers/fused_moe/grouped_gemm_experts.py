@@ -158,7 +158,6 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
             local_experts=params.experts,
             hidden_size=hidden,
             intermediate_size=intermediate,
-            topk_reduce=self.topk_reduce,
         ).allocate(hidden_states.device, hidden_states.dtype)
 
         if expert_tokens_meta is None:
@@ -220,5 +219,4 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
             expert_offsets=workspace.expert_offsets,
             intermediate_output=workspace.intermediate_output,
             activated=workspace.activated,
-            workspace_unpermute_and_reduce=workspace.unpermute_and_reduce,
         )

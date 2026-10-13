@@ -325,12 +325,12 @@ def test_workspace_rechecks_amx_scratch_after_thread_count_change(version):
 
 @pytest.mark.parametrize("version", [5, 6])
 @pytest.mark.parametrize(
-    "local_experts,arena_gib", [(1, 3), (2, 3.75), (4, 5.25), (8, 10)]
+    "local_experts,arena_gib", [(1, 1.5234375), (2, 2.5), (4, 5), (8, 10)]
 )
 def test_compact_workspace_ep64_capacity(version, local_experts, arena_gib):
     """Production-size query only: never allocate these multi-GiB buffers.
 
-    With four experts the unpermute stage, not either GEMM, sets the peak.
+    With four experts GEMM1 sets the peak after per-worker FP32 reduction.
     Original top-k routing/sort metadata remains full-sized in all cases.
     """
     query = getattr(
@@ -341,6 +341,18 @@ def test_compact_workspace_ep64_capacity(version, local_experts, arena_gib):
     assert query(64, 1024, 8, 6144, 2048, local_experts, 2, 128, 128, False, False) == (
         int(arena_gib * 2**30) + metadata_bytes
     )
+
+
+@pytest.mark.parametrize("version", [5, 6])
+def test_glm52_acc_mxfp4_workspace_after_row_reduce(version):
+    query = getattr(
+        torch.ops.torch_xcpu,
+        f"fused_ep_moe_v{version}_workspace_size_AccMxfp4MoeGroupedGemm",
+    )
+    # TP4/SP4: M=2048/4. Quota 1024 is clamped to M, so no chunking.
+    size = query(64, 512, 8, 6144, 2048, 4, 2, 1, 32, False, False, 1024)
+    assert size == 2560 * 2**20 + 4_211_584
+    assert 2_822_783_872 - size == 128 * 2**20
 
 
 @pytest.mark.parametrize("version", [5, 6])

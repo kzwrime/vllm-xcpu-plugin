@@ -13,7 +13,6 @@ class FusedMoeWorkspace:
     expert_offsets: torch.Tensor
     intermediate_output: torch.Tensor
     activated: torch.Tensor
-    unpermute_and_reduce: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +22,6 @@ class FusedMoeWorkspacePlan:
     local_experts: int
     hidden_size: int
     intermediate_size: int
-    topk_reduce: bool
 
     def allocate(self, device: torch.device, dtype: torch.dtype) -> FusedMoeWorkspace:
         route_capacity = self.input_capacity * self.topk
@@ -49,14 +47,5 @@ class FusedMoeWorkspacePlan:
                 (route_capacity, self.intermediate_size),
                 device=device,
                 dtype=dtype,
-            ),
-            unpermute_and_reduce=(
-                torch.empty(
-                    (self.input_capacity, self.hidden_size),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                if self.topk_reduce
-                else torch.empty(0, device=device, dtype=torch.float32)
             ),
         )
