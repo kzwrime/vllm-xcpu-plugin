@@ -58,7 +58,7 @@ UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
-        "2f6336a9ebbfc0a7de6d7e38ba9502bde11b0ee7834d7ca94b3bf973bf9a5cd2",
+        "ad054e0502ff348c24531cbec37bdfa9458efce0c792e7f4fa3c41480dc37765",
     ),
     UpstreamSourceFile(
         "sparse_indexer",

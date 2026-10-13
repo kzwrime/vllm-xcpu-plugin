@@ -494,7 +494,6 @@ def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
                 rotary_emb.is_neox_style,
             )
         else:
-            # Reference path for A/B validation; Q remains BF16 on both paths.
             k = self.k_norm(k)
             k_pe = k[:, : self.rope_dim].unsqueeze(1)
             _, k_pe = rotary_emb(positions, torch.empty_like(k_pe), k_pe)
@@ -517,18 +516,16 @@ def _install_indexer_preprocessing() -> None:
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         parallel = self.vllm_config.parallel_config
-        if (
-            parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-        ):
-            raise NotImplementedError(
-                "XCPU DSA indexer preprocessing requires PCP=DCP=1"
-            )
+        if parallel.decode_context_parallel_size != 1:
+            raise NotImplementedError("XCPU DSA indexer preprocessing requires DCP=1")
         if self.head_dim != 128 or self.rope_dim != 64 or self.n_head not in (32, 64):
             raise NotImplementedError(
                 "XCPU DSA indexer requires H={32,64}, D=128, RoPE=64"
             )
-        self._xcpu_fuse_k_cache = os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        self._xcpu_fuse_k_cache = (
+            parallel.prefill_context_parallel_size == 1
+            and os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        )
         self._xcpu_fuse_qk_cache = (
             self._xcpu_fuse_k_cache
             and os.getenv("VLLM_XCPU_FUSED_INDEXER_QK", "1") != "0"
@@ -558,13 +555,15 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
             verify_upstream_compatibility(("sparse_indexer",))
             XcpuSparseAttnIndexer._upstream_verified = True
         super().__init__(*args, **kwargs)
-        self._xcpu_cpp_core = os.getenv("VLLM_XCPU_CPP_SPARSE_INDEXER", "1") != "0"
+        self._xcpu_cpp_core = (
+            not self.use_pcp and os.getenv("VLLM_XCPU_CPP_SPARSE_INDEXER", "1") != "0"
+        )
         config = get_current_vllm_config()
         spec = config.speculative_config
         next_n = 1 if spec is None else 1 + spec.num_speculative_tokens
-        if self.use_pcp or self.dcp_world_size != 1 or self.use_fp4_cache:
+        if self.dcp_world_size != 1 or self.use_fp4_cache:
             raise NotImplementedError(
-                "XCPU sparse indexer requires PCP=DCP=1 and FP8 cache"
+                "XCPU sparse indexer requires DCP=1 and FP8 cache"
             )
         if config.parallel_config.num_ubatches > 1:
             raise NotImplementedError(
@@ -579,6 +578,8 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
                 "XCPU sparse indexer requires float32 or ue8m0 scales"
             )
         if not self._xcpu_cpp_core:
+            if self.use_pcp:
+                _install_python_reference_kernels()
             return
         handle = next(_metadata_handles)
         self.k_cache._xcpu_indexer_metadata_handle = handle
@@ -610,8 +611,6 @@ XcpuSparseAttnIndexer.name = SparseAttnIndexer.name
 
 
 def _install_python_reference_kernels() -> None:
-    """Legacy A/B path only; the C++ OOT path does not rebind these operators."""
-
     import vllm._custom_ops as ops
     import vllm.model_executor.layers.sparse_attn_indexer as indexer_module
     import vllm.utils.deep_gemm as deep_gemm
