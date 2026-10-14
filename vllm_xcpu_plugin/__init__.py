@@ -45,7 +45,12 @@ def register_ops():
     from vllm_xcpu_plugin.layers.sparse_attn_indexer import (
         maybe_patch_vllm_sparse_attn_indexer,
     )
-    import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
+    from vllm.model_executor.layers.fused_moe import all2all_utils
+
+    if hasattr(all2all_utils, "register_moe_prepare_finalize_factory"):
+        import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
+    else:
+        logger.warning("XCPU MoE Prepare/Finalize registration is unavailable")
     import vllm_xcpu_plugin.layers.fused_moe.routed_experts  # noqa: F401
     from vllm_xcpu_plugin.fake_triton.runtime import KernelVersionError
 

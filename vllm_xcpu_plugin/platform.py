@@ -73,7 +73,11 @@ class McpuPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
-        import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
+        from vllm.model_executor.layers.fused_moe import all2all_utils
+
+        # 需要向 vllm 定制修改，参考 dev* 的历史提交
+        if hasattr(all2all_utils, "register_moe_prepare_finalize_factory"):
+            import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
         import vllm_xcpu_plugin.layers.fused_moe.routed_experts  # noqa: F401
 
     @classmethod
