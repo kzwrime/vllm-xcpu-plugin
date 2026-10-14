@@ -3,6 +3,11 @@
 本记录对应 `postprocess_mamba_fused_kernel` 的 #50432 回移。
 通用规则见 [兼容性指南](TRITON_COMPATIBILITY_GUIDE.md)。
 
+> 2026-10-09 来源结构迁移：下表保留当时的审计快照；当前 `_KERNELS` 使用
+> `KernelSource(tag="v0.25.1", local_commit="ea378f497e812cb2a80feefee6e5af6d74ead395",
+> backport_commit="c2881ce60302b5455867d2c29cdfae5fbeddecac")`，将实际改动提交与
+> 后续审计 HEAD 分开。仅迁移来源字段，不表示当前 0.31 Mamba 已重新适配。
+
 ## 源码身份
 
 | 字段 | 值 |

@@ -1,9 +1,11 @@
 # vLLM XCPU Triton 兼容性与新算子接入指南
 
 > **迁移记录说明：** 具体版本的语义审计与迁移结论单独维护，不写入本通用指南。
-> 当前记录见 [v0.25.1 Triton 兼容层迁移记录](TRITON_MIGRATION_V0.25.1.md)。
+> v0.31 三组算子复核及全表漂移见 [v0.31 审计](TRITON_AUDIT_V0.31_20261009.md)。
+> 历史记录见 [v0.25.1 Triton 兼容层迁移记录](TRITON_MIGRATION_V0.25.1.md)。
 > 增量回移示例见 [Mamba align 审计记录](TRITON_AUDIT_MAMBA_ALIGN_20261005.md)。
 > 元数据与后端算子同步适配示例见 [GDN 首个 chunk 审计](TRITON_AUDIT_GDN_FIRST_CHUNK_20261006.md)。
+> 请求映射与裁剪语义升级示例见 [Grammar bitmask v0.31.0 审计](TRITON_AUDIT_GRAMMAR_BITMASK_20261009.md)。
 
 本文面向 `vllm-xcpu-plugin` 和 `torch_mcpu` 的维护者，说明如何使用当前 Fake Triton 兼容层、如何接入新的 vLLM Triton kernel，以及升级 vLLM、启用 `torch.compile` 时必须注意的边界。
 
@@ -65,26 +67,35 @@
 
 #### 来源标记规范
 
-新接入或重新审计的条目统一手工填写
-`<reviewed-label>; local=<local-vllm-commit>; upstream=<upstream-commit>`：
+新接入或重新审计的 `_KERNELS` 条目使用 `KernelSource`，四个具名字段为：
 
-- `reviewed-label` 是人工确认的产品/审计版本标签；若引用 Git tag，必须核对
-  其来源。它不表示完整上游版本兼容，也不要求为每次 kernel 修复新建 tag。
-- `local-vllm-commit` 是**本次审计时 vLLM 工作区对应的已提交快照**，通常取
-  当时的HEAD。被审阅kernel及调用点必须与该提交一致，不能含未提交修改。
-  短SHA至少12位，在对应仓库中唯一；完整40位SHA及仓库身份写入独立审计记录。不是插件自身
-  commit，也不是尚未原样合入本地的上游修复 commit。
-- `upstream-commit` 独立记录上游语义来源，短SHA至少12位，完整SHA和上游
-  仓库写入审计记录；多个来源用逗号分隔，纯本地修改无对应来源时写`none`
-  并解释原因。它不是本地源码身份。上游和本地函数即使语义一致，注释或
-  移植调整也可能导致指纹不同。
-- 先提交被审阅的 vLLM 改动，再填写插件来源。开发中的未提交内容只能作为
-  临时审计草稿；合入时不能用旧 HEAD 的 SHA 指代包含未提交修改的源码。
-- 不使用 `git describe`、最近 tag 或祖先关系自动生成审计结论。不为统一样式
-  批量改写历史条目；旧记录在下次实际语义审计时迁移。
-- 三字段是本次审计的固定快照。后续无关提交不自动更新local；修改kernel
-  或调用语义时重新审计，再更新来源及必要的指纹。字符串是审计标签，
-  不按SemVer解析，不用于判断版本大小或自动放行。
+- `tag`：人工标签，通常为 `v0.31.0` 等产品版本；允许带有人工说明的非标准
+  标签。不要求对应 Git tag 位于 main，也不根据 `git describe` 自动生成。
+- `local_commit`：**替代实现发生本次改动时，对应的本地 vLLM 已提交快照**。
+  不是 plugin/torch_mcpu commit，也不是每次运行、复查时的新 HEAD。被审阅的
+  kernel 和调用点必须与该快照一致；后续无关改动不推进它。
+- `main_commit`：上述本地快照对应的最近上游 vLLM main 基准 commit，版本升级
+  通常填写此项。先确认 main ref 的仓库身份和历史，再用共同祖先等 Git 信息
+  辅助定位并人工核对。不是“今天最新 main”，也不是某个 kernel 的最后修改。
+- `backport_commit`：从更高版本移植的上游原始改动 ID，backport 通常填写此项；
+  本地 cherry-pick ID 仍属于 `local_commit`，不能放在这里。
+
+`local_commit` 必填；`main_commit` 与 `backport_commit` **严格二选一**，不允许
+同时填或同时缺失。三个 commit 字段均使用完整 40 位 SHA。多个依赖修复、具体
+引入 commit 和 wrapper 来源在审计记录中逐项列出，`backport_commit` 固定本次
+回移的目标改动。运行时只验证字段格式与互斥，不调用 Git、不联网。
+
+发布 tag 在 release 分支、未处于 main 时，保留人工 `tag`，填写核实过的 main
+分叉基准，并在审计记录记录实际 tag SHA 和 release-only 差异。不能把 release
+commit 冒充 main commit，也不能仅凭祖先关系宣布 kernel 等价。
+
+历史证据不完整的条目使用 `LegacyKernelSource` 保留原始文字，诊断会明确显示
+`legacy-unverified`。这不表示新审计通过，也不授权刷新指纹；新条目和重审条目
+必须用 `KernelSource`。本次未能恢复的历史 local/main 信息不能用当前 HEAD 或
+产品 tag 编造。已有明确证据的 Mamba backport 单独迁移，见对应审计记录。
+
+`source_version` 保留为 registry 的可读诊断字符串，由结构化来源生成，不能
+再在 `_KERNELS` 中手工拼接 `local=...; upstream=...`。
 
 独立审计记录至少包含：kernel及全部调用点、本地仓库/完整commit、人工版本
 标签、上游来源、source/signature hash、输入输出及副作用变化、配套后端改动、
@@ -123,6 +134,10 @@ Schema 是 `torch.compile` 能否正确理解调用的关键部分：
 - schema、C++ 函数签名和 adapter 参数顺序必须一致。
 
 实现层还需要显式检查 XCPU 支持边界，例如 dtype、device、contiguous/stride、维度和数值范围。不要让不支持的输入产生未定义行为。
+
+本轮精简仅限 0.31 适配新增或改写的检查：上游已保证的前提不在这些改动中
+重复检查；不据此清理既有算子或历史检查。padding、dummy request、裁剪位置
+等决定输出的分支属于算法语义，必须保留。
 
 ### 2.3 为 `torch_mcpu` operator 编写独立语义测试
 
@@ -192,7 +207,12 @@ adapter 不应：
         "_example_kernel",
         "<source hash>",
         "<signature hash>",
-        "vX.Y.Z; local=<12+位SHA>; upstream=<12+位SHA或none>",
+        KernelSource(
+            tag="vX.Y.Z",
+            local_commit="<本次改动时本地 vLLM 的完整 SHA>",
+            main_commit="<对应上游 main 基准的完整 SHA>",
+            # backport 时改填 backport_commit，不同时填写 main_commit。
+        ),
         _example_kernel,
         ("num_warps",),  # 没有 metadata 时使用 ()
     ),
@@ -220,8 +240,8 @@ PY
 哈希只能在完成源码和语义 review 后写入。vLLM 升级导致哈希变化时，禁止仅运行脚本刷新哈希；必须重新检查函数体、签名和所有 launch 点。
 
 `_MANIFEST_BASELINE_VERSION` 只说明清单最初建立时的背景版本，不参与注册，
-也不是任何 kernel 的默认值。每条 `_KERNELS` 记录必须直接写自己的
-`source_version` 字面量。某个 kernel 完成新版本审计后，只修改它自己的
+也不是任何 kernel 的默认值。每条 `_KERNELS` 记录必须显式声明自己的
+`KernelSource`（待补证历史条目为 `LegacyKernelSource`）。某个 kernel 完成新版本审计后，只修改它自己的
 版本、source hash 和 signature hash；禁止通过修改 baseline 批量放行。
 
 绕过 Fake Triton 的替代路径登记在
@@ -471,7 +491,7 @@ TorchDynamo tracing
 
 ## 6. 接入完成检查表
 
-- [ ] 人工确认版本标签，记录本次vLLM已提交快照及上游来源三个字段。
+- [ ] 人工填写 tag、local_commit，以及 main_commit/backport_commit 二选一。
 - [ ] 审计记录含仓库身份和完整SHA；kernel及调用点与local提交一致。
 - [ ] 审计 kernel 函数体、签名和全部 launch 点。
 - [ ] 明确输入、输出、副作用、grid、constexpr、metadata 和边界语义。
