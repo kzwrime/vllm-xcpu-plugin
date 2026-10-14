@@ -208,6 +208,7 @@ def test_compile_config_disables_inductor_fusions():
     from vllm_xcpu_plugin.platform import McpuPlatform
 
     config = SimpleNamespace(
+        additional_config={"user_setting": "preserved"},
         compilation_config=SimpleNamespace(
             mode=CompilationMode.VLLM_COMPILE,
             custom_ops=[],
@@ -223,11 +224,47 @@ def test_compile_config_disables_inductor_fusions():
     )
 
     McpuPlatform.check_and_update_config(config)
+    assert config.additional_config == {"user_setting": "preserved"}
 
     compile_config = config.compilation_config.inductor_compile_config
     assert compile_config["epilogue_fusion"] is False
     assert compile_config["pattern_matcher"] is False
     assert compile_config["combo_kernels"] is False
+
+
+@pytest.mark.parametrize(
+    "native,gdn,expected",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_native_gdn_selects_base_aware_functionalization(
+    monkeypatch, native, gdn, expected
+):
+    from types import SimpleNamespace
+
+    from vllm import envs
+    from vllm.config import CompilationMode
+
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    monkeypatch.setattr(envs, "VLLM_XCPU_GDN_COMPILE", native)
+    text_config = SimpleNamespace(**({"linear_num_value_heads": 24} if gdn else {}))
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=[],
+            backend="",
+            inductor_compile_config={"enable_auto_functionalized_v2": False},
+        ),
+        parallel_config=SimpleNamespace(worker_cls=None),
+        model_config=SimpleNamespace(hf_text_config=text_config),
+    )
+    McpuPlatform.check_and_update_config(config)
+    assert (
+        config.compilation_config.inductor_compile_config[
+            "enable_auto_functionalized_v2"
+        ]
+        is expected
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -298,3 +335,82 @@ def test_fused_norm_split_views_eager_and_compile(dtype, monkeypatch):
             residual_out.cpu(), summed.to(dtype), atol=2e-2, rtol=2e-2
         )
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("backend_name", ["dense", "mla"])
+@pytest.mark.parametrize("block_size", [None, 128])
+def test_platform_selects_block_size_after_backend_selection(
+    monkeypatch, backend_name, block_size
+):
+    """Non-hybrid defaults and explicit sizes must survive removing early overrides."""
+    from types import SimpleNamespace
+
+    from vllm.config import CacheConfig, CompilationMode
+
+    from vllm_xcpu_plugin.attn_backend import (
+        XcpuTritonAttentionBackend,
+        XcpuTritonMLABackend,
+    )
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    backend = {
+        "dense": XcpuTritonAttentionBackend,
+        "mla": XcpuTritonMLABackend,
+    }[backend_name]
+    cache = CacheConfig(block_size=block_size)
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE, custom_ops=[]),
+        parallel_config=SimpleNamespace(worker_cls=None),
+        cache_config=cache,
+        model_config=SimpleNamespace(is_hybrid=False),
+    )
+    monkeypatch.setenv("BLOCK_SIZE_ALIGN", "256")
+    McpuPlatform.check_and_update_config(config)
+    assert cache.block_size == (block_size or CacheConfig.DEFAULT_BLOCK_SIZE)
+    monkeypatch.setattr(
+        McpuPlatform,
+        "_find_non_ssm_backends",
+        classmethod(lambda cls, cfg: [backend]),
+    )
+    McpuPlatform.update_block_size_for_backend(config)
+    assert cache.block_size == (block_size or 64)
+
+
+def test_xcpu_attention_block_sizes_match_runtime_cache_layout():
+    """Keep backend selection and cache allocation on the NPU block granularity."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheTensor,
+        create_kv_cache_views,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.utils import select_common_block_size
+
+    from vllm_xcpu_plugin.attn_backend import XcpuTritonAttentionBackend as backend
+
+    assert backend.get_preferred_block_size(16) == 64
+    assert backend.supports_block_size(None)
+    for block_size in (64, 128, 576, 1024):
+        assert backend.supports_block_size(block_size)
+        kernel_block_size = select_common_block_size(block_size, [backend])
+        assert kernel_block_size == block_size
+        spec = FullAttentionSpec(
+            block_size=block_size, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+        )
+        raw = torch.empty(4 * spec.page_size_bytes, dtype=torch.int8, device="cpu")
+        placement = KVCacheTensor(
+            size=raw.numel(),
+            layers=["attn"],
+            layer_stride=raw.numel(),
+            block_stride=spec.page_size_bytes,
+        )
+        (cache,) = create_kv_cache_views(
+            raw, spec, 4, KVCacheLayout.LBNHC, placement, kernel_block_size
+        )
+        assert cache.shape == (4, 2, block_size, 128)
+    for block_size in (0, -64, 16, 32, 80, 544):
+        assert not backend.supports_block_size(block_size)
+        with pytest.raises(ValueError, match="positive multiple of 64"):
+            backend.get_kv_cache_shape(4, block_size, 2, 64)
+    with pytest.raises(ValueError, match="No common block size"):
+        select_common_block_size(544, [backend])

@@ -212,6 +212,20 @@ class McpuPlatform(Platform):
         from vllm.config import CompilationMode
 
         compilation_config = vllm_config.compilation_config
+        if (
+            envs.VLLM_XCPU_GDN_COMPILE
+            and vllm_config.model_config is not None
+            and hasattr(
+                vllm_config.model_config.hf_text_config, "linear_num_value_heads"
+            )
+        ):
+            # Hybrid cache views share storage. V1 functionalization scatters
+            # whole state pools between each mutable view; V2 tracks their
+            # common base and lets Inductor restore native in-place updates.
+            # MCPU uses TRACE_ONCE below, not vLLM's V1-only fusion passes.
+            compilation_config.inductor_compile_config[
+                "enable_auto_functionalized_v2"
+            ] = True
         if vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
             compilation_config.backend = "inductor"
