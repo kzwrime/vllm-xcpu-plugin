@@ -11,11 +11,12 @@ from typing import Any, cast
 import torch
 import torch_mcpu  # noqa: F401
 
+from .provenance import KernelSource, LegacyKernelSource
 from .runtime import FakeJITFunction, InvalidLaunchError, KernelLaunch, get_registry
 
 # Informational only: this is the baseline at which the manifest was created.
 # Never use it as a registration default or bulk-update it during a port. Each
-# kernel below owns its literal source_version and may advance independently.
+# kernel below owns its source provenance and may advance independently.
 # New audits record the reviewed label, local vLLM commit, and upstream commit; see
 # docs/TRITON_COMPATIBILITY_GUIDE.md for provenance and fingerprint rules.
 _MANIFEST_BASELINE_VERSION = "v0.24.0"
@@ -138,21 +139,20 @@ def _per_token_group_quant_fp8(launch: KernelLaunch) -> None:
 
 def _zero_kv_blocks(launch: KernelLaunch) -> None:
     args = launch.arguments
-    n_blocks = args["n_blocks"]
-    n_segs = args["N_SEGS"]
-    page_size = args["PAGE_SIZE_EL"]
-    block_size = args["BLOCK_SIZE"]
-    _expect(page_size % block_size == 0, "PAGE_SIZE_EL must divide BLOCK_SIZE")
-    _expect_grid(
-        launch,
-        (n_blocks * n_segs * (page_size // block_size),),
+    import torch_xcpu  # noqa: F401
+
+    n_blocks = args["block_ids_ptr"].numel()
+    n_segs = args["seg_addrs_ptr"].numel()
+    _expect(
+        len(launch.grid) == 3 and launch.grid[:2] == (n_blocks, n_segs),
+        "zero_kv_blocks requires a (blocks, segments, chunks) grid",
     )
-    torch.ops.mcpu.zero_kv_blocks_kernel_impl(
+    torch.ops.torch_xcpu.zero_kv_blocks(
         args["seg_addrs_ptr"],
+        args["seg_block_strides_ptr"],
+        args["seg_page_sizes_ptr"],
         args["block_ids_ptr"],
-        n_blocks,
-        n_segs,
-        page_size,
+        launch.grid[2] * args["BLOCK_SIZE"],
     )
 
 
@@ -238,6 +238,9 @@ def _compute_slot_mappings(launch: KernelLaunch) -> None:
         args["PAD_ID"],
         num_groups,
         num_reqs,
+        args["kernel_block_sizes"],
+        args["slot_mapping_enabled"],
+        args["dcp_sharded"],
     )
 
 
@@ -355,22 +358,44 @@ def _post_update(launch: KernelLaunch) -> None:
 
 def _grammar_bitmask(launch: KernelLaunch) -> None:
     args = launch.arguments
-    num_masks = args["logits_indices_ptr"].numel()
+    logits = args["logits_ptr"]
+    indices = args["logits_indices_ptr"]
+    offsets = args["cu_num_logits_ptr"]
+    bitmask = args["bitmask_ptr"]
     vocab_size = args["vocab_size"]
     block_size = args["BLOCK_SIZE"]
-    _expect_grid(launch, (num_masks, (vocab_size + block_size - 1) // block_size))
+    mask_stride = args["MASK_STRIDE"]
+    # Trust the same input preconditions as the Triton kernel. Only check
+    # launch information that the C++ operator derives instead of receiving.
+    _expect(args["logits_stride"] == logits.stride(0), "grammar logits stride mismatch")
+    _expect(
+        args["bitmask_stride"] == bitmask.stride(0), "grammar bitmask stride mismatch"
+    )
+    _expect_grid(launch, (indices.numel(), (vocab_size + block_size - 1) // block_size))
     torch.ops.mcpu.vllm_apply_grammar_bitmask(
-        args["logits_ptr"],
-        args["logits_indices_ptr"],
-        args["bitmask_ptr"],
+        logits,
+        indices,
+        offsets,
+        bitmask,
         vocab_size,
+        mask_stride,
     )
 
 
 def _logit_bias(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
     args = launch.arguments
     _expect_grid(launch, (args["expanded_idx_mapping_ptr"].numel(),))
-    torch.ops.mcpu.vllm_bias_kernel(
+    for tensor_name, stride_name in (
+        ("logits_ptr", "logits_stride"),
+        ("allowed_token_ids_ptr", "allowed_token_ids_stride"),
+        ("bias_token_ids_ptr", "bias_token_ids_stride"),
+        ("bias_ptr", "bias_stride"),
+        ("stop_token_ids_ptr", "stop_token_ids_stride"),
+    ):
+        _expect(args[tensor_name].stride(0) == args[stride_name], stride_name)
+    torch.ops.torch_xcpu.logit_bias(
         args["logits_ptr"],
         args["vocab_size"],
         args["expanded_idx_mapping_ptr"],
@@ -382,7 +407,9 @@ def _logit_bias(launch: KernelLaunch) -> None:
         args["pos_ptr"],
         args["min_lens_ptr"],
         args["num_stop_token_ids_ptr"],
+        args["restore_when_all_masked_ptr"],
         args["stop_token_ids_ptr"],
+        args["CHECK_ALL_MASKED_ROWS"],
     )
 
 
@@ -410,6 +437,14 @@ def _prepare_prefill_inputs(launch: KernelLaunch) -> None:
     args = launch.arguments
     _expect_grid(launch, (args["idx_mapping_ptr"].numel(),))
     _expect(args["BLOCK_SIZE"] == 1024, "prefill BLOCK_SIZE must be 1024")
+    next_tokens = args["next_prefill_tokens_ptr"]
+    _expect(
+        next_tokens.ndim == 2
+        and args["next_prefill_tokens_stride"] == next_tokens.stride(0)
+        and args["num_lookahead"] == next_tokens.shape[0]
+        and args["LOOKAHEAD_BLOCK"] >= args["num_lookahead"],
+        "prefill lookahead shape/stride mismatch",
+    )
     _expect(
         args["all_token_ids_stride"] == args["all_token_ids_ptr"].stride(0),
         "all_token_ids stride mismatch",
@@ -993,6 +1028,8 @@ def _rejection_v2(launch: KernelLaunch) -> None:
 
 def _rejection_resample(launch: KernelLaunch) -> None:
     args = launch.arguments
+    _expect(not args["WATERMARK"], "watermarked resampling is unsupported")
+    _expect(not args["DEDUPLICATE_CONTEXTS"], "watermark deduplication is unsupported")
     vocab_size = args["vocab_size"]
     block_size = args["BLOCK_SIZE"]
     num_reqs = args["rejected_step_ptr"].numel()
@@ -1269,6 +1306,8 @@ def _eagle_step_slot_mapping_metadata(launch: KernelLaunch) -> None:
 
 
 def _bad_words(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
     args = launch.arguments
     _expect(
         launch.grid[0] == args["expanded_idx_mapping_ptr"].numel(), "bad words grid"
@@ -1285,7 +1324,8 @@ def _bad_words(launch: KernelLaunch) -> None:
         args["all_token_ids_stride"] == args["all_token_ids_ptr"].stride(0),
         "all-token stride mismatch",
     )
-    torch.ops.mcpu.vllm_bad_words_kernel(
+    _expect(args["logits_stride"] == args["logits_ptr"].stride(0), "logits stride")
+    torch.ops.torch_xcpu.bad_words(
         args["logits_ptr"],
         args["expanded_idx_mapping_ptr"],
         args["bad_word_token_ids_ptr"],
@@ -1296,19 +1336,28 @@ def _bad_words(launch: KernelLaunch) -> None:
         args["total_len_ptr"],
         args["input_ids_ptr"],
         args["expanded_local_pos_ptr"],
+        launch.grid[1] if len(launch.grid) > 1 else 1,
     )
 
 
 def _topk_log_softmax(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
     args = launch.arguments
     _expect_grid(launch, (args["logits_ptr"].shape[0],))
     _expect(args["logits_stride"] == args["logits_ptr"].stride(0), "logits stride")
-    torch.ops.mcpu.vllm_topk_log_softmax_kernel(
+    _expect(
+        args["topk_ids_stride"] == args["topk_ids_ptr"].stride(0),
+        "topk token IDs stride mismatch",
+    )
+    torch.ops.torch_xcpu.topk_log_softmax(
         args["output_ptr"],
         args["logits_ptr"],
         args["topk_ids_ptr"],
         args["topk"],
         args["vocab_size"],
+        args["BLOCK_SIZE"],
+        args["TOPK_BLOCK_SIZE"],
     )
 
 
@@ -1401,14 +1450,23 @@ def _prompt_logprob_token_ids(launch: KernelLaunch) -> None:
 
 
 _KERNELS: tuple[
-    tuple[str, str, str, str, str, Callable[[KernelLaunch], Any], tuple[str, ...]], ...
+    tuple[
+        str,
+        str,
+        str,
+        str,
+        KernelSource | LegacyKernelSource,
+        Callable[[KernelLaunch], Any],
+        tuple[str, ...],
+    ],
+    ...,
 ] = (
     (
         "vllm.model_executor.models.qwen3_vl",
         "_bilinear_pos_embed_kernel",
         "77637835fa2fb867fd9f9b97c12ada5ca063fc84b351654ad65427a42dd61721",
         "6a8f4330010da11c2ae8d3cb6ae0fa86a3e1792b8eca8d97fb752dd709ac5eac",
-        "v0.25.1",
+        LegacyKernelSource("v0.25.1"),
         _qwen3_vl_bilinear_pos_embed,
         (),
     ),
@@ -1417,16 +1475,20 @@ _KERNELS: tuple[
         "_per_token_group_quant_fp8",
         "7717aa7f963f67003bcd95773ee448a344f772c0789b60abf4765c7abe5afb3b",
         "ef21c8054336abd0321214df36f5ce0888919da816686b2a61e559a392b1d1fa",
-        "v0.25.0",
+        LegacyKernelSource("v0.25.0"),
         _per_token_group_quant_fp8,
         ("num_stages", "num_warps"),
     ),
     (
         "vllm.v1.worker.utils",
         "_zero_kv_blocks_kernel",
-        "eedc25dc850294fdcb43a7c7e4fb04c465740a435157dd91e05a103fb2366304",
-        "b572c3cc2feaa91e97397b5a07a4ac4fa9597667c8dad6eb3388d7a51fa5e351",
-        "v0.24.0",
+        "3e9fd54fe13faf03897d1e2ab7abaa981aaeca3c9eadbaed83ec768adc42e51d",
+        "748e43d8a951e76c0c66503988f051618ecb1c8f7a91c90c6ad086c5b71b3ab1",
+        KernelSource(
+            tag="v0.31 Qwen3.5 cache semantics",
+            local_commit="630fdc2cf5a9c06095504b7a052e0d650bba458c",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _zero_kv_blocks,
         (),
     ),
@@ -1435,7 +1497,7 @@ _KERNELS: tuple[
         "_apply_write_kernel",
         "6bde42298a330d5060b8061fdfcfba17cf7a0a812d4a78b54ff148a9b4dfd257",
         "1fe7155b89393baa74552e3015f08f47b3130da9051adb8de6ef8cec8b34fcf7",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _apply_write,
         (),
     ),
@@ -1444,7 +1506,7 @@ _KERNELS: tuple[
         "_gather_block_tables_kernel",
         "5aa908b7646c32148e5fb7cdd62781e7fd466b359a674a4bf7416358a7d0f2a6",
         "cac827ebbf78044d46ae1fb2c2b38f96cb4ef0193ae9e0a6851d9042b5977e70",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _gather_block_tables,
         (),
     ),
@@ -1453,7 +1515,7 @@ _KERNELS: tuple[
         "_compute_slot_mapping_kernel",
         "80be96b2bf56f10d060d32779de2bac5577db68b0cdd345b7a91437158858027",
         "5eb4c7a44f8ce37b48472fd97ca0bd19e4f87a7f5a3b22b3ab6ef39f53a699cd",
-        "v0.25.0",
+        LegacyKernelSource("v0.25.0"),
         _compute_slot_mapping,
         (),
     ),
@@ -1462,16 +1524,20 @@ _KERNELS: tuple[
         "BuildPrefillChunkMetadataKernel.kernel",
         "385ac0d8e2a8f959b3e33d2dcfef5431eddf0fc02b76869201106ab43dbdc08d",
         "32c266857225077009d2181fc4e291b34645db43cfa35b77e4d5b34eceb6ec03",
-        "v0.25.0",
+        LegacyKernelSource("v0.25.0"),
         _build_indexer_prefill_chunk_metadata,
         (),
     ),
     (
         "vllm.v1.worker.gpu.block_table",
         "_compute_slot_mappings_kernel",
-        "e7cfdd055ee4f32c0fb5b18091f508dd8754d58f9120034105d425e44cdaff9b",
-        "653c92181fba55279fb7a633ad85485888f04b418f8c19095ce5f0dc13785abf",
-        "v0.24.0",
+        "6396157db0ab8393e4fc7d6cfde18f6a257bad7f08b12527fa27a181efbd255c",
+        "8c66ef11e4926fb3ec7790dd6cd554cff3e6f22a26e33a8921410777ae3cab2f",
+        KernelSource(
+            tag="v0.31.0",
+            local_commit="dd24619b0d47831e2826d57fe3f948a303d73c55",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _compute_slot_mappings,
         (),
     ),
@@ -1480,7 +1546,7 @@ _KERNELS: tuple[
         "_combine_sampled_and_draft_tokens_kernel",
         "87a15b332c59f4be05844b8b761960f1bbaa0a4182aa29215fec36c1aa871b22",
         "4ef7c5370798e1bd7a972572d12a64e4c4463d6ed04dab404ccb55867a3b1e9e",
-        "v0.25.0",
+        LegacyKernelSource("v0.25.0"),
         _combine_sampled_and_draft,
         (),
     ),
@@ -1489,25 +1555,33 @@ _KERNELS: tuple[
         "_post_update_kernel",
         "716d50004e13452fa8fefb211d3e5ca66756f7d78b9f63fda008431b3d7b0286",
         "3097fa96b4547ccdf952985b5aa933d9b73f651f919b2124025d337934273174",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _post_update,
         ("num_warps",),
     ),
     (
         "vllm.v1.worker.gpu.structured_outputs",
         "_apply_grammar_bitmask_kernel",
-        "e334b50d21b3e3f8c39e7e64ade9135b25e4039d460f6ca271e6b44335953b21",
-        "fb602ffdcdbdcaf4fdb3dee73b58435e5106e107c2fd037e88b3c5cc8c75563b",
-        "v0.24.0",
+        "9b314b61959e9d7ea16a733c873c19f3677f63ca3dbb80e6f356613907e2d15f",
+        "d36601f75e189d67bbec31bf6891559577edd04ec783384b550bb9f9f4329215",
+        KernelSource(
+            tag="v0.31.0",
+            local_commit="6626cc5bb9f158fb6701be56ac74a7a06771a07c",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _grammar_bitmask,
         (),
     ),
     (
         "vllm.v1.worker.gpu.sample.logit_bias",
         "_bias_kernel",
-        "a37b8836ad5f45654eabba292a4abe7e1f37da9695e253aab79afd07530bf6bf",
-        "9681ff4dfb8298a8407b5f8655ffdbb129f4474bea20bd0292ea789d4194fba9",
-        "v0.24.0",
+        "13d1b77e67211296fda425d8bde3582f1c8235942beb74a00f7455d5d412413e",
+        "993fabe1855642073bf8293d7cc2193885c5ebb961415056d61812c8fa75d272",
+        KernelSource(
+            tag="v0.31 logit bias: per-request finite stop-logit restore",
+            local_commit="aef0296d2b22a98fa0c8a37bbdf3205c85d8a092",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _logit_bias,
         (),
     ),
@@ -1516,16 +1590,20 @@ _KERNELS: tuple[
         "_fill_logprob_token_ids_kernel",
         "67b978589645faf3ad20c43fd78c6ba91d9a1ddc85623c07df8501a317c4e2bb",
         "9aa0a7b30e841c7e5137fcca3d96ad6ee5a2ef04a13166d0a940980e9fccbdf4",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _fill_logprob_token_ids,
         (),
     ),
     (
         "vllm.v1.worker.gpu.input_batch",
         "_prepare_prefill_inputs_kernel",
-        "928ffeb93a37d7de91cea22760440a77a5af2d25f2bed4671ca0d41984a6ff35",
-        "77c7c4a386f60887453fb464c275933bbcb05f79e68be455f5b0ce0012eda6ed",
-        "v0.24.0",
+        "5617219a85a9f761efd0e7c6ac83f686d5ca44805ffb0c746af3de72659c4d6c",
+        "b943372eb57c4418f17f860d45429a4e275f6dfc60c5ed0a5e7f1ad4013f4e5f",
+        KernelSource(
+            tag="v0.31.0",
+            local_commit="dd24619b0d47831e2826d57fe3f948a303d73c55",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _prepare_prefill_inputs,
         (),
     ),
@@ -1534,7 +1612,7 @@ _KERNELS: tuple[
         "_prepare_prefill_inputs_kernel",
         "fc094fbcf36c318670ece79a9cbbde4013966270c30bbba5c435c5778b8e57cc",
         "ed7370baed785629709f3a261987fe0118a40852c162e799bf5ebf6fb32ed68e",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _autoregressive_prepare_prefill_inputs,
         (),
     ),
@@ -1543,7 +1621,7 @@ _KERNELS: tuple[
         "_prepare_decode_inputs_kernel",
         "2c95b42783b22ef2cc91f3e325f224b2a946986eadf12a77d84d374ef48d8897",
         "f58f0edceb3bcc8c7bf97e4d490cdea52c65d36290490519b9c711d38da42d24",
-        "fe755c88995 (#54282)",
+        LegacyKernelSource("fe755c88995 (#54282)"),
         _autoregressive_prepare_decode_inputs,
         (),
     ),
@@ -1552,7 +1630,7 @@ _KERNELS: tuple[
         "_update_draft_inputs_kernel",
         "6a01da77eb14e736abc6504c9c1cc53383e4cf92f6bec820bb7b1b42728fcdf1",
         "e49d918e586c113607c416e118a54563d8c85e777383233579b60c850f667968",
-        "fe755c88995 (#54282)",
+        LegacyKernelSource("fe755c88995 (#54282)"),
         _autoregressive_update_draft_inputs,
         (),
     ),
@@ -1561,7 +1639,7 @@ _KERNELS: tuple[
         "_prepare_pos_seq_lens_kernel",
         "5e42c1095fe391474d4cac66c76dba29259a62ff2a20ce5cf0ce5df7d52accef",
         "41458ec9cbc4829bfd42e070efdc5be7d1c6fd0a884d674324a6d0496296a096",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _prepare_pos_seq_lens,
         (),
     ),
@@ -1570,16 +1648,20 @@ _KERNELS: tuple[
         "_prepare_rope_positions_kernel",
         "65158c5c27896b717e28c9b6727aa95285969e1221526faa531c0cf5b766bd34",
         "7b68271fdc1121235ae9233ae2da4fa18745e1bb8c65e69373649a8545e4e81d",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _prepare_rope_positions,
         (),
     ),
     (
         "vllm.v1.worker.mamba_utils",
         "preprocess_mamba_align_fused_kernel",
-        "55c1440a10f71a2582d7c8aec21c1ccfa605381b5c3f24c2990c2be08ec10ab6",
+        "ace7e4347dad9b17f03370989934d7ef5c4fa6f2d2601b4a809422e17d05af94",
         "d37373ee6a2ab978247bbba864c785901c1afd677b98850f9d6a68bb81e77e49",
-        "v0.25.1",
+        KernelSource(
+            tag="v0.31 Qwen3.5 cache semantics",
+            local_commit="630fdc2cf5a9c06095504b7a052e0d650bba458c",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _preprocess_mamba_align,
         (),
     ),
@@ -1588,7 +1670,7 @@ _KERNELS: tuple[
         "precopy_mamba_align_fused_kernel",
         "9bbbde89056d4fba815268a71d038650bc840e2dafd9944c3fd9b619876efd2e",
         "7e3b13b611b2c064d90bc22719d3ec5384dc9a93eba374f7885195bd73b1e35a",
-        "v0.25.1",
+        LegacyKernelSource("v0.25.1"),
         _precopy_mamba_align,
         (),
     ),
@@ -1599,7 +1681,7 @@ _KERNELS: tuple[
         "34919a7a6f15f7639eb0ee59abebf561f2c48b1243eee651aa03adeafd7ec97b",
         # Audited vLLM snapshot and upstream #50432; full provenance is in
         # docs/TRITON_AUDIT_MAMBA_ALIGN_20261005.md.
-        "v0.25.1; local=377c203f180c; upstream=c2881ce60302",
+        LegacyKernelSource("v0.25.1; local=377c203f180c; upstream=c2881ce60302"),
         _postprocess_mamba,
         (),
     ),
@@ -1608,7 +1690,7 @@ _KERNELS: tuple[
         "_scatter_num_accepted_kernel",
         "20bca6b80f9d2a5d6a51a88bf683256fd9d15efe05a1592da25d7d2f31d5b107",
         "5619eaf2ab8f252bf3562bd92a9c78da16e96c5daada7a8c8aed720983daa19e",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _scatter_num_accepted,
         (),
     ),
@@ -1617,7 +1699,7 @@ _KERNELS: tuple[
         "_get_num_sampled_and_rejected_kernel",
         "8e76f6adf25e74d7d7bdf053d50399861f50613fb707acdd0b869b1c3be82b07",
         "8172888d9239019811f577e2b0dbafcc7d656804f3503c753016f34d3cbafce1",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _get_num_sampled_and_rejected,
         (),
     ),
@@ -1626,7 +1708,7 @@ _KERNELS: tuple[
         "_post_update_num_computed_tokens_kernel",
         "9c9754a3c48a493290d6917370a96d79620239809fc0edb08e6906cf45acfcad",
         "042f8815ef34ea47ce1c367ab3b183c34001b97d0b598907a1d5090227691a3a",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _post_update_num_computed_tokens,
         (),
     ),
@@ -1635,7 +1717,7 @@ _KERNELS: tuple[
         "_expand_idx_mapping_kernel",
         "c716f4fadb06c80d28adbb03307d989bf62f7ef9ae6694549650fdc2a7983045",
         "a91a97bdb0a7d9f6ad5095f72509905e256570d914a116741ad0c93ee51d4128",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _expand_idx_mapping,
         (),
     ),
@@ -1644,7 +1726,7 @@ _KERNELS: tuple[
         "_flatten_sampled_kernel",
         "0256a6b5405bc8f62f2cd2dff4c83f613d9c2c8e1c74ac0f9dc477341f576778",
         "bba626cce7c4642ff2c2c1f6839fe7010e03368c201ba370a4dab9ca713d16a7",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _rejection_flatten,
         ("num_warps",),
     ),
@@ -1653,7 +1735,7 @@ _KERNELS: tuple[
         "_compute_local_logits_stats_kernel",
         "85f0c4a3cc706909fffb745b5b9a2e94b26c2eee8f1e6771185489cd14b00f92",
         "f7df3922cbf844c774e1d7746d88d1b93dd75a99b0232d955c69d91ef553aea8",
-        "b389ac2946",
+        LegacyKernelSource("b389ac2946"),
         _rejection_compute_local_logits_stats,
         (),
     ),
@@ -1662,7 +1744,7 @@ _KERNELS: tuple[
         "_compute_cumulative_log_p_kernel",
         "260df7bbaf2d6f8008904ceac7950ab04350fdfdfdfdd74a46358dccb616411b",
         "9288fe68370ddebf205d8583a3fde34969f8d3535c2f208615598df7140bddd2",
-        "b389ac2946",
+        LegacyKernelSource("b389ac2946"),
         _rejection_cumulative_log_p,
         ("num_warps",),
     ),
@@ -1671,7 +1753,7 @@ _KERNELS: tuple[
         "_compute_local_residual_mass_kernel",
         "40057b9b19a3ab64fc9dc0c70914477ddc52918b2fda13cce74ccaa7e3bc5809",
         "bedaed3ba6a0b2032fac12cc9f5b33b47511463fb5385f5f57470104565869d5",
-        "b389ac2946",
+        LegacyKernelSource("b389ac2946"),
         _rejection_local_residual_mass,
         (),
     ),
@@ -1680,25 +1762,33 @@ _KERNELS: tuple[
         "_rejection_kernel",
         "3d4dbcdc0d283809f462c8d9ebae30e2f477eab2baea07425692329a2e085a18",
         "ab95ffecb83ee24783fcfa2f1a52274a82888fc2763fd0669421935647b0ae5b",
-        "b389ac2946",
+        LegacyKernelSource("b389ac2946"),
         _rejection_v2,
         ("num_warps",),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_resample_kernel",
-        "f6f1c6654494ce131a001adf6a037cade8f7a93a5df7164eecf2028549a78bcc",
-        "2cb197288d2aabd1719d7dd1a599f48a5c059f1a8c4549196347eb95ea28af2a",
-        "fe755c88995 (#54282)",
+        "b00ed915df2cea198ac2a6a0ab54e578e5049f930ff3cbf22f8bae5f3bf19582",
+        "f579e85f05eaa128de438a7c3ce9b189f66952719f18763ddbf6b58284f74ce5",
+        KernelSource(
+            tag="v0.31.0 standard non-watermarked verification",
+            local_commit="9c77da8aee9b04e3db4797b1ff4c576fb394dcdf",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _rejection_resample,
         (),
     ),
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_insert_resampled_kernel",
-        "e4daecaefc15bbc4b02c6ee7541dc1acd0ad582afcd617efb325d0d084a2273b",
+        "8a44a81e0aa726bac33ae3e974a0227b6aa79108869f9cfe3e0431dee8020301",
         "31af6f6b1e71365896c70a7da6263928ffc9a30877b62a608cd452b0f9681ac8",
-        "v0.24.0",
+        KernelSource(
+            tag="v0.31.0 standard non-watermarked verification",
+            local_commit="9c77da8aee9b04e3db4797b1ff4c576fb394dcdf",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _rejection_insert,
         (),
     ),
@@ -1707,7 +1797,7 @@ _KERNELS: tuple[
         "_selector_walk_kernel",
         "184f60427633418ff15fc8e6f07de0b9ea88a08637c10c9d7f62342ce9c538f7",
         "600d4f3329d7088336c4c2bbbea178eab7862f4f454c0fbd7ca5f9696be104ba",
-        "fe755c88995 (#54282)",
+        LegacyKernelSource("fe755c88995 (#54282)"),
         _dflash2_selector_walk,
         ("num_warps",),
     ),
@@ -1716,7 +1806,7 @@ _KERNELS: tuple[
         "_cache_draft_logits_kernel",
         "c024edcea71f86a71bc6eedb2f8d9764089cce65709673d0f40d704f9ac5df17",
         "423da88d0a099305f654f9b17c52effe8f24128505c30b9630b9c71f92e4d2f1",
-        "b389ac2946",
+        LegacyKernelSource("b389ac2946"),
         _dflash2_cache_draft_logits,
         ("num_warps",),
     ),
@@ -1725,7 +1815,7 @@ _KERNELS: tuple[
         "expand_kernel",
         "6bc6d69deac4b0bf8aa07bcc879e80f1e3e8ab45ee003b90b56b5756c84e1910",
         "e915db20eca855654152e1b0db836f032483d3cb477487cbf305b2a5e21e4b00",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _rejection_sampler_expand,
         (),
     ),
@@ -1734,7 +1824,7 @@ _KERNELS: tuple[
         "rejection_greedy_sample_kernel",
         "8f96dd95137ff29dd09be620021f72c79162376ba6b8e75077aae69ff1696d9f",
         "5cb68da8498b1d54a330aee377d9cdc4e7122bb34a74e53b0169903a927e3bc2",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _rejection_greedy,
         (),
     ),
@@ -1743,7 +1833,7 @@ _KERNELS: tuple[
         "sample_recovered_tokens_kernel",
         "2b93b033709712e066b19d1dc1873a11468c36b2be448c5deec72745aa8f3755",
         "00fbf642aff31227f9dca2537c92deccaa0bed7a5c35bb94af548146d8e4d40a",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _sample_recovered,
         (),
     ),
@@ -1752,7 +1842,7 @@ _KERNELS: tuple[
         "rejection_random_sample_kernel",
         "f75f9429eafb383840ff75eaa550d27491ea09cafb029244c8292e09f23e8a86",
         "61d2450a512a6a2211a01b17f242f2001b70f55ef270cfa75adc524da4253347",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _rejection_random,
         (),
     ),
@@ -1761,7 +1851,7 @@ _KERNELS: tuple[
         "eagle_prepare_next_token_padded_kernel",
         "466d87c788c9dcf9a842cabe2777ecb85460a64bba6929902740cebd6313a37b",
         "3622acaef3e6e01bda16622d695a1913cce1353a08feddeff9592e0310d53cb8",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _eagle_prepare_next_token_padded,
         (),
     ),
@@ -1770,7 +1860,7 @@ _KERNELS: tuple[
         "eagle_prepare_inputs_padded_kernel",
         "499c9ce7d993134d799f89d9f895d2070bc4aed5851ee4dfa033fbf5c850b4da",
         "0503ad7b03daa8bba43ea18b80e27d3b64ea733466ed612b079a5c8d0c13e088",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _eagle_prepare_inputs_padded,
         (),
     ),
@@ -1779,25 +1869,33 @@ _KERNELS: tuple[
         "eagle_step_slot_mapping_metadata_kernel",
         "fecbccb0286df45eb67a092836a29357f75b3e445a249738dd95739728bb82d8",
         "972738fccc9dc1fe972bd1afc1e7dfe689fc453ab8c176e6e4d405a17e617add",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _eagle_step_slot_mapping_metadata,
         (),
     ),
     (
         "vllm.v1.worker.gpu.sample.bad_words",
         "_bad_words_kernel",
-        "d58260c941d0deaaa6e474f18c6db2cc5b3bd959a63b9d5ee35450320ecdb55a",
+        "e733604f781e979dd0f585465e6c61ad39c40b89fe33ad6eb84701f89b528039",
         "e275dcc38c8769bebb9322fd473062d0c9319963f8b1ed0ee4c8f0e093388a54",
-        "v0.24.0",
+        KernelSource(
+            tag="v0.31 bad words: drafts start after the committed token",
+            local_commit="aef0296d2b22a98fa0c8a37bbdf3205c85d8a092",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _bad_words,
         (),
     ),
     (
         "vllm.v1.worker.gpu.sample.logprob",
         "_topk_log_softmax_kernel",
-        "31c228669aa02373e285e4e8f318a4b62beda5bacbe9be3dc4e1f81715dfd908",
-        "ed8ecd4bb2608522dcd02fd61f20aebb36fd6fc99eb3b6322392ea0082cf7c31",
-        "v0.24.0",
+        "e63ad59776bfbec42c373c88e2a29a6495a9050a787ce9b36aa2e109e5a01a15",
+        "a23201f75bb8e4cf4d128873becb4cb835aefd52ff66a862cd21b3c802ddeb67",
+        KernelSource(
+            tag="v0.31 topk logprobs: independent token-ID row stride",
+            local_commit="aef0296d2b22a98fa0c8a37bbdf3205c85d8a092",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _topk_log_softmax,
         (),
     ),
@@ -1806,7 +1904,7 @@ _KERNELS: tuple[
         "_ranks_kernel",
         "f1b2b5dc4deef9f30924304f7bf98393138b883dd98db60f65f139ffc26e7c90",
         "1b8570353f9fe64bae9cfd8ea5fc80c5b89aa72d711adfea0d464204ccb8e1a6",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _ranks,
         (),
     ),
@@ -1815,7 +1913,7 @@ _KERNELS: tuple[
         "_min_p_kernel",
         "07cfd4634f986ac5cd6e0f5c7f66b678c7bb6b1168cae50fd699c23fee949f0a",
         "334bc27604309735887a01c28b4ffbf2283780b45cd95f50f98cd9095022cb79",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _min_p,
         (),
     ),
@@ -1824,7 +1922,7 @@ _KERNELS: tuple[
         "_penalties_kernel",
         "7d427188e1874917ad43b0a843b718518ef9bc4116be8367c06fe72bfba5e3dc",
         "332996dd6a4f16f92ec084fe2623bc06f3b65c46f2a667ba841505284d27fb4f",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _penalties,
         (),
     ),
@@ -1833,7 +1931,7 @@ _KERNELS: tuple[
         "_bincount_kernel",
         "3009661a6db97446184fb9ed6458069c580a12c4a9e2cc643dff35ca4a80369c",
         "14a55431028882a62010aa7273ff46305b8f4b361067479c30b7c885367eaf5f",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _bincount,
         (),
     ),
@@ -1842,7 +1940,7 @@ _KERNELS: tuple[
         "_prompt_logprobs_token_ids_kernel",
         "85a3b2e004343807a21da4eb84d09548c3bb1f26d5a0db01cfb826cd7a9f3b54",
         "a711807c2084cbfea9cd3094ce73d6023f335fa65ed111c53317ab26276ca909",
-        "v0.24.0",
+        LegacyKernelSource("v0.24.0"),
         _prompt_logprob_token_ids,
         (),
     ),
@@ -1864,7 +1962,7 @@ def register_vllm_kernels() -> None:
         name,
         source_hash,
         signature_hash,
-        source_version,
+        source,
         adapter,
         metadata,
     ) in _KERNELS:
@@ -1889,6 +1987,6 @@ def register_vllm_kernels() -> None:
             expected_signature_hash=signature_hash,
             allowed_metadata=metadata,
             owner="torch_mcpu",
-            source_version=source_version,
+            source_version=str(source),
             defer_version_check=True,
         )

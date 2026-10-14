@@ -209,9 +209,11 @@ _apply_grammar_bitmask_kernel[(1, 1)](
     logits,
     logits.stride(0),
     indices,
+    torch.tensor([0, 1], dtype=torch.int32, device="mcpu"),
     bitmask,
     bitmask.stride(0),
     35,
+    MASK_STRIDE=1,
     BLOCK_SIZE=8192,
 )
 query_start = torch.tensor([0, 2], dtype=torch.int32, device="mcpu")
@@ -338,14 +340,19 @@ print(json.dumps({
     assert payload == {
         "has_triton": True,
         "registrations": 49,
-        "source_versions": [
-            "b389ac2946",
-            "fe755c88995 (#54282)",
-            "v0.24.0",
-            "v0.25.0",
-            "v0.25.1",
-            "v0.25.1; local=377c203f180c; upstream=c2881ce60302",
-        ],
+        "source_versions": sorted([
+            "legacy-unverified: b389ac2946",
+            "legacy-unverified: fe755c88995 (#54282)",
+            "legacy-unverified: v0.24.0",
+            "legacy-unverified: v0.25.0",
+            "legacy-unverified: v0.25.1",
+            "v0.25.1; local=ea378f497e812cb2a80feefee6e5af6d74ead395; "
+            "backport=c2881ce60302b5455867d2c29cdfae5fbeddecac",
+            "v0.31.0; local=6626cc5bb9f158fb6701be56ac74a7a06771a07c; "
+            "main=283d76d56a45d9bbead5ba650402fb0957abc30c",
+            "v0.31.0; local=dd24619b0d47831e2826d57fe3f948a303d73c55; "
+            "main=283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ]),
         "expand_launches": 1,
         "expanded": [0.5, 0.5, 0.25, 0.25, 0.25],
         "invalid_max_rejected": True,
