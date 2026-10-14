@@ -34,8 +34,39 @@ class FakeDType:
     """
 
 
+class _FakeConstexprMeta(type):
+    def __repr__(cls) -> str:
+        # Kernel signature fingerprints include the annotation repr.
+        return "tl.constexpr"
+
+
+class FakeConstexpr(metaclass=_FakeConstexprMeta):
+    """Compile-time value container for imports and TorchDynamo inspection.
+
+    Fake JIT kernels dispatch to registered adapters; this is not a Triton
+    expression interpreter.
+    """
+
+    name = "constexpr"
+    value: Any
+
+    def __init__(self, value: Any) -> None:
+        while isinstance(value, FakeConstexpr):
+            value = value.value
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"constexpr[{self.value}]"
+
+    def __bool__(self) -> bool:
+        return bool(self.value)
+
+    def __index__(self) -> int:
+        return self.value
+
+
 class FakeLanguageModule(types.ModuleType):
-    constexpr: FakeLanguageSymbol
+    constexpr: type[FakeConstexpr]
     dtype: type[FakeDType]
     core: FakeLanguageModule
     view: Callable[..., Any]
@@ -201,7 +232,7 @@ def install_fake_triton(*, replace_existing: bool = False) -> FakeTritonInstalla
     language.__path__ = package_paths.get(  # type: ignore[attr-defined]
         "triton.language", []
     )
-    language.constexpr = FakeLanguageSymbol("constexpr")
+    language.constexpr = FakeConstexpr
     language.dtype = FakeDType
     language.core = language
     language.view = _language_view
