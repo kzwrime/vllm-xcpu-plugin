@@ -9,6 +9,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="XCPU AF-EP expert service")
     parser.add_argument("--model", required=True)
     parser.add_argument("--revision")
+    parser.add_argument(
+        "--all2all-backend",
+        choices=("mpi_alltoallv_v7", "mpi_alltoallv_v8"),
+        default="mpi_alltoallv_v7",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
     parser.add_argument(
         "--max-model-passes",

@@ -205,8 +205,20 @@ class MpiAlltoallvPrepareAndFinalizeV5(mk.FusedMoEPrepareAndFinalizeModular):
             + topk * (torch.int32.itemsize + topk_weights.element_size())
             + hidden_dim * a1.element_size()
         )
+        from torch_xcpu.ops_defs.moe_prepare import (
+            moe_prepare_dispatch_buffer_bytes,
+        )
+
+        # Allocate the fixed capacity bound; let the allocator reuse storage
+        # after finalize releases the reference for this prepare.
         dispatch_send_buffer = torch.empty(
-            self.ep_size * self.max_moe_tokens_per_rank * dispatch_record_bytes,
+            moe_prepare_dispatch_buffer_bytes(
+                self.ep_size,
+                self.max_moe_tokens_per_rank,
+                topk,
+                dispatch_record_bytes,
+                send_empty_header=False,
+            ),
             dtype=torch.uint8,
             device=device,
         )

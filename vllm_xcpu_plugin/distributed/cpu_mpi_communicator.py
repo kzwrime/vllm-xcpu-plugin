@@ -19,6 +19,7 @@ MPI_ALLTOALLV_BACKENDS = {
     "mpi_alltoallv_v5",
     "mpi_alltoallv_v6",
     "mpi_alltoallv_v7",
+    "mpi_alltoallv_v8",
 }
 
 
@@ -93,11 +94,11 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         )
 
         if self.use_all2all:
-            if self.all2all_backend == "mpi_alltoallv_v7":
+            if self.all2all_backend in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
                 import vllm_xcpu_plugin.envs as envs_xcpu
 
                 if not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP:
-                    raise ValueError("mpi_alltoallv_v7 requires AF-EP")
+                    raise ValueError(f"{self.all2all_backend} requires AF-EP")
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "all_to_all_single":
@@ -133,10 +134,13 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torch_mpi_ext
 
-        # logger.info(f"all_reduce rank: {self.mpi_group_rank}, "
-        #     f"input_.shape: {input_.shape}, input_.dtype: {input_.dtype}")
-        torch_mpi_ext.ops.all_reduce__wrapper(input_, self.comm_ptr_wrapper)
-        return input_
+        # Keep allocation visible to Inductor so it can plan/reuse the output
+        # without functionalizing a mutation of the input (which may be a view).
+        output = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)
+        torch_mpi_ext.ops.all_reduce_out_wrapper(
+            output, input_, self.comm_ptr_wrapper
+        )
+        return output
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         from torch_xcpu import ops as xcpu_ops

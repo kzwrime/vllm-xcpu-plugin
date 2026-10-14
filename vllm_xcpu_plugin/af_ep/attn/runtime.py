@@ -16,6 +16,10 @@ class ExpertsClient(Protocol):
     No session, communicator or wire metadata is exposed through this contract.
     """
 
+    def register_layer_capacity(self, sp_size: int) -> None:
+        """Register a routed layer’s actual sequence-parallel partition size."""
+        ...
+
     def initialize(self, hidden_size: int, topk: int, dtype: torch.dtype) -> None:
         """Prepare transport after loading weights and before model execution."""
         ...

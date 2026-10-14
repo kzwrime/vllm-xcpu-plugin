@@ -69,6 +69,7 @@ def _experts(
                 intermediate=4,
                 gemm1=gemm1,
             ),
+            backend_type=gemm1,
             resolved_backend="AccBf16MoeGroupedGemm",
         ),
     )
@@ -207,10 +208,7 @@ def test_unquantized_experts_select_kernel_reduce_from_ep_mode(
     assert "plan" not in captured
     assert "w1_bias" not in captured
     assert "w2_bias" not in captured
-    expected_workspace_shape = (2, 4) if expected_topk_reduce else (0,)
-    assert captured["workspace_unpermute_and_reduce"].shape == (
-        expected_workspace_shape
-    )
+    assert "workspace_unpermute_and_reduce" not in captured
 
 
 def test_prepare_accepts_deferred_quant_and_preserves_tensor_contract(monkeypatch):
@@ -292,3 +290,25 @@ def test_finalize_requires_delegate_and_uses_original_router_weights(
     )
 
     assert captured["router_weights"] is original_weights
+
+
+def test_workspace_allocation_has_no_fp32_reduce_buffer(monkeypatch):
+    from vllm_xcpu_plugin.layers.fused_moe.workspace import FusedMoeWorkspacePlan
+
+    # Record allocation requests, including discarded/empty placeholders.
+    allocations = []
+    real_empty = torch.empty
+
+    def record_empty(*args, **kwargs):
+        result = real_empty(*args, **kwargs)
+        allocations.append(result)
+        return result
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    FusedMoeWorkspacePlan(
+        input_capacity=17, topk=8, local_experts=4,
+        hidden_size=384, intermediate_size=128,
+    ).allocate(torch.device("cpu"), torch.bfloat16)
+    assert allocations
+    assert all(t.dtype != torch.float32 for t in allocations)
+    assert all(t.numel() > 0 for t in allocations)

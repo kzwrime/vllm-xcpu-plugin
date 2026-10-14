@@ -26,6 +26,7 @@ class RoutedExpertsModel(torch.nn.Module):
         ep_rank: int,
         max_num_tokens: int,
         device: torch.device | str = "mcpu",
+        all2all_backend: str = "mpi_alltoallv_v7",
     ) -> None:
         super().__init__()
         model_config = vllm_config.model_config
@@ -48,6 +49,9 @@ class RoutedExpertsModel(torch.nn.Module):
         if max_num_tokens <= 0:
             raise ValueError("max_num_tokens must be positive")
 
+        if all2all_backend not in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
+            raise ValueError(f"unsupported AF-EP backend: {all2all_backend}")
+        self.all2all_backend = all2all_backend
         self.num_layers = config.num_hidden_layers
         self.layer_indices = self._moe_layer_indices(config)
         self.hidden_size = config.hidden_size
@@ -142,7 +146,7 @@ class RoutedExpertsModel(torch.nn.Module):
             ep_rank=self.ep_rank,
             sp_size=1,
             use_ep=True,
-            all2all_backend="mpi_alltoallv_v7",
+            all2all_backend=self.all2all_backend,
             enable_eplb=False,
         )
         expert_map_manager = ExpertMapManager(

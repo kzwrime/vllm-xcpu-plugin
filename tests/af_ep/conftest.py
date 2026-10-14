@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm_xcpu_plugin.af_ep.common.session_v7 import AfV7Session
+from vllm_xcpu_plugin.af_ep.common.session_v8 import AfV8Session
 from vllm_xcpu_plugin.distributed.mpi_world import ClusterType, MpiCluster, MpiWorld
 
 
@@ -15,6 +16,7 @@ def make_af_session(monkeypatch):
     monkeypatch.setenv("VLLM_XCPU_AF_FORWARD_ALLREDUCE", "0")
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch_xcpu.ops, "moe_af_v7_initialize", lambda *args: None)
+    monkeypatch.setattr(torch_xcpu.ops, "moe_af_v8_initialize", lambda *args: None)
 
     def make(
         cluster_type=ClusterType.ATTN,
@@ -22,6 +24,7 @@ def make_af_session(monkeypatch):
         num_attention_ranks=2,
         num_expert_ranks=2,
         role_rank=0,
+        version=7,
     ):
         instance = int(cluster_type)
         attention_ranks = tuple(range(num_attention_ranks))
@@ -42,12 +45,24 @@ def make_af_session(monkeypatch):
                 Get_rank=lambda: role_ranks[role_rank],
                 Get_size=lambda: num_attention_ranks + num_expert_ranks,
                 py2f=lambda: 7,
+                allgather=lambda proposal: (
+                    [proposal or max_rows] * num_attention_ranks
+                    + [0] * num_expert_ranks
+                ),
             ),
             clusters={
                 0: MpiCluster(0, ClusterType.ATTN, attention_ranks),
                 1: MpiCluster(1, ClusterType.MOE, expert_ranks),
             },
         )
-        return AfV7Session(world, max_rows_per_attention_rank=max_rows)
+        session_type = AfV8Session if version == 8 else AfV7Session
+        return session_type(world, max_rows_per_attention_rank=max_rows)
 
     return make
+
+
+@pytest.fixture
+def make_af_session_v8(make_af_session):
+    from functools import partial
+
+    return partial(make_af_session, version=8)

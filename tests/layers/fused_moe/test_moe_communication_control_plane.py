@@ -302,19 +302,24 @@ def test_mpi_v3_sequence_parallel_capacity_uses_local_token_bound():
     )
 
 
-def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
+@pytest.mark.parametrize(
+    "ep,capacity,rows,send_bytes", [(2, 4, 1, 512), (8, 256, 129, 98308)]
+)
+def test_mpi_v6_selects_rma_prepare_and_finalize_ops(
+    monkeypatch, ep, capacity, rows, send_bytes
+):
     import torch_xcpu
 
     prepare_finalize = object.__new__(MpiAlltoallvPrepareAndFinalizeV6)
-    prepare_finalize.max_num_tokens = 4
-    prepare_finalize.max_moe_tokens_per_rank = 4
-    prepare_finalize.num_experts = 4
+    prepare_finalize.max_num_tokens = capacity
+    prepare_finalize.max_moe_tokens_per_rank = capacity
+    prepare_finalize.num_experts = ep * 2
     prepare_finalize.num_local_experts = 2
-    prepare_finalize.num_dispatchers_ = 2
+    prepare_finalize.num_dispatchers_ = ep
     prepare_finalize.rank_expert_offset = 0
-    prepare_finalize.ep_size = 2
+    prepare_finalize.ep_size = ep
     prepare_finalize._comm_metadata = torch.tensor(
-        [2, 0, 0, 1, 0, 1], dtype=torch.int64
+        [ep, 0, 0, 1, 0, 1], dtype=torch.int64
     )
     prepare_finalize.comm_ptr_wrapper = torch.zeros(1, dtype=torch.int64)
     prepare_finalize._return_row_indices = None
@@ -339,19 +344,19 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
 
     with pytest.raises(ValueError, match="topk=6 or topk=8"):
         prepare_finalize.prepare(
-            a1=torch.zeros((1, 4), dtype=torch.bfloat16),
+            a1=torch.zeros((rows, 4), dtype=torch.bfloat16),
             topk_weights=torch.ones((1, 7), dtype=torch.float32),
             topk_ids=torch.zeros((1, 7), dtype=torch.int32),
-            num_experts=4,
+            num_experts=ep * 2,
             expert_map=None,
             apply_router_weight_on_input=False,
         )
 
     prepare_result = prepare_finalize.prepare(
-        a1=torch.zeros((1, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 6), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
-        num_experts=4,
+        a1=torch.zeros((rows, 4), dtype=torch.bfloat16),
+        topk_weights=torch.ones((rows, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((rows, 6), dtype=torch.int32),
+        num_experts=ep * 2,
         expert_map=None,
         apply_router_weight_on_input=False,
     )
@@ -360,40 +365,43 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
     assert expert_tokens_meta.expert_num_tokens_cpu is None
     assert expert_tokens_meta.num_input_rows_valid is calls[0][1][4]
     prepare_finalize.finalize(
-        output=torch.empty((1, 4), dtype=torch.bfloat16),
-        fused_expert_output=torch.empty((8, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 6), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
+        output=torch.empty((rows, 4), dtype=torch.bfloat16),
+        fused_expert_output=torch.empty((ep * capacity, 4), dtype=torch.bfloat16),
+        topk_weights=torch.ones((rows, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((rows, 6), dtype=torch.int32),
         apply_router_weight_on_input=False,
         weight_and_reduce_impl=TopKWeightAndReduceNoOP(),
     )
 
     assert [name for name, _ in calls] == ["prepare", "finalize"]
     prepare_args = calls[0][1]
+    from torch_xcpu.ops_defs import moe_prepare
+    monkeypatch.setattr(moe_prepare, "_ENABLE_CHECKS", True)
+    moe_prepare.moe_prepare_fused_v6_check(*prepare_args)
     return_row_indices = prepare_args[0]
-    assert return_row_indices.shape == (1, 6)
+    assert return_row_indices.shape == (rows, 6)
     assert return_row_indices.dtype == torch.int32
-    assert prepare_args[1].shape == (2 * 4, 4)
+    assert prepare_args[1].shape == (ep * capacity, 4)
     assert prepare_args[1].dtype == torch.bfloat16
-    assert prepare_args[2].shape == (2 * 4, 6)
+    assert prepare_args[2].shape == (ep * capacity, 6)
     assert prepare_args[2].dtype == torch.int32
-    assert prepare_args[3].shape == (2 * 4, 6)
+    assert prepare_args[3].shape == (ep * capacity, 6)
     assert prepare_args[3].dtype == torch.float32
     assert prepare_args[4].shape == (1,)
-    assert prepare_args[5].shape == (2,)
-    assert prepare_args[6].shape == (2,)
-    assert prepare_args[7].shape == (2,)
+    assert prepare_args[5].shape == (ep,)
+    assert prepare_args[6].shape == (ep,)
+    assert prepare_args[7].shape == (ep,)
 
     dispatch_send_buffer = prepare_args[8]
     assert dispatch_send_buffer.dtype == torch.uint8
     # record_bytes = 2 int32 + 6 * (int32 + float32) + 4 * bf16 = 64.
-    assert dispatch_send_buffer.numel() == 2 * 4 * 64
+    assert dispatch_send_buffer.numel() == send_bytes
 
     finalize_args = calls[1][1]
     assert finalize_args[2] is return_row_indices
     assert finalize_args[3] is prepare_args[5]
     assert finalize_args[4] is prepare_args[6]
-    assert finalize_args[7].shape == (1, 4)
+    assert finalize_args[7].shape == (rows, 4)
     assert finalize_args[7].dtype == torch.float32
     assert finalize_args[-1] == prepare_finalize.max_moe_tokens_per_rank
     assert prepare_finalize._return_row_indices is None
@@ -408,19 +416,24 @@ def test_mpi_v6_selects_rma_prepare_and_finalize_ops(monkeypatch):
     assert "mpi_alltoallv_v6" in MPI_ALLTOALLV_BACKENDS
 
 
-def test_mpi_v5_selects_dense_prepare_and_finalize_ops(monkeypatch):
+@pytest.mark.parametrize(
+    "ep,capacity,rows,send_bytes", [(2, 4, 1, 512), (8, 256, 129, 98304)]
+)
+def test_mpi_v5_selects_dense_prepare_and_finalize_ops(
+    monkeypatch, ep, capacity, rows, send_bytes
+):
     import torch_xcpu
 
     prepare_finalize = object.__new__(MpiAlltoallvPrepareAndFinalizeV5)
-    prepare_finalize.max_num_tokens = 4
-    prepare_finalize.max_moe_tokens_per_rank = 4
-    prepare_finalize.num_experts = 4
+    prepare_finalize.max_num_tokens = capacity
+    prepare_finalize.max_moe_tokens_per_rank = capacity
+    prepare_finalize.num_experts = ep * 2
     prepare_finalize.num_local_experts = 2
-    prepare_finalize.num_dispatchers_ = 2
+    prepare_finalize.num_dispatchers_ = ep
     prepare_finalize.rank_expert_offset = 0
-    prepare_finalize.ep_size = 2
+    prepare_finalize.ep_size = ep
     prepare_finalize._comm_metadata = torch.tensor(
-        [2, 0, 0, 1, 0, 1], dtype=torch.int64
+        [ep, 0, 0, 1, 0, 1], dtype=torch.int64
     )
     prepare_finalize.comm_ptr_wrapper = torch.zeros(1, dtype=torch.int64)
     prepare_finalize._return_row_indices = None
@@ -445,19 +458,19 @@ def test_mpi_v5_selects_dense_prepare_and_finalize_ops(monkeypatch):
 
     with pytest.raises(ValueError, match="topk=6 or topk=8"):
         prepare_finalize.prepare(
-            a1=torch.zeros((1, 4), dtype=torch.bfloat16),
+            a1=torch.zeros((rows, 4), dtype=torch.bfloat16),
             topk_weights=torch.ones((1, 7), dtype=torch.float32),
             topk_ids=torch.zeros((1, 7), dtype=torch.int32),
-            num_experts=4,
+            num_experts=ep * 2,
             expert_map=None,
             apply_router_weight_on_input=False,
         )
 
     prepare_result = prepare_finalize.prepare(
-        a1=torch.zeros((1, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 6), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
-        num_experts=4,
+        a1=torch.zeros((rows, 4), dtype=torch.bfloat16),
+        topk_weights=torch.ones((rows, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((rows, 6), dtype=torch.int32),
+        num_experts=ep * 2,
         expert_map=None,
         apply_router_weight_on_input=False,
     )
@@ -466,41 +479,44 @@ def test_mpi_v5_selects_dense_prepare_and_finalize_ops(monkeypatch):
     assert expert_tokens_meta.expert_num_tokens_cpu is None
     assert expert_tokens_meta.num_input_rows_valid is calls[0][1][4]
     prepare_finalize.finalize(
-        output=torch.empty((1, 4), dtype=torch.bfloat16),
-        fused_expert_output=torch.empty((8, 4), dtype=torch.bfloat16),
-        topk_weights=torch.ones((1, 6), dtype=torch.float32),
-        topk_ids=torch.zeros((1, 6), dtype=torch.int32),
+        output=torch.empty((rows, 4), dtype=torch.bfloat16),
+        fused_expert_output=torch.empty((ep * capacity, 4), dtype=torch.bfloat16),
+        topk_weights=torch.ones((rows, 6), dtype=torch.float32),
+        topk_ids=torch.zeros((rows, 6), dtype=torch.int32),
         apply_router_weight_on_input=False,
         weight_and_reduce_impl=TopKWeightAndReduceNoOP(),
     )
 
     assert [name for name, _ in calls] == ["prepare", "finalize"]
     prepare_args = calls[0][1]
+    from torch_xcpu.ops_defs import moe_prepare
+    monkeypatch.setattr(moe_prepare, "_ENABLE_CHECKS", True)
+    moe_prepare.moe_prepare_fused_v5_check(*prepare_args)
     return_row_indices = prepare_args[0]
-    assert return_row_indices.shape == (1, 6)
+    assert return_row_indices.shape == (rows, 6)
     assert return_row_indices.dtype == torch.int32
-    assert prepare_args[1].shape == (2 * 4, 4)
+    assert prepare_args[1].shape == (ep * capacity, 4)
     assert prepare_args[1].dtype == torch.bfloat16
-    assert prepare_args[2].shape == (2 * 4, 6)
+    assert prepare_args[2].shape == (ep * capacity, 6)
     assert prepare_args[2].dtype == torch.int32
-    assert prepare_args[3].shape == (2 * 4, 6)
+    assert prepare_args[3].shape == (ep * capacity, 6)
     assert prepare_args[3].dtype == torch.float32
     assert prepare_args[4].shape == (1,)
-    assert prepare_args[5].shape == (2,)
-    assert prepare_args[6].shape == (2,)
-    assert prepare_args[7].shape == (2,)
+    assert prepare_args[5].shape == (ep,)
+    assert prepare_args[6].shape == (ep,)
+    assert prepare_args[7].shape == (ep,)
 
     dispatch_send_buffer = prepare_args[8]
     assert dispatch_send_buffer.dtype == torch.uint8
     # record_bytes = 2 int32 + 6 * (int32 + float32) + 4 * bf16 = 64.
-    assert dispatch_send_buffer.numel() == 2 * 4 * 64
+    assert dispatch_send_buffer.numel() == send_bytes
 
     finalize_args = calls[1][1]
     assert finalize_args[2] is return_row_indices
     assert finalize_args[3] is prepare_args[5]
     assert finalize_args[4] is prepare_args[6]
     assert finalize_args[5] is prepare_args[7]
-    assert finalize_args[8].shape == (1, 4)
+    assert finalize_args[8].shape == (rows, 4)
     assert finalize_args[8].dtype == torch.float32
     assert finalize_args[-1] == prepare_finalize.max_moe_tokens_per_rank
     assert prepare_finalize._return_row_indices is None

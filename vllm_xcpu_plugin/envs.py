@@ -31,6 +31,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
+    # Complete post-routing V5/V6 EP operation; set 0 for the legacy MK path.
+    "VLLM_XCPU_ENABLE_FUSED_EP_MOE": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ENABLE_FUSED_EP_MOE", "1"))
+    ),
+    # V5/V6 fused EP quota per source/destination pair, in post-SP token rows.
+    # Zero disables chunking. This is independent of the V4 total receive cap.
+    "VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK": lambda: int(
+        os.getenv("VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK", "1024")
+    ),
     # Enable XCPU AF-EP. Topology is derived from vLLM and the MPMD MPI world.
     "VLLM_XCPU_ENABLE_AF_EP": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0"))

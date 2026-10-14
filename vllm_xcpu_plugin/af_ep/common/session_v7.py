@@ -65,7 +65,20 @@ class AfV7Session:
         self._global_world_comm = mpi_world.global_world_comm
         self._forward_allreduce = envs_xcpu.VLLM_XCPU_AF_FORWARD_ALLREDUCE
         self.max_rows_per_attention_rank = max_rows_per_attention_rank
+        self._scheduler_capacity = max_rows_per_attention_rank
+        self._layer_capacity = 0
         self._model_shape: tuple[int, int, torch.dtype] | None = None
+
+    def register_layer_capacity(self, sp_size: int) -> None:
+        """A registers actual per-layer SP, before collective initialization."""
+        if self.cluster_type != ClusterType.ATTN or self._model_shape is not None:
+            raise RuntimeError(
+                "AF layer capacity must be registered on A before initialize"
+            )
+        if sp_size < 1:
+            raise ValueError("AF SP size must be positive")
+        rows = (self._scheduler_capacity + sp_size - 1) // sp_size
+        self._layer_capacity = max(self._layer_capacity, rows)
 
     @property
     def expert_capacity(self) -> int:
@@ -132,6 +145,21 @@ class AfV7Session:
         # Loading/weight conversion may have queued device work. Complete it
         # before entering MPI on this host thread.
         torch.accelerator.synchronize()
+        # F has no SP execution: A reports its post-SP capacity. Use the
+        # largest A/layer requirement for fixed-slot transport, never divide on F.
+        proposal = (
+            self._layer_capacity or self._scheduler_capacity
+            if self.cluster_type == ClusterType.ATTN
+            else 0
+        )
+        capacities = self._global_world_comm.allgather(proposal)
+        if (
+            len(capacities) != self.num_attention_ranks + self.num_expert_ranks
+            or any(n <= 0 for n in capacities[: self.num_attention_ranks])
+            or any(n != 0 for n in capacities[self.num_attention_ranks :])
+        ):
+            raise ValueError("AF capacity negotiation has invalid role proposals")
+        self.max_rows_per_attention_rank = max(capacities)
         xcpu_ops.moe_af_v7_initialize(
             self.max_rows_per_attention_rank,
             hidden_size,
@@ -143,7 +171,8 @@ class AfV7Session:
         self._model_shape = model_shape
         print(
             f"AF-EP V7 transport ready: role={self.cluster_type.name} "
-            f"rank={self.role_rank} hidden_size={hidden_size} topk={topk}",
+            f"rank={self.role_rank} hidden_size={hidden_size} topk={topk} "
+            f"max_rows_per_attention_rank={self.max_rows_per_attention_rank}",
             flush=True,
         )
 

@@ -19,53 +19,64 @@ class FakeModel:
     ep_rank = 0
     device = torch.device("cpu")
     dtype = torch.bfloat16
-    routed_experts = {str(i): SimpleNamespace(expert_map=None) for i in layer_indices}
+
+    def __init__(self):
+        from torch_xcpu.ops_defs.moe_grouped_gemm import PortableBf16MoeGroupedGemm
+
+        expert_map = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1], dtype=torch.int32)
+        self.routed_experts = {
+            str(i): SimpleNamespace(expert_map=expert_map) for i in self.layer_indices
+        }
+        self.backends = {}
+        for i in self.layer_indices:
+
+            def params(shape, value=i):
+                return SimpleNamespace(
+                    packed_weight=torch.full(shape, value, dtype=self.dtype),
+                    packed_weight_scale=None,
+                    bias=None,
+                    scale_block_size=None,
+                )
+
+            self.backends[i] = SimpleNamespace(
+                backend_type=PortableBf16MoeGroupedGemm,
+                params=SimpleNamespace(
+                    hidden=16,
+                    intermediate=8,
+                    experts=4,
+                    gemm1=SimpleNamespace(params=params((4, 16, 16))),
+                    gemm2=SimpleNamespace(params=params((4, 16, 8))),
+                ),
+            )
 
     def fused_moe_for_layer(self, layer_idx):
-        return layer_idx
+        return self.backends[layer_idx]
 
 
-def test_expert_service_returns_computed_rows_for_each_moe_layer(
+def test_expert_service_reuses_workspace_and_binds_each_layer(
     monkeypatch, make_af_session
 ):
-    import torch_xcpu
-
-    sent = []
-
-    def receive(hidden, ids, weights, valid, elements, offsets, layer_idx, *args):
-        hidden.fill_(float("nan"))
-        hidden[:layer_idx].fill_(layer_idx)
-        ids.zero_()
-        weights.fill_(1)
-        valid.fill_(layer_idx)
-        elements.copy_(torch.tensor([layer_idx * 16, 0]))
-        offsets.copy_(torch.tensor([0, layer_idx * 16]))
-
-    def compute(**kw):
-        rows = int(kw["num_input_rows_valid"].item())
-        kw["output"][:rows] = (
-            kw["hidden_states"][:rows]
-            * kw["topk_weights"][:rows].sum(dim=1, keepdim=True)
-            * kw["backend"]
-        )
-
-    def send(output, elements, offsets, metadata, comm, capacity, topk, layer_idx):
-        rows = int(elements.sum().item()) // 16
-        sent.append((layer_idx, output[:rows].clone()))
-
-    monkeypatch.setattr(torch_xcpu.ops, "moe_af_dispatch_recv_v7", receive)
-    monkeypatch.setattr(torch_xcpu.ops, "fused_moe_compute", compute)
-    monkeypatch.setattr(torch_xcpu.ops, "moe_af_combine_send_v7", send)
     service = ExpertServiceV7(FakeModel(), make_af_session(ClusterType.MOE, max_rows=4))
     service.initialize()
+    workspace = service._workspace
+    calls = []
 
+    def execute(*args):
+        calls.append(args)
+        args[-1].fill_(args[13])
+
+    service._op = execute
     service.execute_model_pass()
-
-    assert [layer for layer, _ in sent] == [1, 3]
-    torch.testing.assert_close(sent[0][1], torch.full((1, 16), 6, dtype=torch.bfloat16))
-    torch.testing.assert_close(
-        sent[1][1], torch.full((3, 16), 54, dtype=torch.bfloat16)
-    )
+    service.execute_model_pass()
+    assert [args[13] for args in calls] == [1, 3, 1, 3]
+    assert all(args[-1] is workspace for args in calls)
+    for args in calls:
+        assert (
+            args[0]
+            is service.model.backends[args[13]].params.gemm1.params.packed_weight
+        )
+        assert args[10:13] == (4, 6, 2)
+    assert workspace.eq(3).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -104,14 +115,6 @@ def test_expert_transaction_reuses_graph_across_many_layer_indices(
     monkeypatch, make_af_session
 ):
     """An int schema used to specialize every layer and hit the 8-graph limit."""
-    from torch_xcpu.ops_defs import moe_af_v7
-
-    monkeypatch.setattr(moe_af_v7, "_ENABLE_CHECKS", True)
-
-    def compute(self, layer, ops):
-        self._buffers.output.copy_(self._buffers.hidden_states)
-
-    monkeypatch.setattr(ExpertServiceV7, "_compute", compute)
     service = ExpertServiceV7(FakeModel(), make_af_session(ClusterType.MOE, max_rows=4))
     service.initialize()
     graphs = []
@@ -131,5 +134,13 @@ def test_expert_transaction_reuses_graph_across_many_layer_indices(
         targets = [
             node.target for node in graph.graph.nodes if node.op == "call_function"
         ]
-        assert torch.ops.torch_xcpu.moe_af_dispatch_recv_v7_bf16 in targets
-        assert torch.ops.torch_xcpu.moe_af_combine_send_v7_bf16 in targets
+        graph.graph.eliminate_dead_code()
+        assert (
+            torch.ops.torch_xcpu.fused_af_f_moe_v7_PortableBf16MoeGroupedGemm.default
+            in targets
+        )
+        assert any(
+            node.target
+            == torch.ops.torch_xcpu.fused_af_f_moe_v7_PortableBf16MoeGroupedGemm.default
+            for node in graph.graph.nodes
+        )
