@@ -95,6 +95,10 @@ def _operator(
 # field from Git topology or replace it with a package-wide version: XCPU vLLM
 # branches are assembled by cherry-pick and manual porting, and are not linear.
 UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
+    # Guard the Python interfaces as well as the Triton kernels: XCPU bypasses
+    # unified_attention and forwards constructor arguments to the upstream base.
+    # Audited v0.31 defaults: decoder, unquantized KV and ordinary sliding window;
+    # pinning the full wrapper does not claim support for its optional features.
     _operator(
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
@@ -386,15 +390,6 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
     _operator(
         "sample",
         "vllm.v1.worker.gpu.sample.gumbel",
-        "tl_rand64",
-        "6f240deb8a7d67d9250ffd35d62beef6300a7745091e02d715376655ee039cc7",
-        "6223b23734cfe8824387f0f645e1001e708358f46915882633790b0c97e1c6d7",
-        "torch_xcpu.ops.gumbel_sample",
-        source_version="v0.24.0",
-    ),
-    _operator(
-        "sample",
-        "vllm.v1.worker.gpu.sample.gumbel",
         "tl_rand32",
         "1e313fec8ffef8569eba06cc0d59361c57af4169069d59c022c427dc594733a6",
         "6223b23734cfe8824387f0f645e1001e708358f46915882633790b0c97e1c6d7",
@@ -405,28 +400,36 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "sample",
         "vllm.v1.worker.gpu.sample.gumbel",
         "gumbel_noised_argmax",
-        "09351d344f146de891069f9dc94c1276dc065000c52fe410c71f998f22de5c57",
+        "e59dd555ff5fbff70ad0ffe15df709364f7b47715d99958e11892b7f1ab326d8",
         "629ea9a6ef230122b37ca719a0d28743bfcb263e22aab0feadf05af08f1c30b6",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="fe755c88995 (#54282), XCPU port 2026-09-30",
+        source_version=(
+            "v0.31 XCPU RNG; local=dd24619b0d47831e; upstream=18553c5c9ff02acb"
+        ),
     ),
     _operator(
         "sample",
         "vllm.v1.worker.gpu.sample.gumbel",
         "gumbel_block_argmax",
-        "3c42bbeb0d5cadc679cecbd82aaae05fd670805441d2a7d859620f227d39b986",
-        "45f94aac7b0f8725a81d1edc75a28bd6398403192290fbf59318789a73073622",
+        "84cb0d04c7c15e3065ca112dc9a757268b093a63c4a5e32b5a53f14ff533fd4d",
+        "6b3bee3b297aa826a02b3c994713dcfd70ab3a48eaa1a49dad5bd218125b71b2",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="fe755c88995 (#54282), XCPU port 2026-09-30",
+        source_version=(
+            "v0.31 separate cache source supported; "
+            "upstream=0f8b398158f01fb3"
+        ),
     ),
     _operator(
         "sample",
         "vllm.v1.worker.gpu.sample.gumbel",
         "_gumbel_sample_kernel",
-        "7d1063f35e94ed916381e82b0e32285d4f4f2bf6341b9d3a87beeb5f272a319f",
-        "af34d62cdbe5fc51c0840be4d00a2fb3c0651f3bd64b4f02b9b03ad9dd1f74ed",
+        "6b671b965ff7dec1feeba9b385c4b31120216c0bdeee33b19ad1e5634554d90e",
+        "71178816cc67bbb0cb907fb78b21a22c09f47157e10df2cbd73da766c735f28f",
         "torch_xcpu.ops.gumbel_sample",
-        source_version="fe755c88995 (#54282), XCPU port 2026-09-30",
+        source_version=(
+            "v0.31 separate cache source supported; "
+            "upstream=0f8b398158f01fb3"
+        ),
     ),
     _operator(
         "topk_topp",
@@ -441,10 +444,13 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "topk_topp",
         "vllm.v1.sample.ops.topk_topp_triton",
         "_topk_topp_kernel",
-        "4d4f1dbd297ca5b4b883989c427d45a65f79594bf8c7179151fce1dc27243126",
-        "cf11f86d0b32b1dcc2b5cb4cb7e5d4ee0623496751af6731e961e402abf9718c",
+        "45cd33684859d7bba5a631131e1927096f5ddf0b2ac6c380b26e4244afd92e53",
+        "e1708c1127650d697d217701d4853c8046545944e45160efeba1cc53c9316ac0",
         "torch_xcpu.ops.apply_top_k_top_p",
-        source_version="v0.24.0",
+        source_version=(
+            "v0.31 XCPU full filter; local=dd24619b0d47831e; "
+            "upstream=bf95f58d10891293,aed894c190aa3db7,1ee7f78e806b5e9b"
+        ),
     ),
     _operator(
         "grouped_topk",

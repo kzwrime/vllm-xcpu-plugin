@@ -23,6 +23,7 @@ def _xcpu_gumbel_sample(
     logits_cache: torch.Tensor | None = None,
     logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
+    logits_cache_source: torch.Tensor | None = None,
 ) -> torch.Tensor:
     import torch_xcpu
 
@@ -42,6 +43,7 @@ def _xcpu_gumbel_sample(
         logits_cache_col=logits_cache_col,
         use_fp64=use_fp64,
         is_drafting=is_drafting,
+        logits_cache_source=logits_cache_source,
     )
 
 
@@ -110,6 +112,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
         logits_cache: torch.Tensor | None = None,
         logits_cache_col: torch.Tensor | None = None,
         use_fp64: bool = False,
+        logits_cache_source: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if _is_xcpu_device(logits):
             return _xcpu_gumbel_sample(
@@ -123,6 +126,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
                 logits_cache,
                 logits_cache_col,
                 use_fp64,
+                logits_cache_source,
             )
 
         return original_gumbel_sample(
@@ -136,6 +140,7 @@ def maybe_patch_vllm_gumbel_sample() -> None:
             logits_cache,
             logits_cache_col,
             use_fp64,
+            logits_cache_source=logits_cache_source,
         )
 
     gumbel_module.gumbel_sample = _patched_gumbel_sample
