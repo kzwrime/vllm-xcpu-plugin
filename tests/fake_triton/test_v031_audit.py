@@ -257,6 +257,107 @@ torch.testing.assert_close(logits.cpu(), expected, rtol=0, atol=0)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_v031_gdn_cache_layouts_and_state_migration():
+    """Clear only page payloads; migrate SD/DS conv and padded SSM states."""
+    repo = Path(__file__).parents[2]
+    code = """
+import torch
+import torch_xcpu
+from vllm.v1.worker.utils import _zero_kv_blocks_kernel
+from vllm.v1.worker.mamba_utils import (
+    precopy_mamba_align_fused_kernel, postprocess_mamba_fused_kernel,
+)
+from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+register_vllm_kernels()
+def t(values, dtype=torch.int32):
+    return torch.tensor(values, dtype=dtype, device="mcpu")
+
+segments = [torch.full((4 * stride + 4,), 99, dtype=torch.int32, device="mcpu")
+            for stride in (13, 21)]
+_zero_kv_blocks_kernel[(2, 2, 3)](
+    t([s.data_ptr() + 8 for s in segments], torch.uint64),
+    t([13, 21], torch.int64), t([5, 17], torch.int64), t([1, 3], torch.int64),
+    BLOCK_SIZE=8,
+)
+for s, stride, size in zip(segments, (13, 21), (5, 17)):
+    expected = torch.full(s.shape, 99, dtype=torch.int32, device="cpu")
+    for block in (1, 3):
+        expected[2 + block * stride:2 + block * stride + size] = 0
+    torch.testing.assert_close(s.cpu(), expected)
+
+for ds in (False, True):
+ for mapped in (False, True):
+  for tiles in (1, 16):
+    conv_storage = torch.arange(5 * 23, dtype=torch.float32, device="mcpu")
+    conv = conv_storage.as_strided((5, 3, 5) if ds else (5, 5, 3),
+                                  (23, 7, 1) if ds else (23, 3, 1))
+    ssm_storage = torch.arange(5 * 11, dtype=torch.float32, device="mcpu")
+    ssm = ssm_storage.as_strided((5, 7), (11, 1))
+    conv_before, ssm_before = conv_storage.cpu(), ssm_storage.cpu()
+    table = t([[1, 2, 3, 4]])
+    layout = (
+        t([table.data_ptr()], torch.int64), 4,
+        t([conv.data_ptr(), ssm.data_ptr()], torch.int64),
+        t([23 * 4, 11 * 4], torch.int64), t([4, 4]),
+        t([3, 7], torch.int64), t([5, 0]), t([0, 0]),
+        t([3 if ds else 0, 0]), t([28 if ds else 0, 0], torch.int64),
+    )
+    state_idx = t([1, 1, 1] if mapped else [1])
+    src = t([0, 0, 0] if mapped else [0])
+    bias = t([2, 2, 2] if mapped else [2])
+    mapping = t([2]) if mapped else None
+    precopy_mamba_align_fused_kernel[(1, 2, tiles)](
+        state_idx, src, bias, *layout, mapping, 1,
+        COPY_BLOCK_SIZE=1024, CONV_STATE_DIM_FIRST=ds,
+        HAS_IDX_MAPPING=mapped, TEMPORAL_TILES=tiles,
+    )
+    expected = conv_before.clone()
+    expected_view = expected.as_strided(conv.shape, conv.stride())
+    source = conv_before.as_strided(conv.shape, conv.stride())[1]
+    if ds:
+        expected_view[2, :, :3] = source[:, 2:]
+    else:
+        expected_view[2, :3] = source[2:]
+    torch.testing.assert_close(conv_storage.cpu(), expected)
+    expected_ssm = ssm_before.clone()
+    expected_ssm[22:29] = ssm_before[33:40]
+    torch.testing.assert_close(ssm_storage.cpu(), expected_ssm)
+
+    # Postprocess performs a same-block left shift at an accepted boundary.
+    conv_storage.copy_(conv_before.to("mcpu"))
+    ssm_storage.copy_(ssm_before.to("mcpu"))
+    accepted = t([3])
+    postprocess_mamba_fused_kernel[(1, 2, tiles)](
+        accepted, t([0]), None, t([4]), None, *layout, t([99]), t([0]), 1,
+        block_size=4, COPY_BLOCK_SIZE=1024, CONV_STATE_DIM_FIRST=ds,
+        HAS_IDX_MAPPING=True, PRECOMPUTED_NEW_COMPUTED=True, TEMPORAL_TILES=tiles,
+    )
+    expected = conv_before.clone()
+    expected_view = expected.as_strided(conv.shape, conv.stride())
+    if ds:
+        expected_view[1, :, :3] = source[:, 2:]
+    else:
+        expected_view[1, :3] = source[2:]
+    torch.testing.assert_close(conv_storage.cpu(), expected)
+    expected_ssm = ssm_before.clone()
+    expected_ssm[11:18] = ssm_before[33:40]
+    torch.testing.assert_close(ssm_storage.cpu(), expected_ssm)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo,
+        timeout=120,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(repo),
+            "VLLM_PLUGINS": "xcpu_platform_plugin",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("omp_threads", [1, 2, 4])
 def test_v031_logit_bias_restore_and_strides(omp_threads):
     """Match bias/masking order, per-request restore and expanded decode rows."""

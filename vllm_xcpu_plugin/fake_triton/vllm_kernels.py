@@ -702,11 +702,28 @@ def _preprocess_mamba_align(launch: KernelLaunch) -> None:
 def _precopy_mamba_align(launch: KernelLaunch) -> None:
     args = launch.arguments
     total_states = args["state_base_addrs_ptr"].numel()
-    _expect_grid(launch, (args["num_reqs"], total_states))
+    tiles = args["TEMPORAL_TILES"]
+    _expect(tiles > 0, "TEMPORAL_TILES must be positive")
+    expected = (args["num_reqs"], total_states)
+    _expect(
+        launch.grid == (*expected, tiles) or (tiles == 1 and launch.grid == expected),
+        "mamba copy grid must match requests, states and temporal tiles",
+    )
+    # The native implementation copies each full state once, using memmove;
+    # GPU temporal tiling does not change the source/destination semantics.
     _expect(
         args["COPY_BLOCK_SIZE"] == 1024,
         "mamba align precopy COPY_BLOCK_SIZE must be 1024",
     )
+    mapping = args["idx_mapping_ptr"]
+    if not args["HAS_IDX_MAPPING"]:
+        mapping = torch.arange(
+            args["num_reqs"],
+            dtype=torch.int32,
+            device=args["mamba_state_idx_ptr"].device,
+        )
+    else:
+        _expect(mapping is not None, "mapped precopy requires idx_mapping")
     torch.ops.mcpu.vllm_precopy_mamba_align(
         args["mamba_state_idx_ptr"],
         args["src_col_ptr"],
@@ -721,7 +738,7 @@ def _precopy_mamba_align(launch: KernelLaunch) -> None:
         args["state_group_indices_ptr"],
         args["state_dim_row_count_ptr"],
         args["state_dim_row_stride_ptr"],
-        args["idx_mapping_ptr"],
+        mapping,
         args["num_reqs"],
         total_states,
         args["CONV_STATE_DIM_FIRST"],
@@ -731,7 +748,15 @@ def _precopy_mamba_align(launch: KernelLaunch) -> None:
 def _postprocess_mamba(launch: KernelLaunch) -> None:
     args = launch.arguments
     total_states = args["state_base_addrs_ptr"].numel()
-    _expect_grid(launch, (args["num_reqs"], total_states))
+    tiles = args["TEMPORAL_TILES"]
+    _expect(tiles > 0, "TEMPORAL_TILES must be positive")
+    expected = (args["num_reqs"], total_states)
+    _expect(
+        launch.grid == (*expected, tiles) or (tiles == 1 and launch.grid == expected),
+        "mamba copy grid must match requests, states and temporal tiles",
+    )
+    # The native implementation copies each full state once, using memmove;
+    # GPU temporal tiling does not change the source/destination semantics.
     _expect(
         args["COPY_BLOCK_SIZE"] == 1024,
         "mamba postprocess COPY_BLOCK_SIZE must be 1024",
@@ -1668,20 +1693,26 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.mamba_utils",
         "precopy_mamba_align_fused_kernel",
-        "9bbbde89056d4fba815268a71d038650bc840e2dafd9944c3fd9b619876efd2e",
-        "7e3b13b611b2c064d90bc22719d3ec5384dc9a93eba374f7885195bd73b1e35a",
-        LegacyKernelSource("v0.25.1"),
+        "b5d65532e0de4b442c82469824fbf72a584ba007ecd1b5058e9f5c449f9efe83",
+        "4c561e95662618d05d0bb893edfac68163fa86361c45b138b1f9b3641d290a2c",
+        KernelSource(
+            tag="v0.31 Qwen3.5 cache semantics",
+            local_commit="630fdc2cf5a9c06095504b7a052e0d650bba458c",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _precopy_mamba_align,
         (),
     ),
     (
         "vllm.v1.worker.mamba_utils",
         "postprocess_mamba_fused_kernel",
-        "4ea8ff600d9b0df472320d75c0f7b3a63f12a41991f6478173fb6ac0b45ec2c3",
-        "34919a7a6f15f7639eb0ee59abebf561f2c48b1243eee651aa03adeafd7ec97b",
-        # Audited vLLM snapshot and upstream #50432; full provenance is in
-        # docs/TRITON_AUDIT_MAMBA_ALIGN_20261005.md.
-        LegacyKernelSource("v0.25.1; local=377c203f180c; upstream=c2881ce60302"),
+        "ffc082c74d244e3941568db0af664b03e6b468d791841e19ec8276ef433da4fe",
+        "fdfe2906c52c35efdb3835567e352c9d975c5b3fbc30dd390478ca5c81d3938c",
+        KernelSource(
+            tag="v0.31 Qwen3.5 cache semantics",
+            local_commit="630fdc2cf5a9c06095504b7a052e0d650bba458c",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _postprocess_mamba,
         (),
     ),

@@ -43,6 +43,7 @@ print(json.dumps({
     result = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
+        cwd=repo,
         capture_output=True,
         text=True,
         env=env,
@@ -74,7 +75,7 @@ states = [(torch.arange(20, dtype=torch.float32).reshape(5, 4) + i * 100)
 before = [state.cpu().clone() for state in states]
 accepted = tensor([77, 88, 3])
 ctx = SimpleNamespace(
-    is_initialized=True, num_layers=3, num_state_types=1, block_size=4,
+    is_initialized=True, num_states=3, block_size=4,
     num_accepted_tokens_out=tensor([0, 0, 0]),
     block_table_ptrs=tensor([block_table.data_ptr()], torch.int64),
     block_table_stride_req=4,
@@ -104,6 +105,7 @@ print("all layer states and acceptance snapshot are correct")
     result = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
+        cwd=repo,
         capture_output=True,
         text=True,
         env=env,
@@ -176,6 +178,7 @@ print(json.dumps({
     result = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
+        cwd=repo,
         capture_output=True,
         text=True,
         env=env,
@@ -237,9 +240,9 @@ print(json.dumps({'passed': True}))
     result = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
+        cwd=repo,
         capture_output=True,
         text=True,
         env=env,
-        cwd=repo,
     )
     assert json.loads(result.stdout.strip().splitlines()[-1]) == {"passed": True}
