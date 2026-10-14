@@ -19,19 +19,6 @@ logger = init_logger(__name__)
 _GDN_ATTENTION_PATCHED = False
 
 
-def _xcpu_fused_gdn_gating(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import torch_xcpu
-
-    return torch_xcpu.ops.fused_gdn_gating(A_log, a, b, dt_bias, beta, threshold)
-
-
 def _xcpu_causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -91,6 +78,7 @@ def _xcpu_causal_conv1d_update(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
+    out: torch.Tensor | None = None,
     **kwargs: object,
 ) -> torch.Tensor:
     import torch_xcpu
@@ -111,6 +99,7 @@ def _xcpu_causal_conv1d_update(
         block_idx_last_scheduled_token=block_idx_last_scheduled_token,
         initial_state_idx=initial_state_idx,
         validate_data=validate_data,
+        out=out,
     )
 
 
@@ -242,7 +231,6 @@ def maybe_patch_gdn_attention() -> None:
     maybe_patch_gdn_metadata()
 
     _ = (
-        gdn.fused_gdn_gating,
         gdn.fused_post_conv_prep,
         gdn.fused_sigmoid_gating_delta_rule_update,
         gdn.fused_recurrent_gated_delta_rule_packed_decode,
@@ -251,7 +239,6 @@ def maybe_patch_gdn_attention() -> None:
     )
 
     gdn_any = cast(Any, gdn)
-    gdn_any.fused_gdn_gating = _xcpu_fused_gdn_gating
     gdn_any.fused_post_conv_prep = _xcpu_fused_post_conv_prep
     gdn_any.fused_sigmoid_gating_delta_rule_update = (
         _xcpu_fused_sigmoid_gating_delta_rule_update

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
 
 import torch
@@ -15,6 +16,13 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 _ORIGINAL_GDN_METADATA_BUILD: Callable[..., GDNAttentionMetadata] | None = None
+
+
+@dataclass
+class XcpuGDNAttentionMetadata(GDNAttentionMetadata):
+    # Immutable per-build CPU scheduling facts, passed as a runtime graph input.
+    xcpu_core_counts: torch.Tensor | None = None
+    xcpu_core_tensors: tuple[torch.Tensor, ...] = ()
 
 
 def _xcpu_gdn_metadata_build(
@@ -46,6 +54,20 @@ def _xcpu_gdn_metadata_build(
         FLA_CHUNK_SIZE,
     )
 
+    # Match upstream build(): precomputed indices are already aligned. The
+    # checkpoint builder below must still receive the original block table.
+    aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
+    if aligned_state_indices is not None:
+        block_table_tensor = aligned_state_indices[: m.num_reqs]
+        block_size_to_align = 0
+    else:
+        block_table_tensor = m.block_table_tensor
+        block_size_to_align = (
+            self.kv_cache_spec.block_size
+            if self.vllm_config.cache_config.mamba_cache_mode == "align"
+            else 0
+        )
+
     # A one-token first prefill must clear recycled state; a resumed chunk can
     # use decode kernels. These are CPU scheduling facts, not device readbacks.
     no_prior_state_cpu = None
@@ -72,15 +94,13 @@ def _xcpu_gdn_metadata_build(
         query_start_loc,
         query_start_loc_cpu,
         m.seq_lens,
-        m.block_table_tensor,
+        block_table_tensor,
         num_accepted_tokens,
         num_decode_draft_tokens_cpu,
         self.num_spec if self.use_spec_decode else 0,
         m.num_actual_tokens,
         m.max_query_len,
-        self.kv_cache_spec.block_size
-        if self.vllm_config.cache_config.mamba_cache_mode == "align"
-        else 0,
+        block_size_to_align,
         FLA_CHUNK_SIZE,
         outputs,
         no_prior_state_cpu,
@@ -147,6 +167,23 @@ def _xcpu_gdn_metadata_build(
                 "token_chunk_offset_ptr": token_chunk_offset_ptr,
             }
         }
+
+    spec_sequence_masks_cpu = None
+    uniform_spec_sequence_length = None
+    if num_spec_decodes > 0:
+        assert num_decode_draft_tokens_cpu is not None
+        spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+        spec_lens = query_start_loc_cpu.diff()[spec_sequence_masks_cpu]
+        first_length = int(spec_lens[0])
+        if first_length > 0 and bool(torch.all(spec_lens == first_length)):
+            uniform_spec_sequence_length = first_length
+
+    checkpoint = None
+    if num_prefills > 0:
+        request_rows = list(range(m.num_reqs))
+        if spec_sequence_masks_cpu is not None:
+            request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
+        checkpoint = self.checkpoint_builder.build(m, request_rows)
 
     # Function code counted on either presency non-spec decode or spec decode,
     # but not both.
@@ -222,7 +259,40 @@ def _xcpu_gdn_metadata_build(
         non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
         non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
-    attn_metadata = GDNAttentionMetadata(
+    # Guardless AOT replay must fetch every slot on every invocation, including
+    # slots that were absent during tracing. Distinct views also prevent Dynamo
+    # from specializing two slots to the same Python Tensor object.
+    core_tensors = tuple(
+        tensor.view(tensor.shape)
+        if tensor is not None
+        else torch.empty(0, dtype=dtype, device=query_start_loc.device)
+        for tensor, dtype in (
+            (has_initial_state, torch.bool),
+            (spec_query_start_loc, torch.int32),
+            (non_spec_query_start_loc, torch.int32),
+            (spec_state_indices_tensor, torch.int32),
+            (non_spec_state_indices_tensor, torch.int32),
+            (spec_token_indx, torch.int64),
+            (non_spec_token_indx, torch.int64),
+            (num_accepted_tokens, torch.int32),
+            (prefill_query_start_loc, torch.int32),
+            (prefill_state_indices, torch.int32),
+            (prefill_has_initial_state, torch.bool),
+        )
+    )
+    attn_metadata = XcpuGDNAttentionMetadata(
+        xcpu_core_tensors=core_tensors,
+        xcpu_core_counts=torch.tensor(
+            [
+                num_prefills,
+                num_decodes,
+                num_spec_decodes,
+                m.num_actual_tokens,
+                num_decode_tokens,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        ),
         num_prefills=num_prefills,
         num_prefill_tokens=num_prefill_tokens,
         num_decodes=num_decodes,
@@ -230,7 +300,7 @@ def _xcpu_gdn_metadata_build(
         num_spec_decodes=num_spec_decodes,
         num_spec_decode_tokens=num_spec_decode_tokens,
         num_actual_tokens=m.num_actual_tokens,
-        xcpu_runtime_metadata_handle=self._xcpu_runtime_metadata_handle,
+        checkpoint=checkpoint,
         has_initial_state=has_initial_state,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
@@ -242,6 +312,8 @@ def _xcpu_gdn_metadata_build(
         spec_state_indices_tensor=spec_state_indices_tensor,
         non_spec_state_indices_tensor=non_spec_state_indices_tensor,
         spec_sequence_masks=spec_sequence_masks,
+        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+        uniform_spec_sequence_length=uniform_spec_sequence_length,
         spec_token_indx=spec_token_indx,
         non_spec_token_indx=non_spec_token_indx,
         num_accepted_tokens=num_accepted_tokens,
@@ -249,28 +321,6 @@ def _xcpu_gdn_metadata_build(
         batch_ptr=batch_ptr,
         token_chunk_offset_ptr=token_chunk_offset_ptr,
     )
-    if self._xcpu_runtime_metadata_handle is not None:
-        import torch_xcpu.ops_defs.gdn_decode_state  # noqa: F401
-
-        torch.ops.torch_xcpu.set_gdn_runtime_metadata(
-            self._xcpu_runtime_metadata_handle,
-            num_prefills,
-            num_decodes,
-            num_spec_decodes,
-            m.num_actual_tokens,
-            num_decode_tokens,
-            has_initial_state,
-            spec_query_start_loc,
-            non_spec_query_start_loc,
-            spec_state_indices_tensor,
-            non_spec_state_indices_tensor,
-            spec_token_indx,
-            non_spec_token_indx,
-            num_accepted_tokens,
-            prefill_query_start_loc,
-            prefill_state_indices,
-            prefill_has_initial_state,
-        )
     return attn_metadata
 
 
