@@ -1,3 +1,5 @@
+from typing import NoReturn
+
 import torch
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm,
@@ -6,20 +8,39 @@ from vllm.model_executor.layers.layernorm import (
 )
 
 
-def _not_implemented(message: str):
+def _not_implemented(message: str) -> NoReturn:
     raise NotImplementedError(f"torch_xcpu {message}")
 
 
 @LayerNorm.register_oot
 class XcpuLayerNorm(LayerNorm):
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        import torch_xcpu.ops as ops
-
+        weight = self.weight
+        bias = self.bias
+        if weight is None or bias is None:
+            _not_implemented(
+                "LayerNorm without affine weight or bias requires torch_xcpu "
+                "layer_norm support for optional parameters"
+            )
+        if weight.dtype != torch.float32 or bias.dtype != torch.float32:
+            _not_implemented(
+                "LayerNorm parameter dtypes other than float32 require "
+                "torch_xcpu layer_norm dtype support"
+            )
+        if x.dtype not in (torch.bfloat16, torch.float32):
+            _not_implemented(
+                f"LayerNorm input dtype {x.dtype} requires torch_xcpu "
+                "layer_norm dtype support"
+            )
         if not x.is_contiguous() and not (x.dim() == 2 and x.stride(-1) == 1):
             _not_implemented(
-                "LayerNorm only supports contiguous or row-strided 2D input"
+                "LayerNorm only supports contiguous or row-strided 2D input; "
+                "torch_xcpu layer_norm needs broader layout support"
             )
-        return ops.layer_norm(x, self.weight.data, self.bias.data, self.eps)
+
+        import torch_xcpu.ops as ops
+
+        return ops.layer_norm(x, weight.data, bias.data, self.eps)
 
 
 @GemmaRMSNorm.register_oot
