@@ -30,6 +30,9 @@ def register_ops():
     from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
 
     register_vllm_kernels()
+    from vllm_xcpu_plugin.rms_norm_dispatch import register_rms_norm_kernel
+
+    register_rms_norm_kernel()
     import vllm_xcpu_plugin.custom_ops  # noqa
     from vllm_xcpu_plugin.dflash_patch import maybe_patch_dflash_inputs
     from vllm_xcpu_plugin.gdn_patch import maybe_patch_gdn_attention

@@ -285,6 +285,9 @@ class McpuPlatform(Platform):
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
+        # 使得 attention 能 enable direct_call。
+        # 配合 vLLM 的定制修改，可以移除 torch.compile 中的
+        # python attention fallback，提高派发性能
         return False
 
     # @classmethod
