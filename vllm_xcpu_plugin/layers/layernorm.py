@@ -51,8 +51,12 @@ class XcpuGemmaRMSNorm(GemmaRMSNorm):
         # observe/change the inputs and outputs at the original norm boundary.
         from torch.nn.modules import module
 
+        # Dynamo does not preserve equality of separately accessed bound methods.
+        # Compare their receiver and function identities instead.
         return (
-            self._forward_method == self.forward_oot
+            getattr(self._forward_method, "__self__", None) is self
+            and getattr(self._forward_method, "__func__", None)
+            is self.forward_oot.__func__
             and not self._forward_pre_hooks
             and not self._forward_hooks
             and not module._global_forward_pre_hooks
