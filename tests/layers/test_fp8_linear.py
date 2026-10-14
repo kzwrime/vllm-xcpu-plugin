@@ -1,18 +1,37 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_xcpu_plugin.layers.fp8_linear import (
     XcpuFp8BlockScaledMMLinearKernel,
+    register_fp8_linear_kernel,
 )
 
 
-def test_process_weights_uses_initialized_torch_xcpu_operator(monkeypatch):
+@pytest.mark.parametrize("scale_attr", ["weight_scale_inv", "weight_scale"])
+@pytest.mark.parametrize(
+    "row_parallel,tp_rank,skip_bias_add,fuse_bias",
+    [
+        (False, 0, False, True),
+        (False, 1, False, True),
+        (False, 0, True, False),
+        (True, 0, False, True),
+        (True, 1, False, False),
+        (True, 0, True, False),
+    ],
+)
+def test_process_weights_uses_initialized_torch_xcpu_operator(
+    monkeypatch, scale_attr, row_parallel, tp_rank, skip_bias_add, fuse_bias
+):
     import torch_xcpu
 
-    class Layer(torch.nn.Module):
+    class Layer(RowParallelLinear if row_parallel else torch.nn.Module):
         def __init__(self):
-            super().__init__()
+            torch.nn.Module.__init__(self)
+            self.tp_rank = tp_rank
+            self.skip_bias_add = skip_bias_add
             self.register_parameter(
                 "weight",
                 torch.nn.Parameter(
@@ -21,7 +40,7 @@ def test_process_weights_uses_initialized_torch_xcpu_operator(monkeypatch):
                 ),
             )
             self.register_parameter(
-                "weight_scale_inv",
+                scale_attr,
                 torch.nn.Parameter(
                     torch.ones((1, 1), dtype=torch.float32),
                     requires_grad=False,
@@ -34,7 +53,6 @@ def test_process_weights_uses_initialized_torch_xcpu_operator(monkeypatch):
                     requires_grad=False,
                 ),
             )
-            self.weight_scale = None
 
     calls = []
 
@@ -63,17 +81,67 @@ def test_process_weights_uses_initialized_torch_xcpu_operator(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][2] == (128, 128)
-    assert calls[0][3].dtype == torch.float32
-    assert layer.bias.dtype == torch.float32
-    assert calls[0][3].data_ptr() == layer.bias.data_ptr()
+    if fuse_bias:
+        assert calls[0][3].dtype == torch.float32
+        assert layer.bias.dtype == torch.float32
+        assert calls[0][3].data_ptr() == layer.bias.data_ptr()
+    else:
+        assert calls[0][3] is None
+        assert layer.bias.dtype == torch.bfloat16
     assert (
         layer.weight.data_ptr()
         == layer._xcpu_fp8_linear.params.packed_weight.data_ptr()
     )
     assert (
-        layer.weight_scale_inv.data_ptr()
+        getattr(layer, scale_attr).data_ptr()
         == layer._xcpu_fp8_linear.params.weight_scale.data_ptr()
     )
 
     x = torch.ones((2, 128), dtype=torch.bfloat16)
-    assert kernel.apply_weights(layer, x, layer.bias) is x
+    assert kernel.apply_weights(layer, x, layer.bias if fuse_bias else None) is x
+
+
+@pytest.mark.parametrize(
+    "input_dtype,out_dtype",
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.bfloat16, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_kernel_selection_requires_bf16_activations(
+    monkeypatch, input_dtype, out_dtype
+):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.kernels import linear
+    from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        GroupShape,
+        create_fp8_quant_key,
+    )
+
+    # Exercise vLLM's actual selector and constructor; a mocked preprocessing
+    # call alone cannot catch an upstream config or kernel-family change.
+    monkeypatch.setattr(linear, "_POSSIBLE_FP8_BLOCK_KERNELS", {})
+    register_fp8_linear_kernel()
+    with set_current_vllm_config(VllmConfig()):
+        kwargs = dict(
+            activation_quant_key=create_fp8_quant_key(
+                static=False, group_shape=GroupShape(1, 128)
+            ),
+            weight_quant_key=create_fp8_quant_key(
+                static=True, group_shape=GroupShape(128, 128)
+            ),
+            weight_shape=(128, 128),
+            input_dtype=input_dtype,
+            out_dtype=out_dtype,
+        )
+        if input_dtype == out_dtype == torch.bfloat16:
+            kernel = init_fp8_linear_kernel(**kwargs)
+            assert isinstance(kernel, XcpuFp8BlockScaledMMLinearKernel)
+            assert kernel.input_quant_key() is None
+        else:
+            with pytest.raises(ValueError, match="requires BF16 input and output"):
+                init_fp8_linear_kernel(**kwargs)

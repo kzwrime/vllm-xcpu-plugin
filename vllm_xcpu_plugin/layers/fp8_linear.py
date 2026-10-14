@@ -91,28 +91,24 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
                 "N % 32 == 0 and K % 128 == 0; got scale block "
                 f"{weight_group_shape} and weight shape {config.weight_shape}.",
             )
-        if config.out_dtype != torch.bfloat16:
-            return False, "torch_xcpu FP8 kernel requires BF16 output."
+        if config.input_dtype != torch.bfloat16 or config.out_dtype != torch.bfloat16:
+            return False, "torch_xcpu FP8 kernel requires BF16 input and output."
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import torch_xcpu
+        from vllm.model_executor.layers.linear import RowParallelLinear
 
         params = self._get_layer_params(layer)
-        scale_attr = (
-            params.WEIGHT_SCALE_INV
-            if params.weight_scale_inv is not None
-            else params.WEIGHT_SCALE
-        )
-        weight_scale = (
-            params.weight_scale_inv
-            if params.weight_scale_inv is not None
-            else params.weight_scale
-        )
-        assert weight_scale is not None
-        weight_scale = weight_scale.data.contiguous()
+        weight_scale = params.block_scale.data.contiguous()
 
         layer_bias = getattr(layer, "bias", None)
+        # Match the bias passed by vLLM's linear forward methods: deferred
+        # bias stays on the layer, and row-parallel bias is fused only on rank 0.
+        if getattr(layer, "skip_bias_add", False) or (
+            isinstance(layer, RowParallelLinear) and layer.tp_rank > 0
+        ):
+            layer_bias = None
         bias_fp32 = None
         if layer_bias is not None:
             assert isinstance(layer_bias, torch.Tensor)
@@ -137,7 +133,7 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         )
         replace_parameter(
             layer,
-            scale_attr,
+            params.block_scale_attr,
             fp8_linear.params.weight_scale,
         )
         if bias_fp32 is not None:
