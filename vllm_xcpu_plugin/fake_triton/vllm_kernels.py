@@ -986,6 +986,10 @@ def _rejection_v2(launch: KernelLaunch) -> None:
         "rejection kernel requires num_warps=1",
     )
     _expect(not args["SYNTHETIC_MODE"], "synthetic rejection mode unsupported")
+    _expect(
+        not args["USE_BLOCK_VERIFICATION"],
+        "block verification requires the v0.31 placeholder-aware XCPU port",
+    )
     if args["USE_BLOCK_VERIFICATION"]:
         _expect(args["cumulative_log_p_ptr"] is not None, "missing cumulative log p")
         if args["HAS_DRAFT_LOGITS"]:
@@ -1189,6 +1193,26 @@ def _dflash2_cache_draft_logits(launch: KernelLaunch) -> None:
         num_sample,
         num_steps,
         top_k,
+    )
+
+
+def _gather_draft_sampled(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
+    args = launch.arguments
+    num_logits = args["num_logits"]
+    block_size = args["BLOCK_SIZE"]
+    _expect_grid(launch, ((num_logits + block_size - 1) // block_size,))
+    torch.ops.torch_xcpu.gather_draft_sampled(
+        args["draft_sampled_ptr"],
+        args["pos_ptr"],
+        args["input_ids_ptr"],
+        args["positions_ptr"],
+        args["logits_indices_ptr"],
+        args["expanded_idx_mapping_ptr"],
+        args["expanded_local_pos_ptr"],
+        args["prefill_len_ptr"],
+        num_logits,
     )
 
 
@@ -1791,9 +1815,13 @@ _KERNELS: tuple[
     (
         "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
         "_rejection_kernel",
-        "3d4dbcdc0d283809f462c8d9ebae30e2f477eab2baea07425692329a2e085a18",
+        "d43728167fef0543cdbdee3239b7bec57122d3a70800e8586c0b080d525f96d7",
         "ab95ffecb83ee24783fcfa2f1a52274a82888fc2763fd0669421935647b0ae5b",
-        LegacyKernelSource("b389ac2946"),
+        KernelSource(
+            tag="v0.31.0 standard non-watermarked verification",
+            local_commit="9c77da8aee9b04e3db4797b1ff4c576fb394dcdf",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
         _rejection_v2,
         ("num_warps",),
     ),
@@ -1821,6 +1849,19 @@ _KERNELS: tuple[
             main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
         ),
         _rejection_insert,
+        (),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        "_gather_draft_sampled_kernel",
+        "e5412a9ae807722ee3e5b024530443b92b4ad9295238f09690ec015fd6247912",
+        "d71d340aa01859a4b3893644f8b67f3dea00a9ac59712e3d4d48017f29f7e5e9",
+        KernelSource(
+            tag="v0.31.0",
+            local_commit="9c77da8aee9b04e3db4797b1ff4c576fb394dcdf",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _gather_draft_sampled,
         (),
     ),
     (

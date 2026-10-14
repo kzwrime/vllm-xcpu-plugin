@@ -5,22 +5,28 @@ from typing import Any, cast
 import torch
 
 
-def _xcpu_prepare_dflash_inputs_for_groups(
+def _xcpu_prepare_dflash_inputs(
     input_buffers: Any,
-    query_slot_mappings: torch.Tensor,
+    query_slot_mapping: torch.Tensor,
     context_positions: torch.Tensor,
-    context_slot_mappings: torch.Tensor,
+    context_slot_mapping: torch.Tensor,
     sample_indices: torch.Tensor,
     sample_pos: torch.Tensor,
     sample_idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
     input_batch: Any,
     num_sampled: torch.Tensor,
     num_rejected: torch.Tensor,
     last_sampled: torch.Tensor,
     next_prefill_tokens: torch.Tensor,
-    block_tables: list[torch.Tensor],
-    block_sizes: list[int],
-    group_ids: list[int],
+    input_temperature: torch.Tensor,
+    input_seeds: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
     parallel_drafting_token_id: int,
     num_query_per_req: int,
     num_speculative_steps: int,
@@ -37,12 +43,14 @@ def _xcpu_prepare_dflash_inputs_for_groups(
         input_buffers.positions,
         input_buffers.query_start_loc,
         input_buffers.seq_lens,
-        query_slot_mappings,
+        query_slot_mapping,
         context_positions,
-        context_slot_mappings,
+        context_slot_mapping,
         sample_indices,
         sample_pos,
         sample_idx_mapping,
+        temperature,
+        seeds,
         input_batch.positions,
         input_batch.query_start_loc,
         input_batch.idx_mapping,
@@ -50,19 +58,23 @@ def _xcpu_prepare_dflash_inputs_for_groups(
         next_prefill_tokens,
         num_sampled,
         num_rejected,
-        block_tables,
-        block_sizes,
-        group_ids,
-        input_batch.num_reqs,
-        input_batch.num_tokens,
+        input_temperature,
+        input_seeds,
+        block_table,
+        block_table.stride(0),
         parallel_drafting_token_id,
+        block_size,
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
         max_num_tokens,
         max_model_len,
-        sample_from_anchor,
-        PAD_SLOT_ID,
+        cp_rank,
+        sample_from_anchor=sample_from_anchor,
+        pad_slot_id=PAD_SLOT_ID,
+        cp_size=cp_size,
+        cp_interleave=cp_interleave,
+        num_reqs=input_batch.num_reqs,
     )
 
 
@@ -78,7 +90,5 @@ def maybe_patch_dflash_inputs() -> None:
     )
 
     verify_upstream_compatibility(("dflash",))
-    speculator_any.prepare_dflash_inputs_for_groups = (
-        _xcpu_prepare_dflash_inputs_for_groups
-    )
+    speculator_any.prepare_dflash_inputs = _xcpu_prepare_dflash_inputs
     speculator_any._xcpu_dflash_inputs_patched = True
