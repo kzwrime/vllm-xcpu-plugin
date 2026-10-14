@@ -100,6 +100,24 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
     # Audited v0.31 defaults: decoder, unquantized KV and ordinary sliding window;
     # pinning the full wrapper does not claim support for its optional features.
     _operator(
+        "attention",
+        "vllm.v1.attention.ops.triton_unified_attention",
+        "unified_attention",
+        "61d44737cbe8baa514d5c7f198d2e91ae49820be46dc3671c1a5a29350074921",
+        "910052c0787dc824128db7e6d1229e3a4b80ab18cb25fc02e83430424f7d0876",
+        "torch_xcpu.ops.unified_attention",
+        source_version="9c77da8aee (v0.31) attention Python interfaces",
+    ),
+    _operator(
+        "attention",
+        "vllm.v1.attention.backends.triton_attn",
+        "TritonAttentionImpl.__init__",
+        "76ac93b2d2dc22ade6a39d20e3e3f937dab7a8410a9c6396cdd74d05974a6ac9",
+        "7beb5deda87f48833ea846faf5de980247c23c273e7e4a77d88fe02d22edee31",
+        "vllm_xcpu_plugin.attn_backend.XcpuTritonAttentionImpl.__init__",
+        source_version="9c77da8aee (v0.31) attention Python interfaces",
+    ),
+    _operator(
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
         "sparse_attn_indexer",
@@ -121,6 +139,18 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "441a21b245c30963704e4bcc4aa2a1aa4c994b575954c3318efa2b3d045b08e5",
         "torch.ops.torch_xcpu.sparse_attn_indexer",
         source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
+    ),
+    _operator(
+        "attention",
+        "vllm.v1.attention.ops.triton_attention_helpers",
+        "compute_kv_seq_mask",
+        "69105e38cf99abb11f70ea627ade1c212c5186cc0debb75e79de7c839746171b",
+        "db24d71f29cbc3ce0c7fd5347329e17dfb8a6568d31dad3543a166b79e26ee71",
+        "torch_xcpu.ops.unified_attention",
+        source_version=(
+            "9c77da8aee (v0.31) dense causal/noncausal sliding-window mask; "
+            "no PrefixLM, chunked attention or R-SWA support claimed"
+        ),
     ),
     _operator(
         "attention",
@@ -162,10 +192,13 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "attention",
         "vllm.v1.attention.ops.triton_unified_attention",
         "kernel_unified_attention",
-        "16c1a25c5b632c385717cf8d76b3bdc71abc1c2012b925f2a1e427bdf2d42275",
+        "af801ecf9d243a25e5d0390e5daff62bd24634aed22da0298a8ba381e057d350",
         "edefe3f15b40eca1cd7814d025601582962cc7436639f0d0431a45a51544c30e",
         "torch_xcpu.ops.unified_attention",
-        source_version="v0.25.0",
+        source_version=(
+            "v0.31 dense causal attention; local=dd24619b0d47831e; "
+            "upstream=07ea9350baf84e33,1117140edbaf3d1e"
+        ),
     ),
     _operator(
         "attention",

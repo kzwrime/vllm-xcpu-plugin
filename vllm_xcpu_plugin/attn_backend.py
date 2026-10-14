@@ -1,4 +1,4 @@
-from typing import Any, Protocol, cast
+from typing import Any, ClassVar, Protocol, cast
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.config.cache import CacheDType
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention, MLAAttention
@@ -18,7 +19,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
 )
-from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionLayer,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
 from vllm.v1.attention.backends.registry import (
@@ -66,7 +67,24 @@ def xcpu_sparse_mla_attention(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Dispatch experimental paged sparse MLA prefill and decode kernels."""
+    import torch_xcpu
+
+    if torch_xcpu.config._ENABLE_CHECKS:
+        if q.ndim != 3:
+            raise ValueError(
+                "XCPU sparse MLA query must have shape [tokens, heads, content]"
+            )
+        if output.ndim != 3 or output.shape != (q.shape[0], q.shape[1], value_dim):
+            raise ValueError(
+                "XCPU sparse MLA output must match query tokens/heads and value_dim"
+            )
+        if not output.is_contiguous():
+            raise ValueError("XCPU sparse MLA output must be contiguous")
     query_starts = query_start_loc.cpu().tolist()
+    if torch_xcpu.config._ENABLE_CHECKS and (
+        not query_starts or q.shape[0] != query_starts[-1]
+    ):
+        raise ValueError("XCPU sparse MLA query tokens must match query_start_loc")
     query_lens = [end - start for start, end in zip(query_starts, query_starts[1:])]
     num_decodes = 0
     while num_decodes < len(query_lens) and query_lens[num_decodes] == 1:
@@ -76,11 +94,7 @@ def xcpu_sparse_mla_attention(
             "XCPU experimental sparse MLA requires decode requests before prefills"
         )
 
-    assert q.shape[0] == query_starts[-1]
-    assert output.shape == (q.shape[0], q.shape[1], value_dim)
     logical_topk = logical_topk[: q.shape[0]]
-
-    import torch_xcpu
 
     if num_decodes:
         torch_xcpu.ops.sparse_mla_decode(
@@ -90,7 +104,7 @@ def xcpu_sparse_mla_attention(
             block_table[:num_decodes].contiguous(),
             seq_lens[:num_decodes].contiguous(),
             scale,
-            output[:num_decodes].contiguous(),
+            output[:num_decodes],
         )
 
     num_decode_tokens = query_starts[num_decodes]
@@ -115,7 +129,7 @@ def xcpu_sparse_mla_attention(
             seq_lens.contiguous(),
             num_decode_tokens,
             scale,
-            output[num_decode_tokens:].contiguous(),
+            output[num_decode_tokens:],
         )
     return output
 
@@ -136,6 +150,11 @@ class XcpuTritonAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
 @register_backend(AttentionBackendEnum.TRITON_MLA)
 class XcpuTritonMLABackend(MLACommonBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Preserve the former platform default when selecting dense MLA blocks.
+        return super().get_preferred_block_size(64)
 
     @staticmethod
     def get_name() -> str:
@@ -247,7 +266,8 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
 
-        self.use_direct_call = not current_platform.opaque_attention_op()
+        # This OOT MLA class owns its dispatch rather than calling Attention.forward.
+        self.use_direct_call = True
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -464,7 +484,10 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert output is not None, "Output tensor must be provided."
+        import torch_xcpu
+
+        if torch_xcpu.config._ENABLE_CHECKS and output is None:
+            raise ValueError("XCPU MLA attention requires an output tensor")
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
@@ -511,8 +534,6 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
         prefill_output = output
 
         # Write the latent and rope to kv cache
-        import torch_xcpu  # noqa: E402
-
         if kv_cache is not None:
             torch_xcpu.ops.reshape_and_cache(
                 k_c_normed,  # [tokens, kv_lora_rank]
@@ -575,6 +596,53 @@ MLAAttention.register(XcpuTritonMLAAttention)
 class XcpuTritonAttentionBackend(TritonAttentionBackend):
     use_direct_unified_op: bool = True
     forward_includes_kv_cache_update: bool = False
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float32]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+
+    # Performance-tuned XCPU unified attention on real NPU hardware for
+    # Qwen3, Qwen3.5, and GLM5.2 requires blocks of at least 64 tokens,
+    # aligned to multiples of 64. Expose this to hybrid page alignment too.
+    block_size_alignment: ClassVar[int] = 64
+
+    @classmethod
+    def get_supported_kernel_block_sizes(
+        cls, kv_cache_spec: KVCacheSpec | None = None
+    ) -> list[int | MultipleOf]:
+        return [MultipleOf(cls.block_size_alignment)]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        return block_size is None or (
+            block_size > 0 and block_size % cls.block_size_alignment == 0
+        )
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return head_size in (4, 64, 80, 128, 192, 256)
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_rswa(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_alibi_sqrt(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == AttentionType.DECODER
 
     @staticmethod
     def get_builder_cls() -> type["XcpuTritonAttentionMetadataBuilder"]:
@@ -588,8 +656,19 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str not in ("auto", "bfloat16"):
+            raise NotImplementedError(
+                "XCPU attention requires unquantized BF16/FP32 KV"
+            )
+        if not XcpuTritonAttentionBackend.supports_head_size(head_size):
+            raise NotImplementedError(
+                f"XCPU attention unsupported head size {head_size}"
+            )
+        if not XcpuTritonAttentionBackend.supports_block_size(block_size):
+            raise ValueError(
+                "XCPU attention block size must be a positive multiple of "
+                f"{XcpuTritonAttentionBackend.block_size_alignment}."
+            )
         kv_cache_shape = TritonAttentionBackend.get_kv_cache_shape(
             num_blocks, block_size, num_kv_heads, head_size
         )
@@ -614,6 +693,76 @@ class XcpuTritonAttentionBackend(TritonAttentionBackend):
 
 
 class XcpuTritonAttentionImpl(TritonAttentionImpl):
+    # register_attn_backend checks source/signature hashes for the upstream
+    # constructor and unified_attention wrapper before installing this backend.
+    @staticmethod
+    def _check_options(
+        alibi_slopes, sinks, logits_soft_cap, use_alibi_sqrt, chunk_lookback
+    ) -> None:
+        unsupported = {
+            "ALiBi": alibi_slopes is not None,
+            "attention sinks": sinks is not None,
+            "logits soft cap": logits_soft_cap not in (None, 0),
+            "ALiBi square root": use_alibi_sqrt,
+            "chunked local attention": chunk_lookback != -1,
+        }
+        for feature, enabled in unsupported.items():
+            if enabled:
+                raise NotImplementedError(f"XCPU attention does not support {feature}")
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: int | None = None,
+        sinks: torch.Tensor | None = None,
+        use_alibi_sqrt: bool = False,
+        chunk_lookback: int = -1,
+    ) -> None:
+        self._check_options(
+            alibi_slopes, sinks, logits_soft_cap, use_alibi_sqrt, chunk_lookback
+        )
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError(
+                "XCPU paged attention supports decoder attention only"
+            )
+        if kv_cache_dtype not in ("auto", "bfloat16"):
+            raise NotImplementedError(
+                "XCPU attention requires unquantized BF16/FP32 KV"
+            )
+        if not XcpuTritonAttentionBackend.supports_head_size(head_size):
+            raise NotImplementedError(
+                f"XCPU attention unsupported head size {head_size}"
+            )
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+            raise ValueError(
+                "XCPU attention query heads must be a positive KV-head multiple"
+            )
+        if sliding_window is not None and sliding_window <= 0:
+            raise ValueError("XCPU attention sliding window must be positive")
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            sinks,
+            use_alibi_sqrt,
+            chunk_lookback,
+        )
+
     def forward(  # type: ignore[override]
         self,
         layer: torch.nn.Module,
@@ -633,25 +782,61 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [num_blocks, 2, block_size, num_kv_heads, head_size]
+                [num_blocks, num_kv_heads, block_size, 2 * head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        assert output is not None, "Output tensor must be provided."
         import torch_xcpu
 
-        if output_block_scale is not None:
-            raise NotImplementedError(
-                "fused block_scale output quantization is not yet supported"
-                " for TritonAttentionImpl"
+        if torch_xcpu.config._ENABLE_CHECKS:
+            if output is None:
+                raise ValueError("XCPU attention requires an output tensor")
+            self._check_options(
+                self.alibi_slopes,
+                self.sinks,
+                self.logits_soft_cap,
+                self.use_alibi_sqrt,
+                self.chunk_lookback,
             )
+            if self.attn_type != AttentionType.DECODER or self.kv_cache_dtype not in (
+                "auto",
+                "bfloat16",
+            ):
+                raise NotImplementedError(
+                    "XCPU attention requires unquantized decoder KV"
+                )
+            if (
+                query.dtype not in (torch.bfloat16, torch.float32)
+                or output.dtype != query.dtype
+            ):
+                raise NotImplementedError(
+                    "XCPU attention requires matching BF16/FP32 query/output"
+                )
+            if output_scale is not None or output_block_scale is not None:
+                raise NotImplementedError(
+                    "XCPU attention does not support output quantization scales"
+                )
 
         if attn_metadata is None:
             # Profiling run.
             return output
 
-        assert attn_metadata.use_cascade is False
+        if torch_xcpu.config._ENABLE_CHECKS:
+            if attn_metadata.use_cascade:
+                raise NotImplementedError(
+                    "XCPU attention does not support cascade attention"
+                )
+            for feature in (
+                "mm_prefix_range",
+                "mm_prefix_range_tensor",
+                "rswa_prefix_lens",
+                "rswa_window",
+            ):
+                if getattr(attn_metadata, feature, None) is not None:
+                    raise NotImplementedError(
+                        f"XCPU attention does not support {feature}"
+                    )
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
@@ -661,21 +846,6 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         # Minimize the PyTorch ops in this method as much as possible.
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-
-        # Handle encoder attention differently - no KV cache needed
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            # For encoder attention,
-            # we use direct Q, K, V tensors without caching
-            return self._forward_encoder_attention(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                output[:num_actual_tokens],
-                attn_metadata,
-                layer,
-            )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -697,9 +867,9 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         # mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         torch_xcpu.ops.unified_attention(
-            q=query,  # query[:num_actual_tokens]
+            q=query,
             kv=kv_cache,
-            out=output,  # output[:num_actual_tokens]
+            out=output,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k,
@@ -723,12 +893,17 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            return
+        import torch_xcpu
+
+        if torch_xcpu.config._ENABLE_CHECKS and (
+            self.attn_type != AttentionType.DECODER
+            or self.kv_cache_dtype not in ("auto", "bfloat16")
+        ):
+            raise NotImplementedError(
+                "XCPU cache update requires unquantized decoder KV"
+            )
         if self.kv_sharing_target_layer_name is not None:
             return
-
-        import torch_xcpu
 
         torch_xcpu.ops.reshape_and_cache(
             key,
@@ -744,6 +919,9 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         values: torch.Tensor,
         slot_mappings: list[torch.Tensor | None],
     ) -> None:
+        import torch_xcpu
+
+        enable_checks = torch_xcpu.config._ENABLE_CHECKS
         kv_caches = []
         active_slot_mappings = []
         layer_indices = []
@@ -753,8 +931,13 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             impl = layer.impl
             if slot_mapping is None:
                 continue
-            if impl.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):  # type: ignore[attr-defined]
-                continue
+            if enable_checks and (
+                impl.attn_type != AttentionType.DECODER
+                or impl.kv_cache_dtype not in ("auto", "bfloat16")
+            ):
+                raise NotImplementedError(
+                    "XCPU grouped cache update requires unquantized decoder KV"
+                )
             if impl.kv_sharing_target_layer_name is not None:  # type: ignore[attr-defined]
                 continue
             kv_caches.append(layer.kv_cache)
@@ -763,8 +946,6 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
 
         if not layer_indices:
             return
-
-        import torch_xcpu
 
         torch_xcpu.ops.reshape_and_cache_grouped(
             keys,

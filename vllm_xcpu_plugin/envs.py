@@ -49,8 +49,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16": lambda: bool(
         int(os.getenv("VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16", "0"))
     ),
-    # Reset block size alignment
-    "BLOCK_SIZE_ALIGN": lambda: int(os.getenv("BLOCK_SIZE_ALIGN", "16")),
 }
 
 # end-env-vars-definition

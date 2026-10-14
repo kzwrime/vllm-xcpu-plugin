@@ -101,7 +101,8 @@ class McpuPlatform(Platform):
             fused_priority.insert(0, "torch_xcpu_inplace")
 
         return IrOpPriorityConfig.with_default(
-            ["torch_xcpu", "native"],
+            ["native"],
+            rms_norm=["torch_xcpu", "native"],
             fused_add_rms_norm=fused_priority,
         )
 
@@ -203,21 +204,6 @@ class McpuPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_xcpu_plugin.worker.worker_v1.McpuWorker"
 
-        cache_config = vllm_config.cache_config
-        if not cache_config.user_specified_block_size:
-            model_config = vllm_config.model_config
-            is_hybrid_model = model_config is not None and model_config.is_hybrid
-            # Hybrid models (Qwen3.5 in this repo) rely on
-            # HybridAttentionMambaModelConfig to align block_size with
-            # mamba/attention page sizes. Keep the model-side value.
-            if not is_hybrid_model:
-                cache_config.block_size = 64
-
-        # Align block_size to envs.BLOCK_SIZE_ALIGN
-        block_size_align = envs_xcpu.BLOCK_SIZE_ALIGN
-        cache_config.block_size = (
-            (cache_config.block_size + block_size_align - 1) // block_size_align
-        ) * block_size_align
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 
@@ -241,12 +227,6 @@ class McpuPlatform(Platform):
                 "combo_kernels": False,
                 "benchmark_combo_kernel": False,
             })
-
-    @classmethod
-    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        # TODO: CPU still sets block_size in check_and_update_config.
-        # Move that logic here so block_size is chosen by the backend.
-        pass
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
