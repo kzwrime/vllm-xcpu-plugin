@@ -1,3 +1,4 @@
+import math
 from typing import Any, ClassVar, Protocol, cast
 
 import torch
@@ -592,6 +593,92 @@ class XcpuTritonMLAAttention(nn.Module, AttentionLayerBase):
 MLAAttention.register(XcpuTritonMLAAttention)
 
 
+# Used only by the qwen3_dflash context-KV grouped update below.
+# The caller validates cache shapes and positive strides before this proof.
+def _cache_write_regions_disjoint(caches: list[torch.Tensor]) -> bool:
+    """Prove non-overlap from page geometry without reading device slot mappings."""
+    regions: list[tuple[int, int, int, int]] = []
+    for cache in caches:
+        elem = cache.element_size()
+        start = cache.data_ptr()
+        page_span = elem * (
+            1 + sum((n - 1) * s for n, s in zip(cache.shape[1:], cache.stride()[1:]))
+        )
+        pitch = cache.stride(0) * elem
+        end = start + (cache.shape[0] - 1) * pitch + page_span
+        for other_start, other_end, other_pitch, other_span in regions:
+            if end <= other_start or other_end <= start:
+                continue
+            # Disjoint residues prove that even interleaved pages cannot overlap.
+            period = math.gcd(pitch, other_pitch)
+            delta = (start - other_start) % period
+            if not (other_span <= delta and page_span <= period - delta):
+                return False
+        regions.append((start, end, pitch, page_span))
+    return True
+
+
+# Eligibility checks for qwen3_dflash context KV, including inherited DFlash2.
+# These safety checks remain active when optional XCPU debug checks are disabled.
+def _can_group_cache_updates(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    caches: list[torch.Tensor],
+    slots: list[torch.Tensor],
+) -> bool:
+    if (
+        len(caches) < 2
+        or keys.device.type != "mcpu"
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or keys.dtype not in (torch.bfloat16, torch.float32)
+        or values.dtype != keys.dtype
+        or values.device != keys.device
+        or not keys.is_contiguous()
+        or not values.is_contiguous()
+        or keys.shape[-1] not in (4, 64, 80, 128, 192, 256)
+        or keys.shape[2] == 0
+        or keys.data_ptr() % 4
+        or values.data_ptr() % 4
+    ):
+        return False
+    source_storage = {
+        keys.untyped_storage().data_ptr(),
+        values.untyped_storage().data_ptr(),
+    }
+    source_storage.update(mapping.untyped_storage().data_ptr() for mapping in slots)
+    for cache, mapping in zip(caches, slots, strict=True):
+        if (
+            cache.ndim != 4
+            or cache.shape[1] != keys.shape[2]
+            or cache.shape[3] != 2 * keys.shape[3]
+            or cache.dtype != keys.dtype
+            or cache.device != keys.device
+            or cache.stride(-1) != 1
+            or cache.data_ptr() % 4
+            or cache.untyped_storage().data_ptr() in source_storage
+            or any(n <= 0 for n in cache.shape)
+            or any(s <= 0 for s in cache.stride())
+            or any(
+                n > 1 and (s * cache.element_size()) % 4
+                for n, s in zip(cache.shape[:-1], cache.stride()[:-1])
+            )
+            or mapping.shape != (keys.shape[1],)
+            or mapping.dtype != torch.int64
+            or mapping.device != keys.device
+            or not mapping.is_contiguous()
+        ):
+            return False
+        span = cache.shape[-1]
+        for stride, size in sorted(
+            (s, n) for n, s in zip(cache.shape[:-1], cache.stride()[:-1]) if n > 1
+        ):
+            if stride < span:
+                return False
+            span += (size - 1) * stride
+    return _cache_write_regions_disjoint(caches)
+
+
 @register_backend(AttentionBackendEnum.TRITON_ATTN)
 class XcpuTritonAttentionBackend(TritonAttentionBackend):
     use_direct_unified_op: bool = True
@@ -912,6 +999,8 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             slot_mapping,
         )
 
+    # Optional hook used only by qwen3_dflash context precompute (also DFlash2).
+    # Ordinary attention forwards continue to use do_kv_cache_update per layer.
     def do_kv_cache_update_grouped(
         self,
         layers: list[Attention],
@@ -919,38 +1008,47 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
         values: torch.Tensor,
         slot_mappings: list[torch.Tensor | None],
     ) -> None:
+        """Group disjoint context cache writes, otherwise preserve layer order.
+
+        Dynamo tracing uses per-layer updates because the eager safety proof
+        inspects storage pointers. Context precompute normally runs outside the
+        compiled model forward, so compile services can still use this hook.
+        """
         import torch_xcpu
 
-        enable_checks = torch_xcpu.config._ENABLE_CHECKS
-        kv_caches = []
-        active_slot_mappings = []
-        layer_indices = []
-        for layer_idx, (layer, slot_mapping) in enumerate(
-            zip(layers, slot_mappings, strict=True)
-        ):
-            impl = layer.impl
-            if slot_mapping is None:
-                continue
-            if enable_checks and (
-                impl.attn_type != AttentionType.DECODER
-                or impl.kv_cache_dtype not in ("auto", "bfloat16")
-            ):
-                raise NotImplementedError(
-                    "XCPU grouped cache update requires unquantized decoder KV"
-                )
-            if impl.kv_sharing_target_layer_name is not None:  # type: ignore[attr-defined]
-                continue
-            kv_caches.append(layer.kv_cache)
-            active_slot_mappings.append(slot_mapping)
-            layer_indices.append(layer_idx)
-
-        if not layer_indices:
-            return
-
-        torch_xcpu.ops.reshape_and_cache_grouped(
-            keys,
-            values,
-            kv_caches,
-            active_slot_mappings,
-            layer_indices,
+        active = [
+            (i, layer, slots)
+            for i, (layer, slots) in enumerate(zip(layers, slot_mappings, strict=True))
+            if slots is not None
+        ]
+        compatible = (
+            not torch.compiler.is_compiling()
+            and keys.ndim == 4
+            and keys.shape[0] == len(layers)
+        ) and all(
+            type(layer.impl) is XcpuTritonAttentionImpl
+            and "do_kv_cache_update" not in vars(layer.impl)
+            and layer.impl.attn_type == AttentionType.DECODER
+            and layer.impl.kv_cache_dtype in ("auto", "bfloat16")
+            for _, layer, _ in active
         )
+        if compatible:
+            active = [
+                (i, layer, slots)
+                for i, layer, slots in active
+                if layer.impl.kv_sharing_target_layer_name is None
+            ]
+            if not active:
+                return
+            caches = [layer.kv_cache for _, layer, _ in active]
+            slots = [mapping for _, _, mapping in active]
+            if _can_group_cache_updates(keys, values, caches, slots):
+                torch_xcpu.ops.reshape_and_cache_grouped(
+                    keys, values, caches, slots, [i for i, _, _ in active]
+                )
+                return
+
+        for i, layer, slots in active:
+            layer.impl.do_kv_cache_update(
+                layer, keys[i], values[i], layer.kv_cache, slots
+            )
