@@ -52,6 +52,9 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         dummy_run=False,
         skip_attn_for_dummy_run=False,
         is_profile=False,
+        context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ):
         if self._af_forward_allreduce and (
             dummy_run or scheduler_output.total_num_scheduled_tokens > 0
@@ -65,11 +68,14 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
                 client.sync_forward_entry()
 
         return super().execute_model(
-            scheduler_output,
-            intermediate_tensors,
-            dummy_run,
-            skip_attn_for_dummy_run,
-            is_profile,
+            scheduler_output=scheduler_output,
+            intermediate_tensors=intermediate_tensors,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
+            context_len=context_len,
+            valid_dummy_state_slots=valid_dummy_state_slots,
+            randomize_inputs=randomize_inputs,
         )
 
 
