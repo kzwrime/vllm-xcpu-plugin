@@ -296,6 +296,23 @@ class McpuWorker(Worker):
         self.available_kv_cache_memory_bytes = kv_cache_space_bytes
         return kv_cache_space_bytes
 
+    def compile_or_warm_up_model(self):
+        from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
+
+        # TRACE_ONCE keeps the first Dynamo trace without guards, and upstream
+        # only warms up VLLM_COMPILE. Left lazy, an idle DP rank traces its
+        # one-token dummy batch first; Dynamo specializes size 1 and every
+        # later batch on that rank runs the T=1 graph. Trace the full token
+        # budget on all ranks before serving instead.
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config.mode == CompilationMode.DYNAMO_TRACE_ONCE and (
+            has_compiled_submodule(self.model_runner.get_model())
+        ):
+            size = self.vllm_config.scheduler_config.max_num_batched_tokens
+            logger.info("Tracing the TRACE_ONCE model graph with %d tokens", size)
+            self.model_runner._dummy_run(size, skip_eplb=True)
+        return super().compile_or_warm_up_model()
+
     def shutdown(self):
         if self._af_client is not None:
             from vllm_xcpu_plugin.af_ep.attn.runtime import (
