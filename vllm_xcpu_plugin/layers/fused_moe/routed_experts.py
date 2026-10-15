@@ -49,9 +49,9 @@ def xcpu_moe_method_factory(
             return upstream
 
         return XcpuQuarkOCPMXMoEMethod(
-            upstream.weight_quant,
-            None,
             layer.moe_config,
+            upstream.weight_quant_key,
+            None,
         )
     if isinstance(upstream, UnquantizedFusedMoEMethod):
         from .unquantized_fused_moe_method import (

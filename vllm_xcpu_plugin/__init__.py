@@ -42,7 +42,7 @@ def register_ops():
     from vllm_xcpu_plugin.layers.quark_mxfp4 import (
         register_quark_mxfp4_linear_scheme,
     )
-    from vllm_xcpu_plugin.layers.sparse_attn_indexer import (
+    from vllm_xcpu_plugin.attention.sparse_attn_indexer import (
         maybe_patch_vllm_sparse_attn_indexer,
     )
     from vllm.model_executor.layers.fused_moe import all2all_utils
@@ -90,13 +90,8 @@ def register_ops():
     import vllm_xcpu_plugin.sampler_patch as sampler_patch
     import vllm_xcpu_plugin.grouped_topk_patch as grouped_topk_patch
 
-    # import vllm_xcpu_plugin.mla_patch as mla_patch
-    def patch_flashattn_mla_sparse():
-        from vllm_xcpu_plugin.flashattn_mla_sparse_patch import (
-            maybe_patch_vllm_flashattn_mla_sparse,
-        )
-
-        maybe_patch_vllm_flashattn_mla_sparse()
+    def register_sparse_mla():
+        import vllm_xcpu_plugin.attention.mla  # noqa: F401
 
     install_optional_integration(
         "MoE topk_softmax", topk_patch.maybe_patch_vllm_topk_softmax
@@ -107,10 +102,7 @@ def register_ops():
     install_optional_integration(
         "MoE grouped_topk", grouped_topk_patch.maybe_patch_vllm_grouped_topk
     )
-    # install_optional_integration(
-    #     "MLA attention", mla_patch.maybe_patch_vllm_mla_attention
-    # )
     install_optional_integration(
-        "flashattn_mla_sparse",
-        patch_flashattn_mla_sparse,
+        "XCPU sparse MLA",
+        register_sparse_mla,
     )

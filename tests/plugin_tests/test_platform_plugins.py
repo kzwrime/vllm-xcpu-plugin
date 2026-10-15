@@ -6,7 +6,7 @@ import torch
 
 
 def _indexer_cache_forward(k, weight, bias, positions, cos_sin, cache):
-    from vllm_xcpu_plugin.layers.sparse_attn_indexer import _indexer_k_cache
+    from vllm_xcpu_plugin.attention.sparse_attn_indexer import _indexer_k_cache
 
     _indexer_k_cache(
         k, weight, bias, positions, cos_sin, cache, "indexer.k_cache", 1e-6, False
@@ -15,7 +15,7 @@ def _indexer_cache_forward(k, weight, bias, positions, cos_sin, cache):
 
 
 def _indexer_qk_cache_forward(k, weight, bias, positions, cos_sin, cache, q, weights):
-    from vllm_xcpu_plugin.layers.sparse_attn_indexer import _indexer_qk_cache
+    from vllm_xcpu_plugin.attention.sparse_attn_indexer import _indexer_qk_cache
 
     rotated, scaled = _indexer_qk_cache(
         q,
@@ -337,7 +337,7 @@ def test_fused_norm_split_views_eager_and_compile(dtype, monkeypatch):
     torch._dynamo.reset()
 
 
-@pytest.mark.parametrize("backend_name", ["dense", "mla"])
+@pytest.mark.parametrize("backend_name", ["dense", "sparse_mla"])
 @pytest.mark.parametrize("block_size", [None, 128])
 def test_platform_selects_block_size_after_backend_selection(
     monkeypatch, backend_name, block_size
@@ -347,15 +347,13 @@ def test_platform_selects_block_size_after_backend_selection(
 
     from vllm.config import CacheConfig, CompilationMode
 
-    from vllm_xcpu_plugin.attn_backend import (
-        XcpuTritonAttentionBackend,
-        XcpuTritonMLABackend,
-    )
+    from vllm_xcpu_plugin.attention.sparse_mla import XcpuMLASparseBackend
+    from vllm_xcpu_plugin.attn_backend import XcpuTritonAttentionBackend
     from vllm_xcpu_plugin.platform import McpuPlatform
 
     backend = {
         "dense": XcpuTritonAttentionBackend,
-        "mla": XcpuTritonMLABackend,
+        "sparse_mla": XcpuMLASparseBackend,
     }[backend_name]
     cache = CacheConfig(block_size=block_size)
     config = SimpleNamespace(

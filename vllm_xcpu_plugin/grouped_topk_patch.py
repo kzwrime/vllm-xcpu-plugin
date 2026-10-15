@@ -3,6 +3,7 @@
 from typing import Any, cast
 
 import torch
+import vllm.envs as envs
 
 
 def _xcpu_grouped_topk(
@@ -79,7 +80,7 @@ def maybe_patch_vllm_grouped_topk() -> None:
         e_score_correction_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device_type = gating_output.device.type
-        if device_type in ("mcpu", "privateuseone"):
+        if device_type in ("mcpu", "privateuseone") and not envs.VLLM_BATCH_INVARIANT:
             return _xcpu_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=gating_output,

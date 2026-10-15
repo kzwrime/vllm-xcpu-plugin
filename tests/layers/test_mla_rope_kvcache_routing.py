@@ -1,176 +1,132 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Exercise the v0.31 OOT MLA path against separate RoPE/cache/projections."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
-from vllm.model_executor.layers.attention import mla_attention
+import torch_mcpu  # noqa: F401
+import torch_xcpu
 
-
-class _Impl:
-    def __init__(self, supported: bool = True) -> None:
-        self.supported = supported
-        self.call_args = None
-
-    def fused_mla_rope_kvcache_supported(self) -> bool:
-        return self.supported
-
-    def fused_mla_rope_qproj_kvcache_supported(self) -> bool:
-        from vllm_xcpu_plugin.flashattn_mla_sparse_patch import (
-            _xcpu_fused_mla_rope_qproj_kvcache_supported,
-        )
-
-        return _xcpu_fused_mla_rope_qproj_kvcache_supported(self)
-
-    def do_fused_mla_rope_kvcache_update(self, *args) -> None:
-        self.call_args = args
-
-    def do_fused_mla_rope_qproj_kvcache_update(self, *args) -> None:
-        self.call_args = args
-
-
-class _Layer:
-    fused_mla_rope_kvcache_supported = (
-        mla_attention.MLAAttention.fused_mla_rope_kvcache_supported
-    )
-    maybe_fused_mla_rope_kvcache_update = (
-        mla_attention.MLAAttention.maybe_fused_mla_rope_kvcache_update
-    )
-    fused_mla_rope_qproj_kvcache_supported = (
-        mla_attention.MLAAttention.fused_mla_rope_qproj_kvcache_supported
-    )
-    maybe_fused_mla_rope_qproj_kvcache_update = (
-        mla_attention.MLAAttention.maybe_fused_mla_rope_qproj_kvcache_update
-    )
-
-    def __init__(self, impl: _Impl) -> None:
-        self.impl = impl
-        self.use_direct_call = True
-        self.use_pcp = False
-        self.calculate_kv_scales = False
-        self.layer_name = "layers.0.attn"
-        self.kv_cache = torch.empty(1)
-        self.kv_cache_dtype = "auto"
-        self._k_scale = torch.ones(1)
-
-
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16", "fp8_ds_mla"])
-def test_qproj_fusion_routes_supported_cache_layouts(monkeypatch, kv_cache_dtype):
-    impl = _Impl()
-    impl.kv_cache_dtype = kv_cache_dtype
-    layer = _Layer(impl)
-    layer.kv_cache_dtype = kv_cache_dtype
-    layer.q_pad_num_heads = None
-    layer.W_UK_T = torch.empty(8, 64, 512)
-    layer.kv_lora_rank = 512
-    layer.qk_rope_head_dim = 64
-    fp8_cache = kv_cache_dtype == "fp8_ds_mla"
-    layer.kv_cache = torch.empty(
-        1,
-        16,
-        656 if fp8_cache else 576,
-        dtype=torch.uint8 if fp8_cache else torch.bfloat16,
-    )
-    slots = torch.arange(2, dtype=torch.int64)
-    monkeypatch.setattr(
-        mla_attention,
-        "get_forward_context",
-        lambda: SimpleNamespace(slot_mapping={layer.layer_name: slots}),
-    )
-
-    out = layer.maybe_fused_mla_rope_qproj_kvcache_update(
-        torch.arange(2, dtype=torch.int64),
-        torch.empty(2, 8, 128),
-        torch.empty(2, 1, 64),
-        torch.empty(2, 512),
-        torch.empty(8, 64),
-        False,
-    )
-
-    assert out is not None and out.shape == (2, 8, 576)
-    assert impl.call_args is not None
-    assert impl.call_args[8] is slots
-    assert impl.call_args[9] == kv_cache_dtype
-    assert impl.call_args[-1] is out
-
-
-@pytest.mark.parametrize(
-    ("attribute", "value"),
-    [
-        ("use_direct_call", False),
-        ("use_pcp", True),
-        ("calculate_kv_scales", True),
-    ],
+from vllm_xcpu_plugin.attention.mla import XcpuMLAAttention
+from vllm_xcpu_plugin.attention.sparse_mla import (
+    XcpuMLASparseBackend,
+    _xcpu_do_kv_cache_update,
+    _xcpu_forward_mqa,
 )
-def test_fused_mla_rope_cache_ignores_non_target_paths(attribute, value) -> None:
-    layer = _Layer(_Impl())
-    setattr(layer, attribute, value)
-    assert not layer.fused_mla_rope_kvcache_supported()
 
 
-def test_fused_mla_rope_cache_requires_backend_opt_in() -> None:
-    layer = _Layer(_Impl(supported=False))
-    assert not layer.fused_mla_rope_kvcache_supported()
-
-
-def test_fused_mla_rope_cache_leaves_shape_validation_to_op(monkeypatch) -> None:
-    impl = _Impl()
-    layer = _Layer(impl)
-    slots = torch.tensor([0, 1], dtype=torch.int64)
-    monkeypatch.setattr(
-        mla_attention,
-        "get_forward_context",
-        lambda: SimpleNamespace(slot_mapping={layer.layer_name: slots}),
+def make_layer(cache_dtype, tokens):
+    layer = XcpuMLAAttention.__new__(XcpuMLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.num_heads, layer.kv_lora_rank = 8, 512
+    layer.qk_nope_head_dim, layer.qk_rope_head_dim, layer.v_head_dim = 192, 64, 256
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.weight = torch.nn.Parameter(
+        torch.randn(8 * (192 + 256), 512, dtype=torch.bfloat16).to("mcpu") / 16,
+        requires_grad=False,
     )
-
-    # Deliberately use dimensions outside the current D576/V512 kernel. The
-    # routing layer must still invoke the backend so its operator can report
-    # the unsupported shape instead of silently selecting the unfused path.
-    positions = torch.arange(2)
-    q_pe = torch.empty(2, 3, 16)
-    k_pe = torch.empty(2, 1, 16)
-    kv_c = torch.empty(2, 32)
-    cos_sin = torch.empty(64, 16)
-
-    assert layer.maybe_fused_mla_rope_kvcache_update(
-        positions, q_pe, k_pe, kv_c, cos_sin, False
+    layer.layer_name = "test.attn"
+    layer.kv_cache_dtype = cache_dtype
+    layer.kv_cache = torch.zeros(
+        (1, 64, 656 if cache_dtype == "fp8_ds_mla" else 576),
+        dtype=torch.uint8 if cache_dtype == "fp8_ds_mla" else torch.bfloat16,
+        device="mcpu",
     )
-    assert impl.call_args is not None
-    assert impl.call_args[0] is q_pe
-    assert impl.call_args[1] is k_pe
-    assert impl.call_args[2] is kv_c
-    assert torch.equal(impl.call_args[7], slots)
-
-
-def test_qproj_plugin_normalizes_explicit_bfloat16_cache(monkeypatch):
-    import torch_xcpu
-
-    from vllm_xcpu_plugin.flashattn_mla_sparse_patch import (
-        _xcpu_do_fused_mla_rope_qproj_kvcache_update,
+    layer._k_scale = torch.ones(1, device="mcpu")
+    layer.use_direct_call = True
+    layer.use_pcp = False
+    layer.pcp_shard_decode_requests = False
+    layer.hisparse_cache = None
+    topk = torch.full((tokens, 2048), -1, dtype=torch.int32)
+    for row in range(tokens):
+        topk[row, : row + 1] = torch.arange(row + 1)
+    layer.impl = SimpleNamespace(
+        is_sparse=True,
+        process_weights_after_loading=lambda dtype: None,
+        kv_cache_dtype=cache_dtype,
+        kv_lora_rank=512,
+        topk_indices_buffer=topk.to("mcpu"),
+        scale=256**-0.5,
     )
+    layer.impl.forward_mqa = MethodType(_xcpu_forward_mqa, layer.impl)
+    layer.impl.do_kv_cache_update = MethodType(_xcpu_do_kv_cache_update, layer.impl)
+    layer.process_weights_after_loading(torch.bfloat16)
+    assert layer.kv_b_proj.weight.numel() == 0
+    return layer
 
-    calls = []
-    monkeypatch.setattr(
-        torch_xcpu.ops,
-        "fused_mla_rope_qproj_cat_cache",
-        lambda *args: calls.append(args),
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
+@pytest.mark.parametrize("tokens", [1, 7])
+def test_fused_sparse_mla_matches_separate_cache_and_projection(
+    monkeypatch, cache_dtype, tokens
+):
+    import vllm.model_executor.layers.attention.mla_attention as upstream
+
+    import vllm_xcpu_plugin.attention.mla as plugin
+
+    torch_xcpu.initialize_runtime()
+    torch.manual_seed(18)
+    layer = make_layer(cache_dtype, tokens)
+    q = torch.randn(tokens, 8, 256, dtype=torch.bfloat16).to("mcpu")
+    kv = torch.randn(tokens, 512, dtype=torch.bfloat16).to("mcpu")
+    k = torch.randn(tokens, 1, 64, dtype=torch.bfloat16).to("mcpu")
+    positions = torch.arange(tokens, dtype=torch.int64, device="mcpu")
+    cache = torch.randn(16, 64, dtype=torch.bfloat16).to("mcpu")
+    starts_cpu = torch.tensor([0, tokens], dtype=torch.int32)
+    starts = starts_cpu.to("mcpu")
+    metadata = SimpleNamespace(
+        num_actual_tokens=tokens,
+        num_decode_tokens=0,
+        query_start_loc=starts,
+        max_query_len=tokens,
+        max_seq_len=tokens,
+        seq_lens=torch.tensor([tokens], dtype=torch.int32, device="mcpu"),
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device="mcpu"),
     )
-    q = torch.empty(2, 8, 128)
-    k = torch.empty(2, 1, 64)
-    _xcpu_do_fused_mla_rope_qproj_kvcache_update(
-        None,
-        q,
-        torch.empty(8, 64, 512),
-        k,
-        torch.empty(2, 512),
-        torch.arange(2),
-        torch.empty(4, 64),
-        False,
-        torch.empty(1, 16, 576),
-        torch.arange(2),
-        "bfloat16",
-        torch.ones(1),
-        torch.empty(2, 8, 576),
+    if cache_dtype == "fp8_ds_mla":
+        metadata.xcpu_backend = torch_xcpu.ops.SparseMlaFp8(8)
+        metadata.xcpu_schedule = metadata.xcpu_backend.build_metadata(
+            starts,
+            tokens,
+            query_start_loc_cpu=starts_cpu,
+            has_prefill=True,
+            kv_slots_hint=tokens,
+        )
+    context = SimpleNamespace(
+        attn_metadata={layer.layer_name: metadata},
+        slot_mapping={layer.layer_name: positions},
     )
-    assert calls[0][-2] == "auto"
-    assert calls[0][2].shape == (2, 64)
+    monkeypatch.setattr(plugin, "get_forward_context", lambda: context)
+    monkeypatch.setattr(upstream, "get_forward_context", lambda: context)
+
+    class Rope:
+        cos_sin_cache = cache
+        is_neox_style = False
+
+        def __call__(self, pos, q_pe, k_pe):
+            torch_xcpu.ops.rotary_embedding(pos, q_pe, k_pe, 64, cache, False)
+            return q_pe, k_pe
+
+    with torch.inference_mode():
+        layer._fuse_rope_cache = False
+        reference = layer.forward_with_rope(
+            q.clone(), kv, k.clone(), positions, Rope(), None
+        ).cpu()
+        expected_cache = layer.kv_cache.cpu().clone()
+        layer.kv_cache.zero_()
+        layer._fuse_rope_cache = True
+        actual = layer.forward_with_rope(
+            q.clone(), kv, k.clone(), positions, Rope(), None
+        ).cpu()
+        actual_cache = layer.kv_cache.cpu()
+    torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_fp8_cache_format_is_scoped_to_xcpu_backend():
+    from vllm.v1.attention.backend import AttentionBackend
+
+    assert XcpuMLASparseBackend.canonicalize_kv_cache_dtype("fp8") == "fp8_ds_mla"
+    assert AttentionBackend.canonicalize_kv_cache_dtype("fp8") == "fp8"
+    assert XcpuMLASparseBackend.canonicalize_kv_cache_dtype("auto") == "auto"

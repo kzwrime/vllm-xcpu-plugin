@@ -6,7 +6,7 @@ The SparseAttnIndexer OOT subclass uses one eager/compile entrypoint.
 The metadata builder publishes runtime state under stable handles, and the
 entrypoint allocates static scratch tensors before invoking C++, which mirrors upstream
 cache insertion, prefill chunks, decode padding, logits and TopK execution.
-The original Python chain remains available for A/B validation.
+The upstream Python chain is used only as a test reference in torch_xcpu.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import functools
 import itertools
 import os
-import sys
 import weakref
 
 import torch
@@ -26,6 +25,11 @@ _metadata_handles = itertools.count(1)
 
 
 def _publish_runtime_metadata(handles, metadata):
+    # UPGRADE: the fields forwarded here are exactly what the C++ mirror of
+    # upstream sparse_attn_indexer() reads (torch_xcpu csrc/sparse_indexer.cpp).
+    # When DeepseekV32IndexerMetadata or its chunk/decode metadata gains,
+    # renames, or changes the meaning of a field, update this function and the
+    # C++ side together, or reject the new mode explicitly as done below.
     chunks: list[torch.Tensor] = []
     info: list[int] = []
     decode_tensors: list[torch.Tensor] = []
@@ -76,11 +80,55 @@ def _install_runtime_metadata_builder():
         DeepseekV32IndexerMetadataBuilder,
     )
 
+    original_init = DeepseekV32IndexerMetadataBuilder.__init__
     original_build = DeepseekV32IndexerMetadataBuilder.build
 
+    @functools.wraps(original_init)
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        from torch_xcpu.ops_defs.sparse_indexer import (
+            get_paged_mqa_logits_metadata_shape,
+        )
+
+        from vllm_xcpu_plugin.attention.sparse_mla import validate_sparse_config
+
+        validate_sparse_config(self.vllm_config)
+        if self.compress_ratio != 1 or self.indexer_uses_fp4:
+            raise NotImplementedError("XCPU indexer requires uncompressed FP8 K cache")
+        self.scheduler_metadata_buffer = torch.empty(
+            get_paged_mqa_logits_metadata_shape(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                self.vllm_config.model_config.max_model_len,
+                self.num_sms,
+            ),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.supports_draft_decode_metadata_update = False
+
+    # UPGRADE: wraps DeepseekV32IndexerMetadataBuilder (__init__ and build).
+    # Re-check on each vLLM upgrade: new metadata fields, the decode
+    # requires_padding rule, the draft-decode update path, and the
+    # seq_lens_cpu_upper_bound semantics assumed below.
     @functools.wraps(original_build)
     def build(self, *args, **kwargs):
         metadata = original_build(self, *args, **kwargs)
+        # v0.31's CPU lengths are upper bounds used only for kernel selection;
+        # device seq_lens remain authoritative for masking and TopK.
+        common = kwargs.get("common_attn_metadata")
+        if common is None:
+            common = args[1]
+        metadata.seq_lens_cpu = common.seq_lens_cpu_upper_bound
+        if metadata.decode is not None:
+            if metadata.decode.indices is not None:
+                raise NotImplementedError(
+                    "XCPU indexer does not support varlen decode indices"
+                )
+            torch.ops.torch_xcpu.get_paged_mqa_logits_metadata_out(
+                metadata.decode.seq_lens,
+                self.kv_cache_spec.num_states,
+                metadata.decode.schedule_metadata,
+            )
         layers = self.vllm_config.compilation_config.static_forward_context
         handles = [
             layers[name]._xcpu_indexer_metadata_handle
@@ -91,11 +139,19 @@ def _install_runtime_metadata_builder():
             _publish_runtime_metadata(handles, metadata)
         return metadata
 
+    DeepseekV32IndexerMetadataBuilder.__init__ = initialize
     DeepseekV32IndexerMetadataBuilder.build = build  # type: ignore[method-assign]
 
 
 def _sparse_attn_indexer(self, hidden_states, q, k, weights):
-    """Shared eager/compile entry; metadata is published before model execution."""
+    """Shared eager/compile entry; metadata is published before model execution.
+
+    UPGRADE: this and the C++ torch_xcpu::sparse_attn_indexer replace
+    vllm.model_executor.layers.sparse_attn_indexer.sparse_attn_indexer(). Any
+    new argument, branch or metadata field upstream must be mirrored there or
+    rejected here with NotImplementedError. The checklist is on top of the C++
+    function; test_indexer_core.py diffs both against the upstream Python.
+    """
     if self.use_pcp or self.dcp_world_size != 1 or self.dcp_rank != 0:
         raise NotImplementedError("XCPU sparse indexer core requires PCP=DCP=1")
     if isinstance(q, tuple) or self.use_fp4_cache:
@@ -157,210 +213,6 @@ def _require_supported_q(q: torch.Tensor, *, topk: int | None = None) -> None:
             "K={512,1024,2048}; got "
             f"H={heads}, D={q.shape[-1]}, K={topk}"
         )
-
-
-def _indexer_k_quant_and_cache(
-    k: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    quant_block_size: int,
-    kv_cache_dtype: str,
-) -> None:
-    import torch_xcpu
-
-    torch_xcpu.ops.indexer_k_quant_and_cache(
-        k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
-    )
-
-
-def _cp_gather_indexer_k_quant_cache(
-    kv_cache: torch.Tensor,
-    dst_k: torch.Tensor,
-    dst_scale: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seq_lens: torch.Tensor,
-) -> None:
-    import torch_xcpu
-
-    torch_xcpu.ops.cp_gather_indexer_k_quant_cache(
-        kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
-    )
-
-
-def _fp8_fp4_mqa_logits(
-    q: tuple[torch.Tensor, torch.Tensor | None],
-    kv: tuple[torch.Tensor, torch.Tensor],
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    clean_logits: bool,
-) -> torch.Tensor:
-    import torch_xcpu
-
-    q_values, q_scale = q
-    k_values, k_scale = kv
-    if q_scale is not None:
-        raise NotImplementedError("XCPU sparse indexer does not support FP4 Q/cache")
-    _require_supported_q(q_values)
-    return torch_xcpu.ops.fp8_fp4_mqa_logits(
-        q_values,
-        k_values,
-        k_scale,
-        weights,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-        clean_logits,
-    )
-
-
-def _top_k_per_row_prefill(
-    logits: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    raw_topk_indices: torch.Tensor,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    topk_tokens: int,
-    seq_lens_cpu: torch.Tensor | None = None,
-) -> None:
-    import torch_xcpu
-
-    torch_xcpu.ops.top_k_per_row_prefill(
-        logits,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-        raw_topk_indices,
-        num_rows,
-        stride0,
-        stride1,
-        topk_tokens,
-        seq_lens_cpu,
-    )
-
-
-def _top_k_per_row_decode(
-    logits: torch.Tensor,
-    next_n: int,
-    seq_lens: torch.Tensor,
-    raw_topk_indices: torch.Tensor,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    topk_tokens: int,
-    seq_lens_cpu: torch.Tensor | None = None,
-) -> None:
-    del next_n
-    import torch_xcpu
-
-    torch_xcpu.ops.top_k_per_row_decode(
-        logits,
-        seq_lens,
-        raw_topk_indices,
-        num_rows,
-        stride0,
-        stride1,
-        topk_tokens,
-        seq_lens_cpu,
-    )
-
-
-def _pack_seq_triton(x, lengths, pad_value=0, block_t=64, block_d=64):
-    if pad_value != 0:
-        raise NotImplementedError("XCPU indexer sequence packing requires zero padding")
-    output = torch.empty(
-        (lengths.numel(), int(lengths.max().item()), *x.shape[1:]),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    torch.ops.torch_xcpu.sparse_indexer_pack_seq(x, lengths, output, False)
-    return output
-
-
-def _unpack_seq_triton(packed_tensor, lengths, block_t=64, block_d=64):
-    output = torch.empty(
-        (int(lengths.sum().item()), *packed_tensor.shape[2:]),
-        dtype=packed_tensor.dtype,
-        device=packed_tensor.device,
-    )
-    torch.ops.torch_xcpu.sparse_indexer_pack_seq(packed_tensor, lengths, output, True)
-    return output
-
-
-def _fp8_fp4_paged_mqa_logits(
-    q: tuple[torch.Tensor, torch.Tensor | None],
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    schedule_metadata: torch.Tensor,
-    max_model_len: int,
-    clean_logits: bool,
-) -> torch.Tensor:
-    import torch_xcpu
-
-    q_values, q_scale = q
-    if q_scale is not None:
-        raise NotImplementedError("XCPU sparse indexer does not support FP4 Q/cache")
-    _require_supported_q(q_values)
-    return torch_xcpu.ops.fp8_fp4_paged_mqa_logits(
-        q_values,
-        kv_cache,
-        weights,
-        context_lens,
-        block_tables,
-        schedule_metadata,
-        max_model_len,
-        clean_logits,
-    )
-
-
-def _fused_indexer_q_rope_quant_glm(
-    positions: torch.Tensor,
-    q: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weights: torch.Tensor,
-    softmax_scale: float,
-    head_scale: float,
-    is_neox: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import torch_xcpu
-
-    return torch_xcpu.ops.fused_indexer_q_rope_quant(
-        positions,
-        q,
-        cos_sin_cache,
-        weights,
-        softmax_scale,
-        head_scale,
-        is_neox,
-        False,
-    )
-
-
-def _fused_indexer_q_rope_quant_deepseek_v4(
-    positions: torch.Tensor,
-    index_q: torch.Tensor,
-    index_q_cos_sin_cache: torch.Tensor,
-    index_weights: torch.Tensor,
-    index_weights_softmax_scale: float,
-    index_weights_head_scale: float,
-    use_fp4: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if use_fp4:
-        raise NotImplementedError("XCPU sparse indexer does not support FP4 Q/cache")
-    import torch_xcpu
-
-    return torch_xcpu.ops.fused_indexer_q_rope_quant(
-        positions,
-        index_q,
-        index_q_cos_sin_cache,
-        index_weights,
-        index_weights_softmax_scale,
-        index_weights_head_scale,
-        False,
-        True,
-    )
 
 
 def _indexer_k_cache(
@@ -558,7 +410,6 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
             verify_upstream_compatibility(("sparse_indexer",))
             XcpuSparseAttnIndexer._upstream_verified = True
         super().__init__(*args, **kwargs)
-        self._xcpu_cpp_core = os.getenv("VLLM_XCPU_CPP_SPARSE_INDEXER", "1") != "0"
         config = get_current_vllm_config()
         spec = config.speculative_config
         next_n = 1 if spec is None else 1 + spec.num_speculative_tokens
@@ -578,8 +429,15 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
             raise NotImplementedError(
                 "XCPU sparse indexer requires float32 or ue8m0 scales"
             )
-        if not self._xcpu_cpp_core:
-            return
+        if (
+            self.compress_ratio != 1
+            or self.candidate_blocks is not None
+            or self.candidate_block_size
+            or self.candidate_write
+        ):
+            raise NotImplementedError(
+                "XCPU indexer does not support compression or candidate filtering"
+            )
         handle = next(_metadata_handles)
         self.k_cache._xcpu_indexer_metadata_handle = handle
         weakref.finalize(
@@ -597,8 +455,6 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
         )
 
     def forward_oot(self, hidden_states, q_quant, k, weights):
-        if not self._xcpu_cpp_core:
-            return super().forward_cuda(hidden_states, q_quant, k, weights)
         return _sparse_attn_indexer(self, hidden_states, q_quant, k, weights)
 
     # custom_ops=["none"] must still use the same supported XCPU implementation.
@@ -609,53 +465,6 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
 XcpuSparseAttnIndexer.name = SparseAttnIndexer.name
 
 
-def _install_python_reference_kernels() -> None:
-    """Legacy A/B path only; the C++ OOT path does not rebind these operators."""
-
-    import vllm._custom_ops as ops
-    import vllm.model_executor.layers.sparse_attn_indexer as indexer_module
-    import vllm.utils.deep_gemm as deep_gemm
-
-    # Exact vLLM operator names used by sparse_attn_indexer().
-    ops.indexer_k_quant_and_cache = _indexer_k_quant_and_cache
-    ops.cp_gather_indexer_k_quant_cache = _cp_gather_indexer_k_quant_cache
-    ops.top_k_per_row_prefill = _top_k_per_row_prefill
-    ops.top_k_per_row_decode = _top_k_per_row_decode
-
-    # Exact DeepGEMM function names imported by sparse_attn_indexer.py.
-    deep_gemm.fp8_fp4_mqa_logits = _fp8_fp4_mqa_logits
-    deep_gemm.fp8_fp4_paged_mqa_logits = _fp8_fp4_paged_mqa_logits
-    indexer_module.fp8_fp4_mqa_logits = _fp8_fp4_mqa_logits
-    indexer_module.fp8_fp4_paged_mqa_logits = _fp8_fp4_paged_mqa_logits
-    indexer_module.pack_seq_triton = _pack_seq_triton
-    indexer_module.unpack_seq_triton = _unpack_seq_triton
-
-    # The two model families expose the same Python function name but differ
-    # in where RoPE lives. Keep that ABI distinction in tiny adapters while a
-    # single XCPU operator owns BF16 RoPE and fixed head scaling (no Q scale).
-    # The patched `quant`/`fp8_fp4` symbols retain upstream names only; tensors
-    # carry BF16 Q all the way to the XCPU logits kernels.
-    indexer_module.fused_indexer_q_rope_quant = _fused_indexer_q_rope_quant_glm
-    glm_module = sys.modules.get("vllm.model_executor.models.deepseek_v2")
-    if glm_module is not None:
-        glm_module.__dict__["fused_indexer_q_rope_quant"] = (
-            _fused_indexer_q_rope_quant_glm
-        )
-    try:
-        import vllm.models.deepseek_v4.common.ops as deepseek_v4_ops
-
-        deepseek_v4_ops.fused_indexer_q_rope_quant = (
-            _fused_indexer_q_rope_quant_deepseek_v4
-        )
-    except ImportError:
-        pass
-    deepseek_v4_attention = sys.modules.get("vllm.models.deepseek_v4.attention")
-    if deepseek_v4_attention is not None:
-        deepseek_v4_attention.__dict__["fused_indexer_q_rope_quant"] = (
-            _fused_indexer_q_rope_quant_deepseek_v4
-        )
-
-
 _integrations_installed = False
 
 
@@ -664,9 +473,6 @@ def maybe_patch_vllm_sparse_attn_indexer() -> None:
     global _integrations_installed
     if _integrations_installed:
         return
-    if os.getenv("VLLM_XCPU_CPP_SPARSE_INDEXER", "1") == "0":
-        _install_python_reference_kernels()
-    else:
-        _install_runtime_metadata_builder()
+    _install_runtime_metadata_builder()
     _install_indexer_preprocessing()
     _integrations_installed = True

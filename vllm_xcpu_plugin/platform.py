@@ -15,6 +15,10 @@ import vllm_xcpu_plugin.envs as envs_xcpu
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEExperts
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+    from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
@@ -31,43 +35,6 @@ class McpuPlatform(Platform):
     dispatch_key: str = "PrivateUse1"
     dist_backend: str = "cpu:gloo,mcpu:mcpu"
     simple_compile_backend: str = "eager"
-
-    @classmethod
-    def supports_sparse_attn_indexer_accelerated_path(cls) -> bool:
-        return True
-
-    @classmethod
-    def supports_sparse_attn_indexer_native_multi_token(cls) -> bool:
-        return True
-
-    @classmethod
-    def get_sparse_attn_indexer_metadata_shape(
-        cls, max_num_requests: int, max_model_len: int, num_sms: int
-    ) -> tuple[int, ...]:
-        from torch_xcpu.ops_defs.sparse_indexer import (
-            get_paged_mqa_logits_metadata_shape,
-        )
-
-        return get_paged_mqa_logits_metadata_shape(
-            max_num_requests, max_model_len, num_sms)
-
-    @classmethod
-    def build_sparse_attn_indexer_metadata(
-        cls,
-        context_lens: torch.Tensor,
-        block_size: int,
-        num_sms: int,
-        output: torch.Tensor,
-    ) -> None:
-        import torch_xcpu  # noqa: F401
-
-        torch.ops.torch_xcpu.get_paged_mqa_logits_metadata_out(
-            context_lens, block_size, output
-        )
-
-    @classmethod
-    def get_sparse_mla_kernel_block_sizes(cls) -> list[int]:
-        return [64, 128]
 
     @classmethod
     def pre_register_and_update(
@@ -118,20 +85,21 @@ class McpuPlatform(Platform):
         num_heads: int | None = None,
     ) -> str:
 
-        if selected_backend:
-            # logger.info("Cannot use %s backend on CPU.", selected_backend)
-            logger.info("Using %s backend on MCPU", selected_backend)
-            if attn_selector_config.use_mla:
-                assert selected_backend == AttentionBackendEnum.TRITON_MLA, (
-                    f"MLA is enabled, but selected backend is {selected_backend}."
+        if attn_selector_config.use_mla:
+            # Only sparse MLA (GLM5.2 DSA) is supported; the backend is fixed.
+            if not attn_selector_config.use_sparse:
+                raise NotImplementedError("MCPU supports sparse MLA (DSA) only")
+            if selected_backend:
+                raise ValueError(
+                    f"MCPU sparse MLA cannot use selected backend {selected_backend}"
                 )
+            logger.info("Using XCPU_MLA_SPARSE backend on MCPU")
+            return "vllm_xcpu_plugin.attention.sparse_mla.XcpuMLASparseBackend"
+
+        if selected_backend:
+            logger.info("Using %s backend on MCPU", selected_backend)
             return selected_backend.get_path()
 
-        if attn_selector_config.use_mla and attn_selector_config.use_sparse:
-            logger.info("Using FLASH_ATTN_MLA_SPARSE backend on MCPU")
-            return AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE.get_path()
-        if attn_selector_config.use_mla:
-            return AttentionBackendEnum.TRITON_MLA.get_path()
         if attn_selector_config.use_sparse:
             raise NotImplementedError(
                 "Non-MLA Sparse Attention is not supported on CPU."
@@ -254,6 +222,44 @@ class McpuPlatform(Platform):
     def support_static_graph_mode(cls) -> bool:
         # CUDA, ROCM, XPU return True
         return False
+
+    @classmethod
+    def select_mxfp4_moe_backend(
+        cls,
+        moe_config: "FusedMoEConfig",
+        activation_key: "QuantKey | None",
+    ) -> "tuple[Mxfp4MoeBackend, type[FusedMoEExperts]]":
+        import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+        from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+            Mxfp4MoeBackend,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp4Static,
+        )
+
+        from vllm_xcpu_plugin.layers.fused_moe.grouped_gemm_experts import (
+            XcpuGroupedGemmExperts,
+        )
+        from vllm_xcpu_plugin.layers.quark_mxfp4 import xcpu_mxfp4_activation_key
+
+        activation_key = xcpu_mxfp4_activation_key(kMxfp4Static, activation_key)
+        activation_format = (
+            mk.FusedMoEActivationFormat.BatchedExperts
+            if moe_config.moe_parallel_config.use_batched_activation_format
+            else mk.FusedMoEActivationFormat.Standard
+        )
+        supported, reason = XcpuGroupedGemmExperts.is_supported_config(
+            XcpuGroupedGemmExperts,
+            moe_config,
+            kMxfp4Static,
+            activation_key,
+            activation_format,
+        )
+        if not supported:
+            raise NotImplementedError(f"XCPU MXFP4 MoE: {reason}")
+        # The CPU enum keeps upstream sizes aligned to the 32-element MXFP4
+        # block; XCPU methods own weight conversion after loading.
+        return Mxfp4MoeBackend.CPU, XcpuGroupedGemmExperts
 
     @classmethod
     def is_cpu(cls) -> bool:

@@ -16,6 +16,11 @@ from vllm.model_executor.layers.quantization.quark.quark_moe import (
 from vllm.model_executor.layers.quantization.quark.schemes.quark_ocp_mx import (
     QuarkOCP_MX,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kMxfp4Dynamic,
+    kMxfp4Static,
+)
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_xcpu_plugin.envs as envs_xcpu
@@ -53,6 +58,25 @@ def should_use_quark_mxfp4_w4a16(
     )
 
 
+def xcpu_mxfp4_activation_key(
+    weight_key: QuantKey | None,
+    activation_key: QuantKey | None,
+) -> QuantKey | None:
+    """Drop MXFP4 activation quantization when W4A16 is forced."""
+    if (
+        force_quark_mxfp4_w4a16()
+        and weight_key == kMxfp4Static
+        and activation_key == kMxfp4Dynamic
+    ):
+        logger.warning_once(
+            "Forcing Quark MXFP4 activations to BF16 W4A16 because %s is enabled",
+            _FORCE_W4A16_ENV,
+            scope="process",
+        )
+        return None
+    return activation_key
+
+
 def _initialize_dummy_e8m0_scale(scale: torch.Tensor) -> None:
     config = get_current_vllm_config_or_none()
     if config is not None and config.load_config.load_format == "dummy":
@@ -64,44 +88,14 @@ def _initialize_dummy_e8m0_scale(scale: torch.Tensor) -> None:
 class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
     """Execute Quark MXFP4 weights with BF16 activations in torch_xcpu."""
 
-    # These attributes are initialized by QuarkOCP_MX, whose imports are
-    # intentionally followed silently by mypy in this plugin.
-    input_dtype: str | None
-    dynamic_mxfp4_quant: bool
-
-    def __init__(
-        self,
-        weight_quant_spec,
-        input_quant_spec,
-        dynamic_mxfp4_quant: bool = False,
-    ):
-        super().__init__(
-            weight_quant_spec,
-            input_quant_spec,
-            dynamic_mxfp4_quant=dynamic_mxfp4_quant,
+    def __init__(self, weight_quant_key, activation_quant_key, scale_block_rows=1):
+        activation_quant_key = xcpu_mxfp4_activation_key(
+            weight_quant_key, activation_quant_key
         )
-        force_w4a16 = (
-            force_quark_mxfp4_w4a16()
-            and self.weight_dtype == "mxfp4"
-            and self.input_dtype == "mxfp4"
+        super().__init__(weight_quant_key, activation_quant_key, scale_block_rows)
+        self._use_xcpu_w4a16 = (
+            weight_quant_key == kMxfp4Static and activation_quant_key is None
         )
-        self._use_xcpu_w4a16 = force_w4a16 or (
-            is_quark_mxfp4_w4a16(self.weight_dtype, self.input_dtype)
-            and not self.dynamic_mxfp4_quant
-        )
-        if force_w4a16:
-            # The checkpoint's packed MXFP4 weights and E8M0 weight scales are
-            # unchanged. Only activation quantization is bypassed so torch_xcpu
-            # consumes BF16 activations through its W4A16 kernels.
-            self.input_quant_spec = None
-            self.input_dtype = None
-            self.dynamic_mxfp4_quant = False
-            logger.warning_once(
-                "Forcing Quark MXFP4 activation quantization off; executing "
-                "packed MXFP4 weights as W4A16 because %s is enabled",
-                _FORCE_W4A16_ENV,
-                scope="process",
-            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self._use_xcpu_w4a16:
@@ -112,6 +106,39 @@ class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
         weight_scale = layer.weight_scale
         assert isinstance(weight_scale, torch.Tensor)
         _initialize_dummy_e8m0_scale(weight_scale)
+        if getattr(layer, "_xcpu_mla_weight_only", False):
+            packed = layer.weight.detach().cpu().to(torch.uint8)
+            codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2).long()
+            lut = torch.tensor(
+                [
+                    0.0,
+                    0.5,
+                    1.0,
+                    1.5,
+                    2.0,
+                    3.0,
+                    4.0,
+                    6.0,
+                    -0.0,
+                    -0.5,
+                    -1.0,
+                    -1.5,
+                    -2.0,
+                    -3.0,
+                    -4.0,
+                    -6.0,
+                ],
+                dtype=torch.float32,
+                device="cpu",
+            )
+            scales = weight_scale.detach().cpu().view(torch.float8_e8m0fnu).float()
+            weight = lut[codes] * scales.repeat_interleave(32, -1)
+            replace_parameter(
+                layer,
+                "weight",
+                weight.to(device=layer.weight.device, dtype=layer.params_dtype),
+            )
+            return
         bias = getattr(layer, "bias", None)
         bias_fp32 = None if bias is None else bias.float().contiguous()
         linear = torch_xcpu.ops.initialize_mxfp4_linear(
@@ -155,11 +182,12 @@ class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
 class XcpuQuarkOCPMXMoEMethod(QuarkOCP_MX_MoEMethod):
     """Keep Quark's W4A16 parameter schema and use XCPU grouped GEMM."""
 
-    def __init__(self, weight_config, input_config, moe):
-        super().__init__(weight_config, input_config, moe)
-        if self.weight_dtype != "mxfp4" or self.input_dtype is not None:
+    def __init__(self, moe, weight_quant_key, activation_quant_key):
+        if weight_quant_key != kMxfp4Static or activation_quant_key is not None:
             raise ValueError("XCPU Quark MXFP4 MoE bridge only supports W4A16")
-        self.mxfp4_backend = Mxfp4MoeBackend.CPU
+        # Backend selection goes through McpuPlatform.select_mxfp4_moe_backend.
+        super().__init__(moe, weight_quant_key, activation_quant_key)
+        # Upstream re-derives experts_cls from the backend enum.
         self.experts_cls = XcpuGroupedGemmExperts
 
     @property

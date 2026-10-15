@@ -364,6 +364,7 @@ class FakeJITFunction:
         self.signature = inspect.signature(fn)
         self._argument_binder = _ArgumentBinder(self.signature)
         self.parameter_names = self._argument_binder.parameter_names
+        self.arg_names = list(self.parameter_names)
         self.source_hash = _source_fingerprint(fn)
         self.signature_hash = _signature_fingerprint(self.signature)
         self.constexpr_names = tuple(

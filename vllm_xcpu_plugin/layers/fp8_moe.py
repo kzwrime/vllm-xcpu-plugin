@@ -27,11 +27,16 @@ from .fused_moe.setup import (
 class XcpuFp8MoEMethod(Fp8MoEMethod):
     """Load upstream FP8 parameters, then resolve and prepack one XCPU plan."""
 
+    # TODO 未来支持该选项，以做到直接加载处理好的权重，而不是每次都重新处理
+    supports_pre_processed_weights = False
+
     def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
         FusedMoEMethodBase.__init__(self, layer.moe_config)
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
+        self.moe_block_shape = self.weight_block_size
+        self.weight_scale_refine = None
         self.weight_scale_name = (
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )

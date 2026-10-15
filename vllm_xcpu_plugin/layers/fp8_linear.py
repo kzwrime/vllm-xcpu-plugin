@@ -101,6 +101,20 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
         params = self._get_layer_params(layer)
         weight_scale = params.block_scale.data.contiguous()
+        if getattr(layer, "_xcpu_mla_weight_only", False):
+            # Preserve [out, in] before native packing; only used at load time.
+            weight = params.weight.detach().cpu().float()
+            scales = weight_scale.detach().cpu().float()
+            bn, bk = self.weight_group_shape
+            weight *= scales.repeat_interleave(bn, 0).repeat_interleave(bk, 1)[
+                : weight.shape[0], : weight.shape[1]
+            ]
+            replace_parameter(
+                layer,
+                params.WEIGHT,
+                weight.to(device=params.weight.device, dtype=layer.params_dtype),
+            )
+            return
 
         layer_bias = getattr(layer, "bias", None)
         # Match the bias passed by vLLM's linear forward methods: deferred

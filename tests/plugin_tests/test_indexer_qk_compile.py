@@ -5,7 +5,7 @@ import torch
 
 
 def _indexer_qk_forward(q, weights, k, weight, bias, positions, cos_sin, cache):
-    from vllm_xcpu_plugin.layers.sparse_attn_indexer import _indexer_qk_cache
+    from vllm_xcpu_plugin.attention.sparse_attn_indexer import _indexer_qk_cache
 
     return _indexer_qk_cache(
         q,
@@ -60,7 +60,9 @@ def test_qk_aot_current_slots_and_reload(monkeypatch, tmp_path):
         )
         q = mcpu_rand(rows, 32, 128).bfloat16()
         kw = mcpu_rand(rows, 160).bfloat16()
-        positions = (torch.arange(rows) % 37).to("mcpu")
+        positions = (torch.arange(rows, dtype=torch.int64, device="cpu") % 37).to(
+            "mcpu"
+        )
         cache = torch.full((2, 64, 132), 0xA5, dtype=torch.uint8, device="mcpu")
         return (
             q,
@@ -162,7 +164,7 @@ def test_qk_profile_no_write_and_reject_capture(monkeypatch):
     )
     q = torch.randn(3, 32, 128).bfloat16().to("mcpu")
     kw = torch.randn(3, 160).bfloat16().to("mcpu")
-    positions = torch.arange(3).to("mcpu")
+    positions = torch.arange(3, dtype=torch.int64, device="cpu").to("mcpu")
     cos_sin = torch.randn(3, 64).bfloat16().to("mcpu")
     cache = torch.full((1, 64, 132), 0xA5, dtype=torch.uint8, device="mcpu")
     before = cache.cpu().clone()

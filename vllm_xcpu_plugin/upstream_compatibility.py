@@ -48,22 +48,41 @@ class UpstreamSourceFile:
     expected_sha256: str
 
 
-# Pin whole files as well as functions: helper changes inside these modules
-# must stop a vLLM upgrade before the XCPU C++ implementation is used.
-# Reviewed 2026-09-30: 2902aaaeb indexer / 23d899fdc metadata, including
-# sliced prefill reuse, native decode padding bounds and seq_lens_cpu hints.
-# 2902aaaeb only skips a redundant clear for fully overwritten XCPU decode rows;
-# the C++ core owns buffer initialization and is unaffected by that change.
+# v0.31 audit: uncompressed FP8 indexer cache, BF16 Q and C++ TopK.
+# New candidate filtering, FP4 cache, CP, speculative varlen decode and HiSparse
+# are explicitly rejected. CPU sequence lengths are upper bounds, not masks.
+# Sparse MLA consumes logical indices on the producer stream; no CUDA side-stream
+# physical-index conversion is used. The outer wrapper retains shared TopK layers.
 UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
-        "2f6336a9ebbfc0a7de6d7e38ba9502bde11b0ee7834d7ca94b3bf973bf9a5cd2",
+        "2282955cf1612f0b46110368fdbcefce60e11bb36204ad5801da47940ca33741",
     ),
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.v1.attention.backends.mla.indexer",
-        "63e799dbe2bccd4d11d97409841858d51249a24f076ee0cf0cea2582e7d468f3",
+        "e601dd278f70d36519e12ccd52aa9de9c85ceafb16ba42e7bdd561110a0b41d9",
+    ),
+    UpstreamSourceFile(
+        "sparse_indexer",
+        "vllm.model_executor.models.deepseek_v2",
+        "e7e9565bf23279972983ba2472fc48e10a472eff2dbb92d4865da681f8e489c9",
+    ),
+    UpstreamSourceFile(
+        "sparse_mla",
+        "vllm.model_executor.layers.mla",
+        "eb159d09c8d00f7ef06ce9cd50821ea0cd54bcfd216d4d5b87d3a8522ea93e89",
+    ),
+    UpstreamSourceFile(
+        "sparse_mla",
+        "vllm.model_executor.layers.attention.mla_attention",
+        "cdaae452880eb06a0c62835c490756e3b14c5827e85e0d3705fbb93bbb12e63b",
+    ),
+    UpstreamSourceFile(
+        "sparse_mla",
+        "vllm.model_executor.layers.attention.sparse_mla_attention",
+        "59b5cc01f45c9a843db53413fcf970acb90d14cef0282115276b055b98d282d2",
     ),
 )
 
@@ -121,24 +140,28 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "sparse_indexer",
         "vllm.model_executor.layers.sparse_attn_indexer",
         "sparse_attn_indexer",
-        "b2335060b3ad702f2dfe8b45eaab48e231ebfb1c1850260ad315c4641c64ec4a",
-        "b3a50a85cd381ff1d1e9130f0decfaf9e97aa7daddc84c4151d55767c8f4fe76",
+        "73eb3bcba9993f6e03398956a4b2776f3b3061dc63484d73f78afc3cc5f61e13",
+        "6fc5720ed074bf65c06c5b66e3ee6382da2e45613a3d20fb9087320aebd223b6",
         "torch.ops.torch_xcpu.sparse_attn_indexer",
-        source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
+        source_version=(
+            "v0.31 GLM5.2 PCP=DCP=1, uncompressed FP8 K, C++ indexer 2026-10-14"
+        ),
         # LayerNameType resolves to str when VLLM_USE_LAYERNAME=0 and to
         # LayerName otherwise. Both are the same source-level annotation.
         alternate_signature_hashes=(
-            "879834c9768957a7395adc410350e41218aa14ad7781c96622112fa3b1633b23",
+            "be5c410bd89f2649615b5c932c6a9ac672ae04255a758574a7d86ed61f9bd534",
         ),
     ),
     _operator(
         "sparse_indexer",
         "vllm.v1.attention.backends.utils",
         "split_decodes_and_prefills",
-        "e0d15f819bc568604d8fc3f3cd3c933992e73823551c17b19b0021157a390570",
+        "21b78ee405f260ca1faf720cac023103e278d378e45b2610f35c99bc265820e1",
         "441a21b245c30963704e4bcc4aa2a1aa4c994b575954c3318efa2b3d045b08e5",
         "torch.ops.torch_xcpu.sparse_attn_indexer",
-        source_version="dev_mcpu_v0.25.1 + XCPU C++ indexer core 2026-09-30",
+        source_version=(
+            "v0.31 GLM5.2 PCP=DCP=1, uncompressed FP8 K, C++ indexer 2026-10-14"
+        ),
     ),
     _operator(
         "attention",
@@ -493,8 +516,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "6b3bee3b297aa826a02b3c994713dcfd70ab3a48eaa1a49dad5bd218125b71b2",
         "torch_xcpu.ops.gumbel_sample",
         source_version=(
-            "v0.31 separate cache source supported; "
-            "upstream=0f8b398158f01fb3"
+            "v0.31 separate cache source supported; upstream=0f8b398158f01fb3"
         ),
     ),
     _operator(
@@ -505,8 +527,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "71178816cc67bbb0cb907fb78b21a22c09f47157e10df2cbd73da766c735f28f",
         "torch_xcpu.ops.gumbel_sample",
         source_version=(
-            "v0.31 separate cache source supported; "
-            "upstream=0f8b398158f01fb3"
+            "v0.31 separate cache source supported; upstream=0f8b398158f01fb3"
         ),
     ),
     _operator(
@@ -534,10 +555,12 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "grouped_topk",
         "vllm.model_executor.layers.fused_moe.router.grouped_topk_router",
         "grouped_topk",
-        "25f175864bd6fa4cf210b00a99810304ac434b1d7bd16ede8fb92481cf62432b",
+        "3063007e0e777337365ac214ce1b17b872ff29ecbb31dea8c190b192cffa3999",
         "4f7fbcf35818ef44b6a629633d8d8145be49b28e7bdb7380e59600957800964f",
         "torch_xcpu.ops.grouped_topk",
-        source_version="v0.19.0",
+        source_version=(
+            "v0.31 grouped routing; sorted batch-invariant path remains native"
+        ),
     ),
     _operator(
         "topk_softmax",

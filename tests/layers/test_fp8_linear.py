@@ -10,6 +10,30 @@ from vllm_xcpu_plugin.layers.fp8_linear import (
 )
 
 
+def test_mla_weight_stays_canonical_with_block_scales():
+    """MLA splits [out, in] weights instead of consuming a packed linear."""
+    layer = torch.nn.Module()
+    layer._xcpu_mla_weight_only = True
+    layer.params_dtype = torch.bfloat16
+    layer.weight = torch.nn.Parameter(
+        torch.ones((3, 5), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale_inv = torch.nn.Parameter(
+        torch.tensor([[1.0, 2.0], [4.0, 8.0]]), requires_grad=False
+    )
+    kernel = object.__new__(XcpuFp8BlockScaledMMLinearKernel)
+    kernel.weight_group_shape = (2, 3)
+
+    kernel.process_weights_after_loading(layer)
+
+    expected = torch.tensor(
+        [[1, 1, 1, 2, 2], [1, 1, 1, 2, 2], [4, 4, 4, 8, 8]],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
+    assert not hasattr(layer, "_xcpu_fp8_linear")
+
+
 @pytest.mark.parametrize("scale_attr", ["weight_scale_inv", "weight_scale"])
 @pytest.mark.parametrize(
     "row_parallel,tp_rank,skip_bias_add,fuse_bias",
@@ -27,7 +51,7 @@ def test_process_weights_uses_initialized_torch_xcpu_operator(
 ):
     import torch_xcpu
 
-    class Layer(RowParallelLinear if row_parallel else torch.nn.Module):
+    class Layer(RowParallelLinear if row_parallel else torch.nn.Module):  # type: ignore[misc]
         def __init__(self):
             torch.nn.Module.__init__(self)
             self.tp_rank = tp_rank
