@@ -16,7 +16,6 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
-from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 
 logger = init_logger(__name__)
 
@@ -211,7 +210,7 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         # back to the ORIGINAL row index (0..num_tokens-1) for reduction.
         # Create a mapping: [0, 0, 1, 1, 2, 2 ...] for topk=2
         original_row_indices = torch.arange(
-            num_tokens, device=device
+            num_tokens, device=device, dtype=torch.int64
         ).repeat_interleave(topk)
         # Reorder this mapping to match the data we are sending
         self._row_indices_restore = original_row_indices[sort_indices]
@@ -275,9 +274,12 @@ class TorchAlltoallSinglePrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular
         # Since recv_topk_ids is now 1D [total_tokens],
         # we treat it as topk=1 for the expert counter
         # The local expert execution will treat these as individual items.
-        expert_num_tokens = count_expert_num_tokens(
-            recv_topk_ids.unsqueeze(1), self.num_local_experts, expert_map
-        )
+        local_ids = recv_topk_ids.long()
+        if expert_map is not None:
+            local_ids = expert_map[local_ids].long()
+        expert_num_tokens = torch.bincount(
+            local_ids[local_ids >= 0], minlength=self.num_local_experts
+        ).to(torch.int32)
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens,
