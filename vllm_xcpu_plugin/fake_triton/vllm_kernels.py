@@ -201,7 +201,7 @@ def _gather_block_tables(launch: KernelLaunch) -> None:
     )
     _expect(args["BLOCK_SIZE"] == 1024, "gather BLOCK_SIZE must be 1024")
     torch.ops.mcpu.vllm_gather_block_tables_kernel(
-        args["batch_idx_to_req_idx"],
+        args["batch_idx_to_req_idx"].to(dtype=torch.int32),
         args["src_block_table_ptrs"],
         args["dst_block_table_ptrs"],
         args["block_table_strides"],
@@ -211,6 +211,28 @@ def _gather_block_tables(launch: KernelLaunch) -> None:
         num_groups,
         num_rows,
     )
+
+
+def _prepare_uniform_decode(launch: KernelLaunch) -> None:
+    args = launch.arguments
+    seq_lens = args["seq_lens_ptr"]
+    decode_seq_lens = args["decode_seq_lens_ptr"]
+    block_table = args["block_table_ptr"]
+    expanded = args["expanded_block_table_ptr"]
+    decode_lens = args["decode_lens_ptr"]
+    n = launch.grid[0]
+    max_len = args["max_decode_len"]
+    idx = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
+    req = idx // max_len
+    decode_seq_lens[:n].copy_(
+        (seq_lens[req] - max_len + idx % max_len + 1).clamp_min(0)
+    )
+    width = args["expanded_bt_stride"]
+    rows = block_table.as_strided(
+        ((n + max_len - 1) // max_len, width), (args["block_table_stride"], 1)
+    )
+    expanded.as_strided((n, width), (width, 1)).copy_(rows[req])
+    decode_lens[:n].fill_(1)
 
 
 def _compute_slot_mappings(launch: KernelLaunch) -> None:
@@ -1557,6 +1579,15 @@ _KERNELS: tuple[
         "cac827ebbf78044d46ae1fb2c2b38f96cb4ef0193ae9e0a6851d9042b5977e70",
         LegacyKernelSource("v0.24.0"),
         _gather_block_tables,
+        (),
+    ),
+    (
+        "vllm.v1.attention.backends.mla.indexer",
+        "PrepareUniformDecodeKernel.kernel",
+        "93d05d2438c0942b7dfafbe6b5ee1e272623a6cf0e639807db1941b36fceab87",
+        "95b5ba6f7ca45f051e30bcaca3ad9da035f576d10c0e701d8b20f8b45fde82c0",
+        LegacyKernelSource("v0.31.0"),
+        _prepare_uniform_decode,
         (),
     ),
     (

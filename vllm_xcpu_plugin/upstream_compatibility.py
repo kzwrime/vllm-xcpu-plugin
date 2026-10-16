@@ -67,7 +67,8 @@ UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.model_executor.models.deepseek_v2",
-        "e7e9565bf23279972983ba2472fc48e10a472eff2dbb92d4865da681f8e489c9",
+        # bb89754cc: replicated indexer projections and [B,1,N,C] cache binding.
+        "5cd8c8883b18cac91979781a8b191703781971d8c59cb9823167cd3e0dfc2408",
     ),
     UpstreamSourceFile(
         "sparse_mla",

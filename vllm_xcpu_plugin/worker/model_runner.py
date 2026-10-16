@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,6 +13,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_xcpu_plugin.envs as envs_xcpu
+from vllm_xcpu_plugin import shared_kv_cache
 
 if TYPE_CHECKING:
     pass
@@ -27,6 +29,7 @@ class McpuModelRunner(GPUModelRunner):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        shared_kv_cache.validate_config(vllm_config)
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
@@ -41,9 +44,57 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        shared_kv_cache.validate_config(vllm_config)
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self._af_forward_allreduce = envs_xcpu.VLLM_XCPU_AF_FORWARD_ALLREDUCE
+
+    def allocate_kv_cache(self, *args, **kwargs):
+        if not shared_kv_cache.enabled():
+            return super().allocate_kv_cache(*args, **kwargs)
+        draft_layers = getattr(self.speculator, "draft_attn_layer_names", ())
+        shared = shared_kv_cache.SharedKVCache(
+            self.vllm_config, self.device, draft_layers
+        )
+        return shared.allocate(*args, **kwargs)
+
+    def _init_kv_zero_meta(self):
+        from vllm.v1.worker.utils import KVBlockZeroer
+
+        shared = shared_kv_cache.runtime()
+        if shared is None or shared.writer:
+            return super()._init_kv_zero_meta()
+        groups = (
+            replace(
+                g, layer_names=[n for n in g.layer_names if n in shared.draft_layers]
+            )
+            for groups in self.attn_groups
+            for g in groups
+        )
+        self.kv_block_zeroer = KVBlockZeroer(
+            self.device,
+            attn_groups_iter=groups,
+            kernel_block_sizes=self.kernel_block_sizes,
+            static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
+        )
+
+    def update_requests(self, scheduler_output):
+        from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
+
+        shared = shared_kv_cache.runtime()
+        if shared is None:
+            return super().update_requests(scheduler_output)
+        # Drain the previous step before blocks are cleared, copied or reused.
+        shared.fence()
+        super().update_requests(replace(scheduler_output, kv_cache_block_copies=[]))
+        caches = self.kv_caches if shared.writer else shared.private_caches
+        copy_kv_cache_blocks_inplace(
+            caches,
+            self.kv_cache_config.num_blocks,
+            scheduler_output.kv_cache_block_copies,
+        )
+        shared.fence()
 
     def execute_model(
         self,

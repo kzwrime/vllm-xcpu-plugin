@@ -20,6 +20,8 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 
+from vllm_xcpu_plugin import shared_kv_cache
+
 # Handles are allocated in model construction order, just like the GDN state.
 _metadata_handles = itertools.count(1)
 
@@ -152,8 +154,8 @@ def _sparse_attn_indexer(self, hidden_states, q, k, weights):
     rejected here with NotImplementedError. The checklist is on top of the C++
     function; test_indexer_core.py diffs both against the upstream Python.
     """
-    if self.use_pcp or self.dcp_world_size != 1 or self.dcp_rank != 0:
-        raise NotImplementedError("XCPU sparse indexer core requires PCP=DCP=1")
+    if self.dcp_world_size != 1 or self.dcp_rank != 0:
+        raise NotImplementedError("XCPU sparse indexer core requires DCP=1")
     if isinstance(q, tuple) or self.use_fp4_cache:
         raise NotImplementedError("XCPU sparse indexer does not support FP4 Q/cache")
     _require_supported_q(q, topk=self.topk_tokens)
@@ -240,6 +242,10 @@ def _indexer_k_cache(
     slots = slot_mappings[prefix]
     import torch_xcpu
 
+    shared = shared_kv_cache.runtime()
+    if shared is not None and not shared.writer:
+        shared_kv_cache.publish(cache)
+        return
     torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
         k,
         weight,
@@ -251,6 +257,9 @@ def _indexer_k_cache(
         eps,
         is_neox,
     )
+
+    if shared is not None:
+        shared_kv_cache.publish(cache)
 
 
 def _indexer_qk_cache(
@@ -283,7 +292,14 @@ def _indexer_qk_cache(
     slot_mappings = forward_context.slot_mapping
     assert isinstance(slot_mappings, dict)
     slots = slot_mappings[prefix]
-    return torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
+    shared = shared_kv_cache.runtime()
+    if shared is not None and not shared.writer:
+        result = torch_xcpu.ops.fused_indexer_q_rope_quant(
+            positions, q, cos_sin, weights, softmax_scale, head_scale, is_neox, False
+        )
+        shared_kv_cache.publish(cache)
+        return result
+    result = torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
         positions,
         q,
         cos_sin,
@@ -298,6 +314,10 @@ def _indexer_qk_cache(
         head_scale,
         is_neox,
     )
+
+    if shared is not None:
+        shared_kv_cache.publish(cache)
+    return result
 
 
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
@@ -354,6 +374,32 @@ def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
                 (k_pe.reshape(-1, self.rope_dim), k[:, self.rope_dim :]), dim=-1
             )
 
+    if self.indexer_op.use_pcp:
+        from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+
+        context = get_forward_context()
+        if context.attn_metadata is not None:
+            metadata = context.attn_metadata[self.k_cache.prefix]
+            slots = context.slot_mapping[self.k_cache.prefix]
+            gathered_k, cache_slots = maybe_gather_indexer_k(
+                k,
+                slots,
+                metadata.num_decode_tokens,
+                True,
+                pcp_shard_decode_requests=self.indexer_op.pcp_shard_decode_requests,
+            )
+            shared = shared_kv_cache.runtime()
+            if shared is None or shared.writer:
+                torch_xcpu.ops.indexer_k_quant_and_cache(
+                    gathered_k,
+                    self.k_cache.kv_cache,
+                    cache_slots,
+                    self.indexer_op.quant_block_size,
+                    self.indexer_op.scale_fmt,
+                )
+            if shared is not None:
+                shared_kv_cache.publish(self.k_cache.kv_cache)
+
     # Let CustomOp dispatch to the registered XCPU OOT implementation.
     return self.indexer_op(hidden_states, q, k, weights)
 
@@ -369,23 +415,23 @@ def _install_indexer_preprocessing() -> None:
     def initialize(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         parallel = self.vllm_config.parallel_config
-        if (
-            parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-        ):
-            raise NotImplementedError(
-                "XCPU DSA indexer preprocessing requires PCP=DCP=1"
-            )
+        if parallel.decode_context_parallel_size != 1:
+            raise NotImplementedError("XCPU DSA indexer preprocessing requires DCP=1")
         if self.head_dim != 128 or self.rope_dim != 64 or self.n_head not in (32, 64):
             raise NotImplementedError(
                 "XCPU DSA indexer requires H={32,64}, D=128, RoPE=64"
             )
-        self._xcpu_fuse_k_cache = os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        self._xcpu_fuse_k_cache = (
+            parallel.prefill_context_parallel_size == 1
+            and os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") != "0"
+        )
         self._xcpu_fuse_qk_cache = (
             self._xcpu_fuse_k_cache
             and os.getenv("VLLM_XCPU_FUSED_INDEXER_QK", "1") != "0"
         )
-        self.indexer_op.skip_k_cache_insert = self._xcpu_fuse_k_cache
+        self.indexer_op.skip_k_cache_insert = (
+            self._xcpu_fuse_k_cache or parallel.prefill_context_parallel_size > 1
+        )
 
     Indexer.__init__ = initialize  # type: ignore[method-assign]
     Indexer.forward = _indexer_forward  # type: ignore[method-assign]
@@ -413,9 +459,9 @@ class XcpuSparseAttnIndexer(SparseAttnIndexer):
         config = get_current_vllm_config()
         spec = config.speculative_config
         next_n = 1 if spec is None else 1 + spec.num_speculative_tokens
-        if self.use_pcp or self.dcp_world_size != 1 or self.use_fp4_cache:
+        if self.dcp_world_size != 1 or self.use_fp4_cache:
             raise NotImplementedError(
-                "XCPU sparse indexer requires PCP=DCP=1 and FP8 cache"
+                "XCPU sparse indexer requires DCP=1 and FP8 cache"
             )
         if config.parallel_config.num_ubatches > 1:
             raise NotImplementedError(

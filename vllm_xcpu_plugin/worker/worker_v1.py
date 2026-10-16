@@ -232,6 +232,10 @@ class McpuWorker(Worker):
         self.init_snapshot = MemorySnapshot(device=self.device)
         logger.info("worker init memory snapshot: %r", self.init_snapshot)
         kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
+        from vllm_xcpu_plugin import shared_kv_cache
+
+        if shared_kv_cache.enabled():
+            kv_cache_space = shared_kv_cache.memory_budget() / GiB_bytes
         assert kv_cache_space is not None
         self.requested_memory = kv_cache_space * GiB_bytes
         # self.requested_memory = request_memory(init_snapshot, self.cache_config)
@@ -264,6 +268,14 @@ class McpuWorker(Worker):
             )
 
     def determine_available_memory(self) -> int:
+        from vllm_xcpu_plugin import shared_kv_cache
+
+        if shared_kv_cache.enabled():
+            budget = shared_kv_cache.memory_budget()
+            requested = self.cache_config.kv_cache_memory_bytes
+            if requested is not None and requested > budget:
+                raise ValueError("kv_cache_memory_bytes exceeds shared KV arena")
+            self.cache_config.kv_cache_memory_bytes = requested or budget
         available_memory = super().determine_available_memory()
 
         if self.vllm_config.compilation_config.mode != CompilationMode.NONE:
@@ -283,7 +295,10 @@ class McpuWorker(Worker):
             torch.accelerator.empty_cache()
 
         kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
-        if kv_cache_space is None:
+        if (
+            kv_cache_space is None
+            or self.cache_config.kv_cache_memory_bytes is not None
+        ):
             return available_memory
 
         kv_cache_space_bytes = kv_cache_space * GiB_bytes
