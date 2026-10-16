@@ -53,10 +53,10 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         if not shared_kv_cache.enabled():
             return super().allocate_kv_cache(*args, **kwargs)
         draft_layers = getattr(self.speculator, "draft_attn_layer_names", ())
-        self.shared_kv = shared_kv_cache.SharedKVCache(
+        shared = shared_kv_cache.SharedKVCache(
             self.vllm_config, self.device, draft_layers
         )
-        return self.shared_kv.allocate(*args, **kwargs)
+        return shared.allocate(*args, **kwargs)
 
     def _init_kv_zero_meta(self):
         from vllm.v1.worker.utils import KVBlockZeroer

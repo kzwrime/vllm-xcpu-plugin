@@ -222,12 +222,17 @@ def _prepare_uniform_decode(launch: KernelLaunch) -> None:
     decode_lens = args["decode_lens_ptr"]
     n = launch.grid[0]
     max_len = args["max_decode_len"]
-    for idx in range(n):
-        req = idx // max_len
-        local = idx % max_len
-        decode_seq_lens[idx] = max(int(seq_lens[req].item()) - max_len + local + 1, 0)
-        expanded[idx, : block_table.shape[1]].copy_(block_table[req])
-        decode_lens[idx] = 1
+    idx = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
+    req = idx // max_len
+    decode_seq_lens[:n].copy_(
+        (seq_lens[req] - max_len + idx % max_len + 1).clamp_min(0)
+    )
+    width = args["expanded_bt_stride"]
+    rows = block_table.as_strided(
+        ((n + max_len - 1) // max_len, width), (args["block_table_stride"], 1)
+    )
+    expanded.as_strided((n, width), (width, 1)).copy_(rows[req])
+    decode_lens[:n].fill_(1)
 
 
 def _compute_slot_mappings(launch: KernelLaunch) -> None:
