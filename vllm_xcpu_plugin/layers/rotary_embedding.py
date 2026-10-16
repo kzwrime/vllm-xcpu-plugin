@@ -6,8 +6,10 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 
-def _rotary_embedding(positions, query, key, head_size, cos_sin_cache,
-                      is_neox, rope_dim_offset=0, inverse=False):
+def _rotary_embedding(
+    positions, query, key, head_size, cos_sin_cache,
+    is_neox, rope_dim_offset=0, inverse=False,
+):
     import torch_xcpu
 
     if rope_dim_offset != 0 or inverse:

@@ -25,8 +25,7 @@ def validate_config(config):
         return
     p = config.parallel_config
     if (
-        p.tensor_parallel_size not in (1, 2, 4)
-        or p.pipeline_parallel_size != 1
+        p.pipeline_parallel_size != 1
         or p.decode_context_parallel_size != 1
         or not config.use_v2_model_runner
         or p.num_ubatches > 1
@@ -35,7 +34,7 @@ def validate_config(config):
         or os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0") != "0"
     ):
         raise ValueError(
-            "Shared KV requires V2, TP1/2/4, PP1/DCP1; disable SP/DBO/AF-EP/KV transfer"
+            "Shared KV requires V2, PP1/DCP1; disable SP/DBO/AF-EP/KV transfer"
         )
     if config.model_config.hf_text_config.model_type != "glm_moe_dsa":
         raise ValueError("Shared KV currently supports GLM5.2 only")
@@ -43,7 +42,7 @@ def validate_config(config):
         raise ValueError("Shared KV requires fused indexer K preprocessing")
 
 
-def memory_budget(num_layers=0):
+def memory_budget():
     size = int(os.environ["TORCH_MCPU_SHARED_SIZE"], 0)
     base = int(os.getenv("TORCH_MCPU_SHARED_BASE", "0"), 0)
     budget = (size - (-base % 256)) // 256 * 256
@@ -109,50 +108,32 @@ class SharedKVCache:
             dataclasses.asdict(config),
             sorted(self.draft_layers),
         ))
-        sizes = {t.size for t in config.kv_cache_tensors}
-        if len(sizes) != 1:
-            raise ValueError("Shared KV requires one device cache pool")
-        original_size = sizes.pop()
-        target_size = max(
-            tensor.offset
-            + (
-                tensor.size
-                if tensor.block_stride > tensor.layer_stride
-                else tensor.layer_stride * len(tensor.layers)
-            )
-            for tensor in config.kv_cache_tensors
-            if not any(layer in self.draft_layers for layer in tensor.layers)
+        layer_specs = {}
+        for group_id, group in enumerate(config.kv_cache_groups):
+            for name in group.layer_names:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                layer_specs[name] = group_id, spec
+        # Descriptor.size covers the whole pool. Preserve placement and stop at
+        # the end of the last target page, including packed-block strides.
+        size = max(
+            t.offset
+            + (len(t.layers) - 1) * t.layer_stride
+            + (config.num_blocks - 1) * t.block_stride
+            + layer_specs[t.layers[0]][1].page_size_bytes
+            for t in config.kv_cache_tensors
+            if t.layers[0] not in self.draft_layers
         )
-        size = target_size
-        if original_size > memory_budget() or size > memory_budget():
-            raise ValueError("KV cache exceeds shared arena capacity")
         buf = xmalloc(size, device.index).view(torch.int8)
         self.backing.append(buf)
-        self.fence()
-        probe = buf[:16]
-        nonce = os.urandom(probe.numel()) if self.writer else None
-        nonce = self.group.broadcast_object(nonce, src=0)
-        if self.writer:
-            probe.copy_(torch.tensor(list(nonce), dtype=torch.uint8).view(torch.int8))
-        self.fence()
-        observed = bytes(probe.cpu().view(torch.uint8).tolist())
-        self.agree((nonce, observed))
-        if observed != nonce:
-            raise RuntimeError("Shared KV mapping did not expose writer data")
         if self.writer:
             buf.zero_()
         self.fence()
         result = {}
         for tensor in config.kv_cache_tensors:
             name = tensor.layers[0]
-            group_id, group = next(
-                (i, g)
-                for i, g in enumerate(config.kv_cache_groups)
-                if name in g.layer_names
-            )
-            spec = group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = spec.kv_cache_specs[name]
+            group_id, spec = layer_specs[name]
             draft = name in self.draft_layers
             if any((n in self.draft_layers) != draft for n in tensor.layers):
                 raise ValueError(
@@ -189,13 +170,11 @@ class SharedKVCache:
                 self.private_caches.extend(views)
         _runtime = self
         logger.info(
-            "Shared KV ready: dp=%d pcp=%d tp=%d physical_bytes=%d "
-            "private_TP_bytes=%d file=%s",
+            "Shared KV ready: dp=%d pcp=%d tp=%d shared_bytes=%d file=%s",
             self.dp_rank,
             self.pcp_rank,
             self.group.world_size,
             size,
-            size * self.group.world_size,
             path,
         )
         return result

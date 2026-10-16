@@ -20,7 +20,7 @@ def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, compiled):
         OMP_NUM_THREADS="1",
         MKL_NUM_THREADS="1",
         OPENBLAS_NUM_THREADS="1",
-            TORCH_MCPU_SHARED_SIZE="1048576",
+        TORCH_MCPU_SHARED_SIZE="164352",
         TORCH_MCPU_SHARED_SIM_FILE=str(tmp_path / "cache"),
         SHARED_TEST_PACKED=str(int(packed)),
         SHARED_TEST_TP=str(tp),
@@ -99,12 +99,6 @@ def _worker(rank, rendezvous):
         barrier=lambda: dist.barrier(group=group),
     )
 
-    def broadcast_object(value, src=0):
-        values = [value]
-        dist.broadcast_object_list(values, src=(rank // tp) * tp + src, group=group)
-        return values[0]
-
-    coordinator.broadcast_object = broadcast_object
     vllm.distributed.get_tp_group = lambda: coordinator
     vllm.distributed.get_pcp_group = lambda: SimpleNamespace(rank_in_group=0)
     cache_config = KVCacheConfig(
@@ -141,14 +135,14 @@ def _worker(rank, rendezvous):
         stride = 64 * (576 * 2 + 132)
         cache_config.kv_cache_tensors = [
             KVCacheTensor(
-                4 * stride,
+                2 * stride,
                 ["mla"],
                 layer_stride=64 * 576 * 2,
                 offset=0,
                 block_stride=stride,
             ),
             KVCacheTensor(
-                4 * stride,
+                2 * stride,
                 ["indexer"],
                 layer_stride=64 * 132,
                 offset=64 * 576 * 2,
@@ -208,9 +202,7 @@ def _worker(rank, rendezvous):
     cos_sin = torch.randn(32, 64).bfloat16().to("mcpu")
     slots = torch.zeros(1, dtype=torch.int64, device="mcpu")
     positions = torch.zeros(1, dtype=torch.int64, device="mcpu")
-    context = SimpleNamespace(
-        attn_metadata={}, slot_mapping={"indexer": slots}
-    )
+    context = SimpleNamespace(attn_metadata={}, slot_mapping={"indexer": slots})
     indexer.get_forward_context = lambda: context
     k_cache = indexer._indexer_k_cache
     qk_cache = indexer._indexer_qk_cache

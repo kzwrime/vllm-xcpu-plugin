@@ -63,6 +63,26 @@ _cache_draft_logits_kernel[(2,)](
     BLOCK_K=2,
     num_warps=1,
 )
+
+from vllm.v1.attention.backends.mla.indexer import PrepareUniformDecodeKernel
+seq_lens = torch.tensor([10, 0], dtype=torch.int32, device="mcpu")
+table = torch.arange(12, dtype=torch.int32, device="mcpu").view(2, 6)[:, :4]
+expanded = torch.full((14, 4), -1, dtype=torch.int32, device="mcpu")
+decode_seq_lens = torch.full((14,), -1, dtype=torch.int32, device="mcpu")
+decode_lens = torch.full((14,), -1, dtype=torch.int32, device="mcpu")
+PrepareUniformDecodeKernel()(
+    seq_lens, decode_seq_lens, table, expanded, decode_lens,
+    num_decode_tokens=12, max_decode_len=6,
+)
+torch.testing.assert_close(
+    decode_seq_lens.cpu(), torch.tensor([5, 6, 7, 8, 9, 10] + [0] * 6 + [-1] * 2,
+                                      dtype=torch.int32),
+)
+torch.testing.assert_close(expanded.cpu()[:12], table.cpu().repeat_interleave(6, 0))
+assert (expanded.cpu()[12:] == -1).all()
+torch.testing.assert_close(
+    decode_lens.cpu(), torch.tensor([1] * 12 + [-1] * 2, dtype=torch.int32),
+)
 torch.mcpu.synchronize()
 print(json.dumps({
     "tokens": tokens.cpu().tolist(),
