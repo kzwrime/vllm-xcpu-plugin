@@ -9,6 +9,8 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_xcpu_plugin import shared_kv_cache
+
 
 class XcpuMLAAttention(MLAAttention):
     def __init__(self, *args, **kwargs):
@@ -28,6 +30,8 @@ class XcpuMLAAttention(MLAAttention):
         output_shape = (q.shape[0], self.num_heads * self.v_head_dim)
         if (
             not self._fuse_rope_cache
+            or self.use_pcp
+            or shared_kv_cache.enabled()
             or metadata is None
             or slots is None
             or self.kv_cache.numel() == 0
