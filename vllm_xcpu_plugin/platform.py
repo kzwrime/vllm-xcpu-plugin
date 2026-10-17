@@ -185,6 +185,14 @@ class McpuPlatform(Platform):
 
             configure_attention_model_loader(vllm_config.load_config)
 
+            from vllm_xcpu_plugin.af_ep.common import apply_default_af_ep_backend
+
+            if apply_default_af_ep_backend(parallel_config):
+                logger.info(
+                    "AF-EP: --all2all-backend not set, using %s",
+                    parallel_config.all2all_backend,
+                )
+
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from ..common import AF_EP_BACKENDS, DEFAULT_AF_EP_BACKEND
 from .weights import RoutedExpertsWeightLoader, WeightLoadAudit
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ class RoutedExpertsModel(torch.nn.Module):
         ep_rank: int,
         max_num_tokens: int,
         device: torch.device | str = "mcpu",
-        all2all_backend: str = "mpi_alltoallv_v7",
+        all2all_backend: str = DEFAULT_AF_EP_BACKEND,
     ) -> None:
         super().__init__()
         model_config = vllm_config.model_config
@@ -49,7 +50,7 @@ class RoutedExpertsModel(torch.nn.Module):
         if max_num_tokens <= 0:
             raise ValueError("max_num_tokens must be positive")
 
-        if all2all_backend not in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
+        if all2all_backend not in AF_EP_BACKENDS:
             raise ValueError(f"unsupported AF-EP backend: {all2all_backend}")
         self.all2all_backend = all2all_backend
         self.num_layers = config.num_hidden_layers

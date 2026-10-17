@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..common import AF_EP_BACKENDS, DEFAULT_AF_EP_BACKEND
+
 
 @dataclass(frozen=True)
 class ExpertServiceOptions:
@@ -14,10 +16,10 @@ class ExpertServiceOptions:
     load_format: str = "auto"
     trust_remote_code: bool = False
     compile_model: bool = False
-    all2all_backend: str = "mpi_alltoallv_v7"
+    all2all_backend: str = DEFAULT_AF_EP_BACKEND
 
     def __post_init__(self) -> None:
-        if self.all2all_backend not in ("mpi_alltoallv_v7", "mpi_alltoallv_v8"):
+        if self.all2all_backend not in AF_EP_BACKENDS:
             raise ValueError(f"unsupported AF-EP backend: {self.all2all_backend}")
         if self.max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive")

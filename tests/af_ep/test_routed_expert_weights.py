@@ -213,6 +213,37 @@ def test_platform_selects_attention_loader_only_for_afd(
     assert load_config.load_format == expected
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected", "changed"),
+    [
+        (None, "mpi_alltoallv_v8", True),
+        ("mpi_alltoallv_v7", "mpi_alltoallv_v7", False),
+        ("mpi_alltoallv_v8", "mpi_alltoallv_v8", False),
+        ("mpi_alltoallv_v6", "mpi_alltoallv_v6", False),
+    ],
+)
+def test_af_ep_backend_defaults_to_v8(configured, expected, changed):
+    from vllm.config import ParallelConfig
+
+    from vllm_xcpu_plugin.af_ep.common import apply_default_af_ep_backend
+    from vllm_xcpu_plugin.af_ep.moe.__main__ import parse_args
+    from vllm_xcpu_plugin.af_ep.moe.runner import ExpertServiceOptions
+
+    parallel_config = ParallelConfig()
+    if configured is not None:
+        parallel_config.all2all_backend = configured
+    assert apply_default_af_ep_backend(parallel_config) is changed
+    assert parallel_config.all2all_backend == expected
+
+    # F rank without --all2all-backend must agree with the A-side default.
+    argv = ["af_ep.moe", "--model", "m", "--max-num-batched-tokens", "8"]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("sys.argv", argv)
+        assert parse_args().all2all_backend == "mpi_alltoallv_v8"
+    options = ExpertServiceOptions(model="m", revision=None, max_num_batched_tokens=8)
+    assert options.all2all_backend == "mpi_alltoallv_v8"
+
+
 def test_expert_loader_reads_only_local_expert_weights(tmp_path, default_vllm_config):
     """F skips other ranks' routed weight tensors before reading them."""
     from types import SimpleNamespace

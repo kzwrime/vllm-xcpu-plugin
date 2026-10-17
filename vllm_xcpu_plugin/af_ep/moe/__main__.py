@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from ..common import AF_EP_BACKENDS, DEFAULT_AF_EP_BACKEND
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="XCPU AF-EP expert service")
@@ -11,8 +13,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision")
     parser.add_argument(
         "--all2all-backend",
-        choices=("mpi_alltoallv_v7", "mpi_alltoallv_v8"),
-        default="mpi_alltoallv_v7",
+        choices=AF_EP_BACKENDS,
+        default=DEFAULT_AF_EP_BACKEND,
     )
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
     parser.add_argument(
