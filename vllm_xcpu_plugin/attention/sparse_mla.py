@@ -131,9 +131,16 @@ def validate_sparse_config(config):
         raise NotImplementedError("XCPU sparse MLA requires PCP=DCP=1")
     if config.attention_config.hisparse_config is not None:
         raise NotImplementedError("XCPU sparse MLA does not support HiSparse")
-    if config.speculative_config is not None:
+    # DFlash/DFlash2 drafts are dense and use the ordinary attention backend;
+    # sparse MLA only sees target verification, which the indexer runs on the
+    # flattened decode path (next_n = 1 + k) mirrored by torch_xcpu. Drafts
+    # that run sparse MLA themselves (MTP) need the draft-decode metadata
+    # update path, which is not implemented.
+    spec = config.speculative_config
+    if spec is not None and spec.method != "dflash":
         raise NotImplementedError(
-            "XCPU v0.31 sparse MLA speculative decoding is not validated"
+            f"XCPU v0.31 sparse MLA supports only DFlash speculative decoding, "
+            f"got {spec.method!r}"
         )
     if parallel.num_ubatches > 1:
         raise NotImplementedError("XCPU sparse MLA does not support ubatching/DBO")

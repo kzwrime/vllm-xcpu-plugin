@@ -176,6 +176,15 @@ class McpuPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_xcpu_plugin.worker.worker_v1.McpuWorker"
 
+        # The F service builds its own VllmConfig without vLLM EP; only A ranks
+        # need the loader that drops remote expert tensors.
+        if envs_xcpu.VLLM_XCPU_ENABLE_AF_EP and parallel_config.enable_expert_parallel:
+            from vllm_xcpu_plugin.af_ep.attn.model_loader import (
+                configure_attention_model_loader,
+            )
+
+            configure_attention_model_loader(vllm_config.load_config)
+
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 

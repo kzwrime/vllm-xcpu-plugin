@@ -21,8 +21,33 @@ class AttentionSupport:
     enable_eplb: bool = False
     fuse_shared_experts: bool = False
     enable_lora: bool = False
-    speculative_configured: bool = False
+    speculative_moe_draft: bool = False
     multimodal: bool = False
+
+
+def _routed_expert_count(hf_config: Any) -> Any:
+    num_experts = getattr(hf_config, "num_experts", None)
+    if num_experts is None:
+        num_experts = getattr(hf_config, "n_routed_experts", None)
+    return num_experts
+
+
+def _speculative_moe_draft(speculative_config: Any) -> bool:
+    """A routed-MoE draft would need F-side experts; dense drafts stay on A.
+
+    MTP drafts reuse target MoE layers past num_hidden_layers, which F does
+    not load. DFlash/DFlash2/EAGLE drafts are dense and only consume target
+    hidden states, so every target forward still enters F once per layer.
+    """
+    if speculative_config is None:
+        return False
+    if speculative_config.method == "mtp":
+        return True
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    if draft_model_config is None:
+        return False
+    num_experts = _routed_expert_count(draft_model_config.hf_text_config)
+    return isinstance(num_experts, int) and num_experts > 0
 
 
 def support_from_vllm(vllm_config: Any) -> AttentionSupport:
@@ -30,9 +55,7 @@ def support_from_vllm(vllm_config: Any) -> AttentionSupport:
     parallel = vllm_config.parallel_config
     model = vllm_config.model_config
     hf_config = model.hf_text_config
-    num_experts = getattr(hf_config, "num_experts", None)
-    if num_experts is None:
-        num_experts = getattr(hf_config, "n_routed_experts", None)
+    num_experts = _routed_expert_count(hf_config)
     if not isinstance(num_experts, int) or num_experts <= 0:
         raise ValueError("AF-EP requires a routed MoE model")
 
@@ -62,7 +85,7 @@ def support_from_vllm(vllm_config: Any) -> AttentionSupport:
         enable_eplb=parallel.enable_eplb,
         fuse_shared_experts=bool(vllm_envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS),
         enable_lora=vllm_config.lora_config is not None,
-        speculative_configured=vllm_config.speculative_config is not None,
+        speculative_moe_draft=_speculative_moe_draft(vllm_config.speculative_config),
         multimodal=multimodal,
     )
 
@@ -92,7 +115,7 @@ def validate_attention_support(
         "EPLB": support.enable_eplb,
         "shared-expert fusion": support.fuse_shared_experts,
         "LoRA": support.enable_lora,
-        "speculative decoding": support.speculative_configured,
+        "speculative decoding with a routed-MoE draft": support.speculative_moe_draft,
         "multimodal input": support.multimodal,
     }
     failures.extend(

@@ -520,3 +520,45 @@ print('bad words and logprobs: 3 dtypes passed')
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_indexer_uniform_decode_flattens_spec_verify_rows():
+    """DFlash/MTP verification: each request becomes next_n single-token rows."""
+    repo = Path(__file__).parents[2]
+    code = """
+import torch
+from vllm.v1.attention.backends.mla.indexer import _PREPARE_UNIFORM_DECODE_KERNEL
+from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+register_vllm_kernels()
+def t(data): return torch.tensor(data, dtype=torch.int32, device='mcpu')
+
+next_n, width = 3, 4
+# Request 2 is a padding request (seq_len 0); request 1 is shorter than next_n.
+seq_lens = t([10, 2, 0, 7])
+block_table = t([[1, 2, 3, 4], [5, 6, 7, 8], [0, 0, 0, 0], [9, 10, 11, 12],
+                 [99, 99, 99, 99]])[:4]
+decode_seq_lens = t([-7] * 16)
+expanded = t([[-7] * width] * 16)
+decode_lens = t([-7] * 16)
+_PREPARE_UNIFORM_DECODE_KERNEL(
+    seq_lens, decode_seq_lens, block_table, expanded, decode_lens, 12, next_n)
+assert decode_seq_lens.cpu().tolist() == (
+    [8, 9, 10, 0, 1, 2, 0, 0, 0, 5, 6, 7] + [-7] * 4)
+assert expanded.cpu().tolist() == (
+    [[1, 2, 3, 4]] * 3 + [[5, 6, 7, 8]] * 3 + [[0] * 4] * 3
+    + [[9, 10, 11, 12]] * 3 + [[-7] * 4] * 4)
+assert decode_lens.cpu().tolist() == [1] * 12 + [-7] * 4
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo,
+        timeout=120,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(repo),
+            "VLLM_PLUGINS": "xcpu_platform_plugin",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

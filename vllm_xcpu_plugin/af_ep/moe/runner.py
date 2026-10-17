@@ -72,9 +72,7 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
 
     assert mpi_world.cluster_type == ClusterType.MOE
     session_type = (
-        AfV8Session
-        if options.all2all_backend == "mpi_alltoallv_v8"
-        else AfV7Session
+        AfV8Session if options.all2all_backend == "mpi_alltoallv_v8" else AfV7Session
     )
     session = session_type(
         mpi_world,
@@ -104,6 +102,7 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
         all2all_backend=options.all2all_backend,
     )
     loader = get_model_loader(load_config)
+    restrict_loader_to_local_experts(loader, model.local_expert_ids())
     with set_current_vllm_config(vllm_config):
         loader.load_weights(model, model_config)
     if options.load_format == "dummy":
@@ -125,6 +124,28 @@ def _load_expert_service(options: ExpertServiceOptions, mpi_world):
     print(f"AF-EP F{session.role_rank} execution mode: {execution_mode}", flush=True)
     service.initialize()
     return service
+
+
+def restrict_loader_to_local_experts(loader, local_expert_ids) -> None:
+    """Skip other F ranks' routed weights before reading them from disk.
+
+    F's VllmConfig does not enable vLLM EP, so DefaultModelLoader would read
+    every expert and RoutedExpertsWeightLoader would discard the remote ones.
+    Reuse vLLM's EP weight filter with this rank's shard instead; scale tensors
+    and non-safetensors formats still arrive and are classified as remote.
+    """
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    if not isinstance(loader, DefaultModelLoader):
+        return
+    local = frozenset(local_expert_ids)
+
+    def init_ep_weight_filter(model_config) -> None:
+        del model_config
+        loader.local_expert_ids = set(local)
+
+    # load_weights() recomputes the filter from the parallel config first.
+    loader._init_ep_weight_filter = init_ep_weight_filter
 
 
 def _join_mpi_world():

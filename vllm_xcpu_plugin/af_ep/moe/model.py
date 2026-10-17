@@ -90,8 +90,15 @@ class RoutedExpertsModel(torch.nn.Module):
         return tuple(layer.load_weights([(relative_name, weight)]))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm.model_executor.models.utils import skip_spec_layers
+
         if self._weights_finalized:
             raise RuntimeError("AF-EP F-side weights cannot be hot reloaded")
+        # GLM/DeepSeek checkpoints carry MTP layers past num_hidden_layers;
+        # their experts belong to the MTP head, not to this F service.
+        weights = skip_spec_layers(
+            weights, self._vllm_config.model_config.hf_text_config
+        )
         audit = RoutedExpertsWeightLoader(self).load(weights)
         self._process_weights_after_loading()
         self.weight_audit = audit

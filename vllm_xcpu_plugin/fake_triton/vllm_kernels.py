@@ -317,6 +317,74 @@ def _build_indexer_prefill_chunk_metadata(launch: KernelLaunch) -> None:
     )
 
 
+def _prepare_indexer_uniform_decode(launch: KernelLaunch) -> None:
+    """Flatten uniform multi-token decode into single-token indexer rows.
+
+    Row ``i = r * max_decode_len + j`` attends to
+    ``max(seq_lens[r] - max_decode_len + j + 1, 0)`` keys (padding requests
+    have seq_len 0), copies request ``r``'s block-table row and gets
+    ``decode_lens[i] = 1``. Rows past the grid are left to the caller, which
+    zeroes the tail of decode_seq_lens. Metadata only, composed from ATen ops
+    on the launch stream.
+    """
+    args = launch.arguments
+    num_tokens = launch.grid[0]
+    _expect_grid(launch, (num_tokens,))
+    _expect(args["BLOCK_SIZE"] == 1024, "uniform decode BLOCK_SIZE must be 1024")
+    max_decode_len = args["max_decode_len"]
+    _expect(max_decode_len > 0, "max_decode_len must be positive")
+    _expect(
+        num_tokens % max_decode_len == 0,
+        "uniform decode grid must be a whole number of requests",
+    )
+    seq_lens = args["seq_lens_ptr"]
+    decode_seq_lens = args["decode_seq_lens_ptr"]
+    block_table = args["block_table_ptr"]
+    expanded = args["expanded_block_table_ptr"]
+    decode_lens = args["decode_lens_ptr"]
+    num_reqs = num_tokens // max_decode_len
+    for name, tensor in (
+        ("seq_lens", seq_lens),
+        ("decode_seq_lens", decode_seq_lens),
+        ("block_table", block_table),
+        ("expanded_block_table", expanded),
+        ("decode_lens", decode_lens),
+    ):
+        _expect(tensor.dtype == torch.int32, f"{name} must be int32")
+    _expect(block_table.ndim == 2 and expanded.ndim == 2, "block tables must be 2D")
+    _expect(
+        block_table.stride(0) == args["block_table_stride"]
+        and expanded.stride(0) == args["expanded_bt_stride"],
+        "uniform decode block-table strides disagree with the launch",
+    )
+    _expect(
+        block_table.stride(1) == 1 and expanded.stride(1) == 1,
+        "uniform decode block tables need unit column stride",
+    )
+    # The GPU kernel copies expanded_bt_stride entries from each source row;
+    # only equal widths keep that copy inside the request's own row.
+    _expect(
+        block_table.shape[1] == expanded.shape[1] == expanded.stride(0),
+        "uniform decode requires equal source/expanded block-table widths",
+    )
+    _expect(
+        seq_lens.numel() >= num_reqs
+        and block_table.shape[0] >= num_reqs
+        and min(decode_seq_lens.numel(), decode_lens.numel(), expanded.shape[0])
+        >= num_tokens,
+        "uniform decode buffers are smaller than the launch",
+    )
+    if num_tokens == 0:
+        return
+    local = torch.arange(max_decode_len, dtype=torch.int32, device=seq_lens.device)
+    per_token = seq_lens[:num_reqs].unsqueeze(1) - max_decode_len + 1 + local
+    decode_seq_lens[:num_tokens].copy_(per_token.clamp_min(0).reshape(-1))
+    expanded[:num_tokens].copy_(
+        block_table[:num_reqs].repeat_interleave(max_decode_len, dim=0)
+    )
+    decode_lens[:num_tokens].fill_(1)
+
+
 def _combine_sampled_and_draft(launch: KernelLaunch) -> None:
     args = launch.arguments
     _expect_grid(launch, (args["idx_mapping_ptr"].numel(),))
@@ -1575,6 +1643,19 @@ _KERNELS: tuple[
         "32c266857225077009d2181fc4e291b34645db43cfa35b77e4d5b34eceb6ec03",
         LegacyKernelSource("v0.25.0"),
         _build_indexer_prefill_chunk_metadata,
+        (),
+    ),
+    (
+        "vllm.v1.attention.backends.mla.indexer",
+        "PrepareUniformDecodeKernel.kernel",
+        "93d05d2438c0942b7dfafbe6b5ee1e272623a6cf0e639807db1941b36fceab87",
+        "95b5ba6f7ca45f051e30bcaca3ad9da035f576d10c0e701d8b20f8b45fde82c0",
+        KernelSource(
+            tag="v0.31.0",
+            local_commit="dbb08efac200d11d7666ff4ceb7a9f62d07a733f",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _prepare_indexer_uniform_decode,
         (),
     ),
     (

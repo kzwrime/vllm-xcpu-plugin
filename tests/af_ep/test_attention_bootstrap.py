@@ -80,6 +80,69 @@ def test_attention_accepts_compile_and_rejects_graph_capture():
         validate_attention_support(2, support_from_vllm(config))
 
 
+@pytest.mark.parametrize(
+    "speculative_config,accepted",
+    [
+        # DFlash/DFlash2: dense draft on A, target forward unchanged for F.
+        (
+            SimpleNamespace(
+                method="dflash",
+                draft_model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(intermediate_size=16)
+                ),
+            ),
+            True,
+        ),
+        (SimpleNamespace(method="ngram", draft_model_config=None), True),
+        # MTP reuses target MoE layers that F never loads.
+        (
+            SimpleNamespace(
+                method="mtp",
+                draft_model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(n_routed_experts=8)
+                ),
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                method="eagle3",
+                draft_model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(num_experts=8)
+                ),
+            ),
+            False,
+        ),
+    ],
+)
+def test_attention_accepts_only_dense_speculative_drafts(speculative_config, accepted):
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            world_size_across_dp=1,
+            enable_dbo=False,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_eplb=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(n_routed_experts=8),
+            dtype=torch.bfloat16,
+            quantization="fp8",
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        lora_config=None,
+        speculative_config=speculative_config,
+    )
+    if accepted:
+        validate_attention_support(2, support_from_vllm(config))
+    else:
+        with pytest.raises(ValueError, match="routed-MoE draft"):
+            validate_attention_support(2, support_from_vllm(config))
+
+
 @pytest.mark.parametrize("version", [7, 8])
 def test_bootstrap_selects_requested_transport(monkeypatch, make_af_session, version):
     from vllm_xcpu_plugin.af_ep.attn import bootstrap

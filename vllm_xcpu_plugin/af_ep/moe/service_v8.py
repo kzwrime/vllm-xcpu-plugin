@@ -147,11 +147,17 @@ class ExpertServiceV8:
 
     def _prepare_layer(self, layer_idx: int) -> _ExpertLayer:
         layer = cast("XcpuRoutedExperts", self.model.routed_experts[str(layer_idx)])
-        if layer.expert_map is None:
+        if layer.expert_map is not None:
+            expert_map = layer.expert_map.to(
+                device=self.model.device, dtype=torch.int32
+            ).contiguous()
+        elif self.model.ep_size == 1:
+            # vLLM builds no map when one rank owns every expert (EP1, A*/F1).
+            expert_map = torch.arange(
+                self.model.num_experts, dtype=torch.int32, device=self.model.device
+            )
+        else:
             raise ValueError("AF experts require a global-to-local expert map")
-        expert_map = layer.expert_map.to(
-            device=self.model.device, dtype=torch.int32
-        ).contiguous()
         backend = self.model.fused_moe_for_layer(layer_idx)
         params = backend.params
         if (
