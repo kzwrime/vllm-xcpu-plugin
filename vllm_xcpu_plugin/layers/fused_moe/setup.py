@@ -90,6 +90,7 @@ def install_fused_moe(
             max_num_tokens=prepare_finalize.max_moe_tokens_per_rank,
             topk=method.moe.experts_per_token,
         )
+        layer._xcpu_ep_experts.initialize_windows()
         method.moe_kernel = XcpuEPKernelAdapter(
             prepare_finalize, experts, layer._xcpu_ep_experts
         )

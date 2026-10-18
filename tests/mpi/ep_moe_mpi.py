@@ -462,6 +462,8 @@ def run(
     # Finish the unbounded reference batch before creating bounded windows.
     torch.accelerator.synchronize()
     getattr(ops, f"moe_prepare_fused_v{version}_cleanup")()
+    # Collective, before the first fused submission (no-op for v6).
+    execution.initialize_windows()
     for case, dummy, xd, wd, ind, ids, baseline, expected in submissions:
         ops.set_dummy_run(dummy)
         graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
@@ -641,6 +643,8 @@ def run(
         assert torch.all(storage[-64:].cpu() == 0xA5)
     torch.accelerator.synchronize()
     getattr(ops, f"moe_prepare_fused_v{version}_cleanup")()
+    if version == 5:
+        torch.ops.torch_xcpu.fused_ep_moe_v5_release_windows()
     if rank == 0:
         print(
             f"PASS version={version} topk={topk} dtype={dtype} "

@@ -131,6 +131,26 @@ class XcpuEPExperts(torch.nn.Module):
             self.max_recv_tokens_per_rank,
         )
 
+    def initialize_windows(self) -> None:
+        """Create the v5 dispatch and combine MPI windows (no-op for v6).
+
+        Collective over the EP group, outside forward: every rank calls it
+        for every layer in the same order. All layers share the windows.
+        """
+        if self.version != 5:
+            return
+        params = self.compute.params
+        torch.ops.torch_xcpu.fused_ep_moe_v5_initialize_windows(
+            self.ep_size,
+            self.max_num_tokens,
+            self.topk,
+            params.hidden,
+            params.experts,
+            4 if self.activation_dtype == torch.float32 else 2,
+            self.max_recv_tokens_per_rank,
+            self.comm_ptr_wrapper,
+        )
+
     def forward(
         self, hidden_states: Tensor, topk_weights: Tensor, topk_ids: Tensor
     ) -> Tensor:

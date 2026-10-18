@@ -358,17 +358,16 @@ def v5_metadata_bytes(peers, rows, topk, local_experts, chunk=None):
 
 
 def v5_arena_bytes(peers, rows, topk, local_experts, hidden, intermediate):
-    """Unchunked V5 arena: the [P,S] send buffer, or activated (+ GEMM2
-    scratch, 0 for ACC) or the expert output + FP32 reduce, followed by the
-    GEMM2 output."""
+    """Unchunked V5 arena: activated (+ GEMM2 scratch, 0 for ACC) or the
+    expert output in S/B-row window-region slots + FP32 reduce, followed by
+    the GEMM2 output. Both [P,S] windows live outside the workspace."""
     capacity = peers * rows
     routes = capacity * min(topk, local_experts)
     activated = routes * intermediate * 2
-    expert_and_reduce = capacity * hidden * 2 + rows * hidden * 4
-    return max(
-        peers * v5_region_bytes(rows, topk, hidden, local_experts),
-        max(activated, expert_and_reduce) + routes * hidden * 2,
+    expert_and_reduce = (
+        peers * v5_region_bytes(rows, topk, hidden, local_experts) + rows * hidden * 4
     )
+    return max(activated, expert_and_reduce) + routes * hidden * 2
 
 
 @pytest.mark.parametrize("version", [5, 6])
