@@ -1,5 +1,6 @@
 """Direct EP binding and preservation of upstream shared-expert execution."""
 
+import math
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ def test_ep_entry_rejects_incompatible_placement_and_inputs_before_dispatch(
     metadata = torch.tensor([2, 0], dtype=torch.int64, device="cpu")
     # No MPI communicator is needed: none of the rejected calls may use it.
     communicator = torch.tensor([0], dtype=torch.int64, device="cpu")
-    with pytest.raises(ValueError, match="linear expert map"):
+    with pytest.raises(ValueError, match="expert map"):
         XcpuEPExperts(
             plan,
             metadata,
@@ -323,6 +324,53 @@ def test_workspace_rechecks_amx_scratch_after_thread_count_change(version):
         torch.set_num_threads(threads)
 
 
+def _align128(nbytes):
+    return (nbytes + 127) // 128 * 128
+
+
+def v5_region_bytes(chunk, topk, hidden, local_experts):
+    """One rank's fixed dispatch region: header, then C hidden rows, C*K
+    weights, C*K route refs and the static [E, C] route index, every section
+    128-byte aligned, padded to lcm(B, 128)."""
+    row = hidden * 2
+    full = (
+        _align128((2 + local_experts) * 4)
+        + _align128(chunk * row)
+        + 2 * _align128(chunk * topk * 4)
+        + chunk * local_experts * 4
+    )
+    unit = math.lcm(row, 128)
+    return -(-full // unit) * unit
+
+
+def v5_metadata_bytes(peers, rows, topk, local_experts, chunk=None):
+    """V5 prefix: return rows, the [E, P*C] GEMM1 route index, expert
+    offsets, the [P,E] route bases (the ACC indexed GEMM1 has no scratch) and
+    the internal 128-byte base shift."""
+    index = local_experts * peers * (chunk or rows)
+    return (
+        _align128(rows * topk * 4)
+        + _align128(index * 4)
+        + _align128((local_experts + 1) * 4)
+        + _align128(peers * local_experts * 4)
+        + 128
+    )
+
+
+def v5_arena_bytes(peers, rows, topk, local_experts, hidden, intermediate):
+    """Unchunked V5 arena: the [P,S] send buffer, or activated (+ GEMM2
+    scratch, 0 for ACC) or the expert output + FP32 reduce, followed by the
+    GEMM2 output."""
+    capacity = peers * rows
+    routes = capacity * min(topk, local_experts)
+    activated = routes * intermediate * 2
+    expert_and_reduce = capacity * hidden * 2 + rows * hidden * 4
+    return max(
+        peers * v5_region_bytes(rows, topk, hidden, local_experts),
+        max(activated, expert_and_reduce) + routes * hidden * 2,
+    )
+
+
 @pytest.mark.parametrize("version", [5, 6])
 @pytest.mark.parametrize(
     "local_experts,arena_gib", [(1, 1.5234375), (2, 2.5), (4, 5), (8, 10)]
@@ -331,16 +379,23 @@ def test_compact_workspace_ep64_capacity(version, local_experts, arena_gib):
     """Production-size query only: never allocate these multi-GiB buffers.
 
     With four experts GEMM1 sets the peak after per-worker FP32 reduction.
-    Original top-k routing/sort metadata remains full-sized in all cases.
+    V5 omits unpacked IDs, the forward permutation and the valid-row tensor,
+    and adds the pack block counters.
     """
     query = getattr(
         torch.ops.torch_xcpu,
         f"fused_ep_moe_v{version}_workspace_size_AccFp8MoeGroupedGemm",
     )
-    metadata_bytes = 8_422_272
-    assert query(64, 1024, 8, 6144, 2048, local_experts, 2, 128, 128, False, False) == (
-        int(arena_gib * 2**30) + metadata_bytes
-    )
+    size = query(64, 1024, 8, 6144, 2048, local_experts, 2, 128, 128, False, False)
+    if version == 5:
+        # GEMM1 reads the window through the indexed backend: no permuted
+        # input, GEMM1 output or GEMM1 scratch in the arena.
+        assert size == (
+            v5_arena_bytes(64, 1024, 8, local_experts, 6144, 2048)
+            + v5_metadata_bytes(64, 1024, 8, local_experts)
+        )
+    else:
+        assert size == int(arena_gib * 2**30) + 8_422_272
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -351,8 +406,13 @@ def test_glm52_acc_mxfp4_workspace_after_row_reduce(version):
     )
     # TP4/SP4: M=2048/4. Quota 1024 is clamped to M, so no chunking.
     size = query(64, 512, 8, 6144, 2048, 4, 2, 1, 32, False, False, 1024)
-    assert size == 2560 * 2**20 + 4_211_584
-    assert 2_822_783_872 - size == 128 * 2**20
+    if version == 5:
+        assert size == v5_arena_bytes(64, 512, 8, 4, 6144, 2048) + v5_metadata_bytes(
+            64, 512, 8, 4
+        )
+    else:
+        assert size == 2560 * 2**20 + 4_211_584
+        assert 2_822_783_872 - size == 128 * 2**20
 
 
 @pytest.mark.parametrize("version", [5, 6])
@@ -366,17 +426,25 @@ def test_chunk_workspace_bounds_and_disabled_compatibility(version):
     # exceed MPI's int32 displacement; the bounded layout must remain usable.
     chunked = query(*args, 1024)
     base = query(64, 1024, *args[2:])
-    # Full-input return indices, FP32 [M,H] accumulator, persistent dense send.
-    # The send arena cannot alias compute while later chunks still need it.
-    packed_bytes = 6144 * 8 * (8 + 8 * 8 + 6144 * 2) + 8
-    aligned_packed_bytes = (packed_bytes + 63) // 64 * 64
-    extra = (6144 - 1024) * 8 * 4 + 6144 * 6144 * 4 + aligned_packed_bytes
+    # Full-input return indices and the FP32 [M,H] accumulator.
+    extra = (6144 - 1024) * 8 * 4 + 6144 * 6144 * 4
+    if version == 6:
+        # Persistent dense send: it cannot alias compute while later chunks
+        # still need it. V5 packs every round into the [P,S] arena instead.
+        packed_bytes = 6144 * 8 * (8 + 8 * 8 + 6144 * 2) + 8
+        extra += (packed_bytes + 63) // 64 * 64
     assert chunked == base + extra
-    # Persistent send and bounded receive have independent MPI int32 limits.
     with pytest.raises(RuntimeError, match="receive window exceeds"):
         query(128, 6144, *args[2:], 2048)
-    with pytest.raises(RuntimeError, match="dispatch capacity exceeds"):
-        query(64, 32768, *args[2:], 1024)
+    if version == 6:
+        # Persistent send and bounded receive have independent MPI int32 limits.
+        with pytest.raises(RuntimeError, match="dispatch capacity exceeds"):
+            query(64, 32768, *args[2:], 1024)
+    else:
+        # V5 send and receive are both [P,S]: only C bounds them. Only the
+        # [M,K] return indices and the FP32 [M,H] accumulator grow with M.
+        growth = (32768 - 6144) * (8 * 4 + 6144 * 4)
+        assert query(64, 32768, *args[2:], 1024) == chunked + growth
     small = (4, 17, 8, 128, 128, 4, 2, 128, 128, False, False)
     assert query(*small) == query(*small, 0) == query(*small, 17) == query(*small, 1024)
     assert query(*small, 3) < query(*small)
@@ -427,3 +495,50 @@ def test_post_sp_input_bound_does_not_scale_receive_quota(monkeypatch, version):
             max_num_tokens=17,
             topk=6,
         )
+
+
+@pytest.mark.parametrize(
+    "mapping,accepted",
+    [
+        ([1, 0, -1, -1], True),
+        ([-1, 0, -1, -1], True),
+        ([-1, -1, -1, -1], True),
+        ([0, 0, -1, -1], False),
+        ([0, 2, -1, -1], False),
+        ([0, -2, -1, -1], False),
+        ([0, 1, 0, -1], False),
+    ],
+)
+@pytest.mark.parametrize(
+    "backend", [ops.MoeGroupedGemmBackend.PORTABLE_LUT, ops.MoeGroupedGemmBackend.ACC]
+)
+def test_v5_checks_map_only_at_initialization(mapping, accepted, backend):
+    plan = ops.initialize_fused_moe(
+        torch.zeros(2, 256, 128, device="cpu", dtype=torch.float8_e4m3fn).to("mcpu"),
+        torch.zeros(2, 128, 128, device="cpu", dtype=torch.float8_e4m3fn).to("mcpu"),
+        torch.ones(2, 2, 1, device="mcpu", dtype=torch.float32),
+        torch.ones(2, 1, 1, device="mcpu", dtype=torch.float32),
+        scale_block_size=(128, 128),
+        backend=backend,
+        allocate_scratch=False,
+    )
+
+    def initialize():
+        return XcpuEPExperts(
+            plan,
+            torch.tensor([2, 0], dtype=torch.int64, device="cpu"),
+            torch.tensor([0], dtype=torch.int64, device="cpu"),
+            torch.tensor(mapping, dtype=torch.int32, device="mcpu"),
+            version=5,
+            ep_size=2,
+            ep_rank=0,
+            max_num_tokens=4,
+            topk=8,
+        )
+
+    if accepted:
+        entry = initialize()
+        assert plan.backend_type.__name__ in entry._op._schema.name
+    else:
+        with pytest.raises(ValueError, match="injective local expert map"):
+            initialize()

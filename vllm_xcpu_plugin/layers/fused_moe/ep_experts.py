@@ -78,8 +78,29 @@ class XcpuEPExperts(torch.nn.Module):
         expected = torch.where(
             (expected >= 0) & (expected < compute.params.experts), expected, -1
         ).to(torch.int32)
-        # Initialization only: V5/V6 wire routing requires linear placement.
-        if not torch.equal(expert_map.cpu(), expected):
+        # Initialization only; never inspect device map values in forward.
+        # V5 routes by canonical owner and maps experts on the receiver, so it
+        # accepts any injective renumbering/filtering inside the owned range.
+        if expert_map.dtype not in (torch.int32, torch.int64):
+            raise ValueError("EP MoE requires integer expert map values")
+        actual = expert_map.cpu()
+        if actual.shape != expected.shape:
+            raise ValueError("EP MoE expert map shape mismatch")
+        if version == 5:
+            owned = expected >= 0
+            values = actual[owned]
+            active = values[values >= 0]
+            if (
+                torch.any(actual[~owned] != -1)
+                or torch.any(values < -1)
+                or torch.any(values >= compute.params.experts)
+                or active.unique().numel() != active.numel()
+            ):
+                raise ValueError(
+                    "EP MoE v5 requires contiguous ownership "
+                    "and an injective local expert map"
+                )
+        elif not torch.equal(actual, expected):
             raise ValueError("EP MoE requires the uniform linear expert map")
         self.expert_map = expert_map.to(
             device=compute.params.gemm1.params.packed_weight.device,

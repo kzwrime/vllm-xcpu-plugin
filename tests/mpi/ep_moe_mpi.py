@@ -154,15 +154,38 @@ def separate_stages(execution, x, weights, ids, baseline_compute):
     return output
 
 
-def reference(x, weights, ids, w1, w2):
+def reference(x, weights, ids, w1, w2, b1=None, b2=None, local_experts=None):
     result = torch.zeros_like(x, dtype=torch.float32)
+    partials = (
+        torch.zeros(w1.size(0) // local_experts, *x.shape, dtype=torch.float32)
+        if local_experts is not None
+        else None
+    )
     for expert in range(w1.size(0)):
         rows, slots = torch.where(ids == expert)
         if rows.numel() == 0:
             continue
-        gate, up = (x[rows].float() @ w1[expert].float().T).chunk(2, dim=-1)
-        values = (F.silu(gate) * up) @ w2[expert].float().T
-        result.index_add_(0, rows, values * weights[rows, slots, None])
+        gate_up = x[rows].float() @ w1[expert].float().T
+        if b1 is not None:
+            gate_up += b1[expert]
+        if partials is not None:
+            gate_up = gate_up.to(x.dtype).float()
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = F.silu(gate) * up
+        if partials is not None:
+            activated = activated.to(x.dtype).float()
+        values = activated @ w2[expert].float().T
+        if b2 is not None:
+            values += b2[expert]
+        if partials is not None:
+            values = values.to(x.dtype).float()
+            partials[expert // local_experts].index_add_(
+                0, rows, values * weights[rows, slots, None]
+            )
+        else:
+            result.index_add_(0, rows, values * weights[rows, slots, None])
+    if partials is not None:
+        result = partials.to(x.dtype).float().sum(dim=0)
     return result.to(x.dtype)
 
 
@@ -175,6 +198,9 @@ def run(
     backend=None,
     shape=(128, 128, 17),
     local_experts=4,
+    map_mode="linear",
+    block_n=128,
+    bias=False,
 ):
     torch._dynamo.reset()
     rank, peers = comm.Get_rank(), comm.Get_size()
@@ -193,11 +219,26 @@ def run(
             (w1 / 0.025).to(torch.float8_e4m3fn),
             (w2 / 0.025).to(torch.float8_e4m3fn),
         )
-        s1 = torch.full((experts, 2, 1), 0.025)
-        s2 = torch.full((experts, 1, 1), 0.025)
-        w1, w2 = (q1.float() * 0.025).bfloat16(), (q2.float() * 0.025).bfloat16()
+        s1 = (
+            torch.rand(
+                experts, (2 * intermediate + block_n - 1) // block_n, hidden // 128
+            )
+            * 0.5
+            + 0.75
+        ) * 0.025
+        s2 = (
+            torch.rand(experts, (hidden + block_n - 1) // block_n, intermediate // 128)
+            * 0.5
+            + 0.75
+        ) * 0.025
+
+        def dequant_fp8(q, scale):
+            expanded = scale.repeat_interleave(block_n, 1).repeat_interleave(128, 2)
+            return q.float() * expanded[:, : q.shape[1], : q.shape[2]]
+
+        w1, w2 = dequant_fp8(q1, s1), dequant_fp8(q2, s2)
         scales = (s1[local].to("mcpu"), s2[local].to("mcpu"))
-        block = (128, 128)
+        block = (block_n, 128)
     elif weight_format == "mxfp4":
         q1 = torch.randint(
             256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8
@@ -235,11 +276,19 @@ def run(
         block = (1, 32)
     else:
         q1, q2 = w1, w2
+    b1 = torch.randn(experts, 2 * intermediate) * 0.01 if bias else None
+    b2 = torch.randn(experts, hidden) * 0.01 if bias else None
+    order = torch.arange(local_experts)
+    if map_mode != "linear":
+        order = order.flip(0)
+    scales = tuple(scale[order.to(scale.device)] for scale in scales)
     compute = ops.initialize_fused_moe(
-        q1[local].to("mcpu"),
-        q2[local].to("mcpu"),
+        q1[local][order].to("mcpu"),
+        q2[local][order].to("mcpu"),
         *scales,
         scale_block_size=block,
+        w1_bias=b1[local][order].to("mcpu") if bias else None,
+        w2_bias=b2[local][order].to("mcpu") if bias else None,
         backend=backend
         if backend is not None
         else (
@@ -279,6 +328,12 @@ def run(
     )
     expert_map = torch.arange(experts, dtype=torch.int32) - rank * local_experts
     expert_map[(expert_map < 0) | (expert_map >= local_experts)] = -1
+    if map_mode != "linear":
+        expert_map[local] = torch.arange(local_experts - 1, -1, -1, dtype=torch.int32)
+    if map_mode == "filter":
+        expert_map[rank * local_experts] = -1
+    elif map_mode == "all_filtered":
+        expert_map.fill_(-1)
     execution = XcpuEPExperts(
         compute,
         torch.tensor([peers, rank, 0, 1, 0, 1], dtype=torch.int64),
@@ -370,9 +425,10 @@ def run(
             # Destinations for the same token can be assigned different rounds.
             ids.fill_(-1)
             ids[:, 0] = 0
-            ids[:, 1] = (
-                torch.arange(rows, dtype=torch.int32) % (peers - 1) + 1
-            ) * local_experts
+            if peers > 1:
+                ids[:, 1] = (
+                    torch.arange(rows, dtype=torch.int32) % (peers - 1) + 1
+                ) * local_experts
         elif rows:
             ids[0] = -1
         weights = torch.softmax(torch.randn(rows, topk), dim=-1)
@@ -380,7 +436,27 @@ def run(
         dummy = case in (5, 10) and rank == 0
         ops.set_dummy_run(dummy)
         baseline = separate_stages(execution, xd, wd, ind, baseline_compute)
-        expected = torch.zeros_like(x) if dummy else reference(x, weights, ids, w1, w2)
+        reference_ids = ids.clone()
+        if map_mode == "filter":
+            reference_ids[reference_ids % local_experts == 0] = -1
+        elif map_mode == "all_filtered":
+            reference_ids.fill_(-1)
+        expected = (
+            torch.zeros_like(x)
+            if dummy
+            else reference(
+                x,
+                weights,
+                reference_ids,
+                w1,
+                w2,
+                b1,
+                b2,
+                local_experts
+                if backend == ops.MoeGroupedGemmBackend.PORTABLE_LUT
+                else None,
+            )
+        )
         submissions.append((case, dummy, xd, wd, ind, ids, baseline, expected))
     # The native transports deliberately bind one fixed-capacity window.
     # Finish the unbounded reference batch before creating bounded windows.
@@ -490,7 +566,29 @@ def run(
                 names.count(f"mcpu::fused_ep_moe_v{version}_dispatch")
                 == expected_rounds
             )
-            assert names.count("mcpu::moe_prepare_hybrid_pack_v5_v8_impl") == 1
+            if version == 5:
+                # GEMM1 + SiLU always reads the window through the backend's
+                # indexed counterpart.
+                # Every round packs its own records and reduces locally
+                # from the window.
+                assert names.count("mcpu::moe_ep_v5_pack") == expected_rounds
+                assert names.count("mcpu::moe_ep_v5_route") == expected_rounds
+                assert names.count("mcpu::moe_ep_v5_local_reduce") == expected_rounds
+                assert "mcpu::moe_unpermute_with_reduce" not in names
+                assert (
+                    sum(
+                        name.startswith("mcpu::moe_grouped_gemm_with_index_")
+                        for name in names
+                    )
+                    == expected_rounds
+                )
+                assert not any("silu_and_mul" in name for name in names)
+                assert "mcpu::moe_prepare_hybrid_pack_v5_v8_impl" not in names
+                assert "mcpu::moe_prepare_fused_v5_unpack" not in names
+                assert "mcpu::moe_permute" not in names
+            else:
+                assert names.count("mcpu::moe_prepare_hybrid_pack_v5_v8_impl") == 1
+                assert names.count("mcpu::moe_permute") == expected_rounds
             assert (
                 names.count("mcpu::moe_finalize_hybrid_reduce_v5_v8_impl")
                 == expected_rounds
@@ -523,18 +621,20 @@ def run(
         # AMX chooses brgemm vs tinygemm by expert tile row count. Chunking
         # can cross that threshold, so its BF16 rounding differs near zero.
         amx = compute.resolved_backend.startswith("IntelAmx")
-        torch.testing.assert_close(
-            new.cpu(),
-            baseline.cpu(),
-            rtol=0.008
-            if execution.max_recv_tokens_per_rank
+        chunked = bool(
+            execution.max_recv_tokens_per_rank
             and execution.max_recv_tokens_per_rank < bound
-            else 0,
-            atol=(1e-4 if amx else 1e-7)
-            if execution.max_recv_tokens_per_rank
-            and execution.max_recv_tokens_per_rank < bound
-            else 0,
         )
+        if version == 5:
+            # v5 runs GEMM1 + silu_and_mul through the indexed backends. The
+            # staged baseline rounds the projection before silu; an indexed
+            # backend may too, or compute silu on FP32 accumulators (preferred
+            # on real hardware, see TODO(acc)). Either is within this error.
+            rtol, atol = (0.02, 1e-3) if dtype == torch.bfloat16 else (1e-4, 1e-6)
+        else:
+            rtol = 0.008 if chunked else 0
+            atol = (1e-4 if amx else 1e-7) if chunked else 0
+        torch.testing.assert_close(new.cpu(), baseline.cpu(), rtol=rtol, atol=atol)
         torch.testing.assert_close(new.cpu(), expected, rtol=0.03, atol=0.003)
     for storage in guards:
         assert torch.all(storage[:64].cpu() == 0xA5)
@@ -545,13 +645,43 @@ def run(
         print(
             f"PASS version={version} topk={topk} dtype={dtype} "
             f"format={weight_format} backend={compute.resolved_backend} "
-            f"shape={shape} workspace_bytes={execution.workspace_bytes}",
+            f"shape={shape} map={map_mode} block_n={block_n} bias={bias} "
+            f"workspace_bytes={execution.workspace_bytes}",
             flush=True,
         )
 
 
 if __name__ == "__main__":
     try:
+        if os.getenv("XCPU_EP_INDEXED", "0") == "1":
+            for block_n in map(
+                int, os.getenv("XCPU_EP_BLOCK_N", "32,64,128,256").split(",")
+            ):
+                for map_mode in os.getenv(
+                    "XCPU_EP_MAP", "linear,permuted,filter"
+                ).split(","):
+                    run(
+                        MPI.COMM_WORLD,
+                        5,
+                        8,
+                        torch.bfloat16,
+                        "fp8",
+                        getattr(
+                            ops.MoeGroupedGemmBackend,
+                            os.getenv("XCPU_EP_BACKEND", "PORTABLE_LUT"),
+                        ),
+                        shape=(
+                            int(os.getenv("XCPU_EP_HIDDEN", "128")),
+                            128,
+                            int(os.getenv("XCPU_EP_MAX_ROWS", "17")),
+                        ),
+                        local_experts=int(os.getenv("XCPU_EP_LOCAL_EXPERTS", "4")),
+                        map_mode=map_mode,
+                        block_n=block_n,
+                        bias=os.getenv("XCPU_EP_BIAS", "0") == "1",
+                    )
+            MPI.Finalize()
+            raise SystemExit(0)
         for version in (5, 6):
             # Exercise both sides of the fixed-slot/dense capacity boundary.
             for bound in map(
@@ -578,6 +708,8 @@ if __name__ == "__main__":
                         for dtype in (torch.bfloat16, torch.float32):
                             run(MPI.COMM_WORLD, version, topk, dtype, shape=shape)
         MPI.Finalize()
+    except SystemExit:
+        raise
     except BaseException:  # noqa: BLE001 -- abort peers on any rank's failure
         import traceback
 
