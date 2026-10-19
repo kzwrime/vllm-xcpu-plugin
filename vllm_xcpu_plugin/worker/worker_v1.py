@@ -16,6 +16,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import clear_workspace, init_workspace_manager
 
 import vllm_xcpu_plugin.envs as envs_xcpu
@@ -302,6 +303,39 @@ class McpuWorker(Worker):
         )
         self.available_kv_cache_memory_bytes = kv_cache_space_bytes
         return kv_cache_space_bytes
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        compilation_times = super().compile_or_warm_up_model()
+        compilation = self.vllm_config.compilation_config
+        if (
+            self.use_v2_model_runner
+            and compilation.mode == CompilationMode.DYNAMO_TRACE_ONCE
+            and compilation.backend == "inductor"
+        ):
+            from torch._inductor import config as inductor_config
+
+            options = compilation.inductor_compile_config
+            planning = options.get("memory_planning", inductor_config.memory_planning)
+            pool = options.get("memory_pool", inductor_config.memory_pool)
+            if planning and pool == "intermediates":
+                # Compile with the normal small batch first: tracing at the
+                # maximum shape can specialize slices at buffer boundaries.
+                # Release its idle intermediate pool, then prime the largest
+                # shape so smaller requests reuse that segment instead of
+                # retaining several GiB-sized segments as token counts grow.
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                num_tokens = self.scheduler_config.max_num_batched_tokens
+                logger.info(
+                    "Warming intermediate memory pool with %d tokens after "
+                    "clearing idle warmup buffers.",
+                    num_tokens,
+                )
+                self.model_runner._dummy_run(num_tokens, skip_eplb=True)
+                torch.accelerator.synchronize()
+                set_random_seed(self.model_config.seed)
+
+        return compilation_times
 
     def shutdown(self):
         if self._af_client is not None:

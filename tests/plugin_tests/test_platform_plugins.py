@@ -200,7 +200,9 @@ def test_ir_priority_uses_functional_kernel_for_compile():
     ]
 
 
-def test_compile_config_disables_inductor_fusions():
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("explicit_override", [False, True])
+def test_compile_config_disables_inductor_fusions(pooled, explicit_override):
     from types import SimpleNamespace
 
     from vllm.config import CompilationMode
@@ -212,7 +214,11 @@ def test_compile_config_disables_inductor_fusions():
             mode=CompilationMode.VLLM_COMPILE,
             custom_ops=[],
             backend="",
-            inductor_compile_config={},
+            inductor_compile_config=(
+                {"memory_planning": not pooled, "memory_pool": "none"}
+                if explicit_override
+                else {}
+            ),
         ),
         parallel_config=SimpleNamespace(worker_cls=None),
         cache_config=SimpleNamespace(
@@ -222,12 +228,21 @@ def test_compile_config_disables_inductor_fusions():
         model_config=None,
     )
 
-    McpuPlatform.check_and_update_config(config)
+    with torch._inductor.config.patch(
+        memory_planning=pooled, memory_pool="intermediates"
+    ):
+        McpuPlatform.check_and_update_config(config)
 
     compile_config = config.compilation_config.inductor_compile_config
     assert compile_config["epilogue_fusion"] is False
     assert compile_config["pattern_matcher"] is False
     assert compile_config["combo_kernels"] is False
+    assert compile_config["memory_planning"] == (
+        not pooled if explicit_override else pooled
+    )
+    assert compile_config["memory_pool"] == (
+        "none" if explicit_override else "intermediates"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
