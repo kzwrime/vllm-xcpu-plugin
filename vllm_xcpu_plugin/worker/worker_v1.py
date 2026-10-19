@@ -305,8 +305,24 @@ class McpuWorker(Worker):
         return kv_cache_space_bytes
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        compilation_times = super().compile_or_warm_up_model()
+        from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+        # TRACE_ONCE keeps the first Dynamo trace without guards, and upstream
+        # only warms up VLLM_COMPILE. Left lazy, an idle DP rank traces its
+        # one-token dummy batch first; Dynamo specializes size 1 and every
+        # later batch on that rank runs the T=1 graph. Trace the full token
+        # budget on all ranks before serving instead.
         compilation = self.vllm_config.compilation_config
+        if compilation.mode == CompilationMode.DYNAMO_TRACE_ONCE and any(
+            isinstance(m, TorchCompileWithNoGuardsWrapper)
+            and not getattr(m, "do_not_compile", True)
+            for m in self.model_runner.get_model().modules()
+        ):
+            size = self.scheduler_config.max_num_batched_tokens
+            logger.info("Tracing the TRACE_ONCE model graph with %d tokens", size)
+            self.model_runner._dummy_run(size, skip_eplb=True)
+
+        compilation_times = super().compile_or_warm_up_model()
         if (
             self.use_v2_model_runner
             and compilation.mode == CompilationMode.DYNAMO_TRACE_ONCE
@@ -318,11 +334,9 @@ class McpuWorker(Worker):
             planning = options.get("memory_planning", inductor_config.memory_planning)
             pool = options.get("memory_pool", inductor_config.memory_pool)
             if planning and pool == "intermediates":
-                # Compile with the normal small batch first: tracing at the
-                # maximum shape can specialize slices at buffer boundaries.
-                # Release its idle intermediate pool, then prime the largest
-                # shape so smaller requests reuse that segment instead of
-                # retaining several GiB-sized segments as token counts grow.
+                # Release idle warmup intermediate pools, then prime the
+                # largest shape so smaller requests reuse that segment instead
+                # of retaining several GiB-sized segments as token counts grow.
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
                 num_tokens = self.scheduler_config.max_num_batched_tokens

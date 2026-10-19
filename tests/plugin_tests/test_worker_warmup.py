@@ -45,7 +45,7 @@ def test_pool_warmup_order(monkeypatch, v2, mode, backend, options, expected):
     )
     worker.scheduler_config = SimpleNamespace(max_num_batched_tokens=1024)
     worker.model_config = SimpleNamespace(seed=42)
-    worker.model_runner = SimpleNamespace()
+    worker.model_runner = SimpleNamespace(get_model=torch.nn.Module)
     events = Mock()
     monkeypatch.setattr(worker_v1.Worker, "compile_or_warm_up_model", events.compile)
     monkeypatch.setattr(torch.accelerator, "synchronize", events.sync)
