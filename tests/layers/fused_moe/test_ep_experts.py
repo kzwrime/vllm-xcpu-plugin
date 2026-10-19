@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExp
 from vllm_xcpu_plugin.layers.fused_moe.ep_experts import (
     XcpuEPExperts,
     XcpuEPKernelAdapter,
+    XcpuSharedExpertWeights,
 )
 from vllm_xcpu_plugin.layers.fused_moe.moe_runner import XcpuMoERunner
 
@@ -541,3 +542,138 @@ def test_v5_checks_map_only_at_initialization(mapping, accepted, backend):
     else:
         with pytest.raises(ValueError, match="injective local expert map"):
             initialize()
+
+
+# -----------------------------------------------------------------------------
+# Fused shared experts (VLLM_XCPU_FUSE_SHARED_EXPERTS): the v5 op takes the
+# shared MLP's packed linear weights and the routed scaling factor.
+# -----------------------------------------------------------------------------
+def _v5_entry(version=5):
+    plan = ops.initialize_fused_moe(
+        torch.zeros(2, 256, 128, device="mcpu", dtype=torch.bfloat16),
+        torch.zeros(2, 128, 128, device="mcpu", dtype=torch.bfloat16),
+        backend=ops.MoeGroupedGemmBackend.PORTABLE,
+    )
+    return XcpuEPExperts(
+        plan,
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.tensor([0], dtype=torch.int64),
+        torch.tensor([0, 1, -1, -1], device="mcpu", dtype=torch.int32),
+        version=version,
+        ep_size=2,
+        ep_rank=0,
+        max_num_tokens=4,
+        topk=6,
+    )
+
+
+def _unquantized_shared(intermediate=64, gate=True):
+    return XcpuSharedExpertWeights(
+        w13=torch.zeros(2 * intermediate, 128, device="mcpu", dtype=torch.bfloat16),
+        w2=torch.zeros(128, intermediate, device="mcpu", dtype=torch.bfloat16),
+        w13_scale=None,
+        w2_scale=None,
+        linear_backend=-1,
+        scale_block_size=(0, 0),
+        gate=torch.zeros(1, 128, device="mcpu", dtype=torch.bfloat16) if gate else None,
+    )
+
+
+def test_bind_shared_experts_passes_linear_weights_and_scale():
+    entry = _v5_entry()
+    routed_only = entry.workspace_bytes
+    shared = _unquantized_shared()
+    entry.bind_shared_experts(shared, 2.5)
+    assert entry.workspace_bytes == entry._workspace_size(64) > routed_only
+    calls = []
+    entry._op = lambda *args: calls.append(args)
+    entry.forward(
+        torch.zeros(3, 128, device="mcpu", dtype=torch.bfloat16),
+        torch.ones(3, 6, device="mcpu"),
+        torch.zeros(3, 6, device="mcpu", dtype=torch.int32),
+    )
+    (args,) = calls
+    assert args[19:23] == (shared.w13, shared.w2, None, None)
+    assert args[23:] == (-1, 0, 0, shared.gate, 2.5)
+    with pytest.raises(ValueError, match="only XCPU EP v5"):
+        _v5_entry(6).bind_shared_experts(shared, 1.0)
+
+
+def _fusable_runner(tp_size=1, sequence_parallel=True, gate=True):
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    def linear(out_features, in_features):
+        return SimpleNamespace(
+            tp_size=tp_size,
+            bias=None,
+            quant_method=object.__new__(UnquantizedLinearMethod),
+            weight=torch.zeros(out_features, in_features, dtype=torch.bfloat16),
+        )
+
+    # The type name selects the gate_up -> SiLU -> down (-> gate) contract.
+    mlp = type("Qwen2MoeMLP", (), {})()
+    mlp.gate_up_proj, mlp.down_proj = linear(128, 128), linear(128, 64)
+    mlp.act_fn = object.__new__(SiluAndMul)
+    mlp.expert_gate = linear(1, 128) if gate else None
+    if mlp.expert_gate is not None:
+        mlp.expert_gate.tp_size = 1
+    bound = []
+    ep_experts = SimpleNamespace(
+        version=5,
+        activation_dtype=torch.bfloat16,
+        compute=SimpleNamespace(params=SimpleNamespace(hidden=128)),
+        bind_shared_experts=lambda shared, scale: bound.append((shared, scale)),
+    )
+    runner = object.__new__(XcpuMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        tp_size=tp_size, is_sequence_parallel=sequence_parallel
+    )
+    runner._shared_experts = SimpleNamespace(_layer=mlp)
+    runner.routed_experts = SimpleNamespace(_xcpu_ep_experts=ep_experts)
+    runner.routed_scaling_factor = 2.5
+    runner.routed_input_transform = runner.routed_output_transform = None
+    runner._forward_entry = None
+    return runner, mlp, bound
+
+
+def test_install_fused_shared_experts_detaches_the_runner_shared_path(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward
+
+    from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+        install_fused_shared_experts,
+    )
+
+    monkeypatch.setenv("VLLM_XCPU_FUSE_SHARED_EXPERTS", "0")
+    runner, mlp, bound = _fusable_runner()
+    assert install_fused_shared_experts(runner) == 0 and not bound
+
+    # On by default.
+    monkeypatch.delenv("VLLM_XCPU_FUSE_SHARED_EXPERTS")
+    assert install_fused_shared_experts(runner) == 1
+    ((shared, scale),) = bound
+    assert shared.w13 is mlp.gate_up_proj.weight and shared.w2 is mlp.down_proj.weight
+    assert shared.gate is mlp.expert_gate.weight and shared.linear_backend == -1
+    assert scale == 2.5
+    # The op returns the complete output: no runner-side shared or scaling.
+    assert runner._shared_experts is None and runner.routed_scaling_factor == 1.0
+    assert runner._forward_entry is _moe_forward
+    routed = torch.randn(3, 4)
+    assert runner._combine_shared_expert_output(None, routed.clone()).equal(routed)
+
+
+@pytest.mark.parametrize(
+    "tp_size,sequence_parallel", [(2, False), (2, True)], ids=["tp", "tp_linear"]
+)
+def test_install_fused_shared_experts_keeps_tensor_parallel_mlp(
+    monkeypatch, tp_size, sequence_parallel
+):
+    from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+        install_fused_shared_experts,
+    )
+
+    monkeypatch.setenv("VLLM_XCPU_FUSE_SHARED_EXPERTS", "1")
+    runner, _, bound = _fusable_runner(tp_size, sequence_parallel)
+    assert install_fused_shared_experts(runner) == 0 and not bound
+    assert runner._shared_experts is not None and runner.routed_scaling_factor == 2.5

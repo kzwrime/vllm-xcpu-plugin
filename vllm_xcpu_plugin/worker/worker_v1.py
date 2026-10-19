@@ -257,6 +257,13 @@ class McpuWorker(Worker):
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
+        # After every layer's post-load packing: the fused EP op reuses the
+        # shared MLP's packed linear weights.
+        from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+            install_fused_shared_experts,
+        )
+
+        install_fused_shared_experts(self.model_runner.get_model())
         if self._af_client is not None:
             config = self.model_config.hf_text_config
             self._af_client.initialize(

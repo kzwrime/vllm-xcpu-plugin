@@ -1,5 +1,6 @@
 """vLLM binding and invocation storage for direct routed EP operators."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,10 +14,35 @@ if TYPE_CHECKING:
     from torch_xcpu.ops import FusedMoe
 
 
+@dataclass(frozen=True)
+class XcpuSharedExpertWeights:
+    """A replicated shared MLP as its linear layers packed it at load time.
+
+    w13/w2 are the gate_up/down weights of one linear format: FP8 or MXFP4
+    with scales, their Fp8LinearBackend/Mxfp4LinearBackend value and scale
+    blocks, or unquantized activation-dtype [N, K] weights (backend -1). gate
+    is the optional [1, H] sigmoid gate weight (Qwen3.5/3.6).
+    """
+
+    w13: Tensor
+    w2: Tensor
+    w13_scale: Tensor | None
+    w2_scale: Tensor | None
+    linear_backend: int
+    scale_block_size: tuple[int, int]
+    gate: Tensor | None
+
+    @property
+    def intermediate(self) -> int:
+        return self.w13.size(0) // 2
+
+
 class XcpuEPExperts(torch.nn.Module):
     """Bind one routed EP op; allocate independent storage for each invocation.
 
-    vLLM owns routing, shared experts, scaling and final output transforms.
+    vLLM owns routing, shared experts, scaling and final output transforms,
+    unless bind_shared_experts moved the shared MLP and the routed scaling
+    into the v5 op.
     Calls sharing an MPI window must use one serialized stream.
     Communication metadata must outlive submitted work.
     """
@@ -111,15 +137,22 @@ class XcpuEPExperts(torch.nn.Module):
             f"fused_ep_moe_v{version}_{compute.backend_type.__name__}",
         ).default
 
+        self.shared: XcpuSharedExpertWeights | None = None
+        self.routed_scaling_factor = 1.0
+        self.workspace_bytes = self._workspace_size()
+
+    def _workspace_size(self, *shared_intermediate: int) -> int:
+        compute = self.compute
         gemm1, gemm2 = compute.params.gemm1.params, compute.params.gemm2.params
         block_n, block_k = gemm1.scale_block_size or (0, 0)
-        self.workspace_bytes = getattr(
+        return getattr(
             torch.ops.torch_xcpu,
-            f"fused_ep_moe_v{version}_workspace_size_{compute.backend_type.__name__}",
+            f"fused_ep_moe_v{self.version}_workspace_size_"
+            f"{compute.backend_type.__name__}",
         )(
-            ep_size,
-            max_num_tokens,
-            topk,
+            self.ep_size,
+            self.max_num_tokens,
+            self.topk,
             compute.params.hidden,
             compute.params.intermediate,
             compute.params.experts,
@@ -129,7 +162,22 @@ class XcpuEPExperts(torch.nn.Module):
             gemm1.bias is not None,
             gemm2.bias is not None,
             self.max_recv_tokens_per_rank,
+            *shared_intermediate,
         )
+
+    def bind_shared_experts(
+        self, shared: XcpuSharedExpertWeights, routed_scaling_factor: float
+    ) -> None:
+        """Run the shared MLP inside the v5 op, in round 0 under the dispatch.
+
+        The op then returns T(gate * shared) + T(routed * routed_scaling_factor),
+        the complete MoE output; the caller drops its own shared path.
+        """
+        if self.version != 5:
+            raise ValueError("only XCPU EP v5 fuses shared experts")
+        self.shared = shared
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        self.workspace_bytes = self._workspace_size(shared.intermediate)
 
     def initialize_windows(self) -> None:
         """Create the v5 dispatch and combine MPI windows (no-op for v6).
@@ -176,6 +224,21 @@ class XcpuEPExperts(torch.nn.Module):
             self.workspace_bytes, device=hidden_states.device, dtype=torch.uint8
         )
         output = torch.empty_like(hidden_states)
+        shared = self.shared
+        shared_args: tuple[object, ...]
+        if shared is None:
+            shared_args = ()
+        else:
+            shared_args = (
+                shared.w13,
+                shared.w2,
+                shared.w13_scale,
+                shared.w2_scale,
+                shared.linear_backend,
+                *shared.scale_block_size,
+                shared.gate,
+                self.routed_scaling_factor,
+            )
         self._op(
             output,
             hidden_states,
@@ -196,6 +259,7 @@ class XcpuEPExperts(torch.nn.Module):
             self.comm_ptr_wrapper,
             workspace,
             self.max_recv_tokens_per_rank,
+            *shared_args,
         )
         return output
 
@@ -214,7 +278,8 @@ class XcpuEPKernelAdapter(mk.FusedMoEKernel):
 
     @property
     def can_overlap_shared_experts(self) -> bool:
-        # Shared experts stay on the upstream MoERunner path.
+        # Shared experts stay on the upstream MoERunner path; a fused v5 shared
+        # MLP is detached from the runner instead (install_fused_shared_experts).
         return False
 
     def validate_routed_contract(
