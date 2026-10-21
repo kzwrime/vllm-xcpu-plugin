@@ -143,6 +143,28 @@ def _install_runtime_metadata_builder():
     DeepseekV32IndexerMetadataBuilder.build = build  # type: ignore[method-assign]
 
 
+def _install_prefill_buffer_size():
+    """Bound the prefill K buffer by the sequences one step can actually hold.
+
+    Upstream sizes it as 40 * max_model_len, a flashmla workspace heuristic.
+    A chunk gathers at most max_num_seqs requests of at most max_model_len
+    tokens each. The metadata builder (chunk split bound) and the indexer
+    layer (scratch capacity) both call this through the module attribute at
+    construction time, so patching it keeps the two sides equal.
+    """
+    import vllm.v1.attention.backends.mla.indexer as indexer_module
+
+    upstream = indexer_module.get_max_prefill_buffer_size
+
+    @functools.wraps(upstream)
+    def get_max_prefill_buffer_size(vllm_config):
+        max_model_len = vllm_config.model_config.max_model_len
+        num_seqs = max(1, vllm_config.scheduler_config.max_num_seqs)
+        return min(upstream(vllm_config), max_model_len * num_seqs)
+
+    indexer_module.get_max_prefill_buffer_size = get_max_prefill_buffer_size
+
+
 def _sparse_attn_indexer(self, hidden_states, q, k, weights):
     """Shared eager/compile entry; metadata is published before model execution.
 
@@ -474,5 +496,6 @@ def maybe_patch_vllm_sparse_attn_indexer() -> None:
     if _integrations_installed:
         return
     _install_runtime_metadata_builder()
+    _install_prefill_buffer_size()
     _install_indexer_preprocessing()
     _integrations_installed = True

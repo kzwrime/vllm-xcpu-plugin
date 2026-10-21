@@ -35,6 +35,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_ENABLE_FUSED_EP_MOE": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_FUSED_EP_MOE", "1"))
     ),
+    # Move replicated shared MLPs into the fused V5 EP op (round 0, under the
+    # dispatch); TORCH_XCPU_FUSED_EP_MOE_V5_ASYNC_DISPATCH=1 overlaps them.
+    # Layers on other MoE backends (only V5 fuses) keep the runner's path.
+    "VLLM_XCPU_FUSE_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_XCPU_FUSE_SHARED_EXPERTS", "1"))
+    ),
     # V5/V6 fused EP quota per source/destination pair, in post-SP token rows.
     # Zero disables chunking. This is independent of the V4 total receive cap.
     "VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK": lambda: int(

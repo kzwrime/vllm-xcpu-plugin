@@ -16,6 +16,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import clear_workspace, init_workspace_manager
 
 import vllm_xcpu_plugin.envs as envs_xcpu
@@ -257,6 +258,13 @@ class McpuWorker(Worker):
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
+        # After every layer's post-load packing: the fused EP op reuses the
+        # shared MLP's packed linear weights.
+        from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+            install_fused_shared_experts,
+        )
+
+        install_fused_shared_experts(self.model_runner.get_model())
         if self._af_client is not None:
             config = self.model_config.hf_text_config
             self._af_client.initialize(
@@ -296,7 +304,7 @@ class McpuWorker(Worker):
         self.available_kv_cache_memory_bytes = kv_cache_space_bytes
         return kv_cache_space_bytes
 
-    def compile_or_warm_up_model(self):
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
 
         # TRACE_ONCE keeps the first Dynamo trace without guards, and upstream
@@ -311,7 +319,35 @@ class McpuWorker(Worker):
             size = self.vllm_config.scheduler_config.max_num_batched_tokens
             logger.info("Tracing the TRACE_ONCE model graph with %d tokens", size)
             self.model_runner._dummy_run(size, skip_eplb=True)
-        return super().compile_or_warm_up_model()
+
+        compilation_times = super().compile_or_warm_up_model()
+        if (
+            self.use_v2_model_runner
+            and compilation_config.mode == CompilationMode.DYNAMO_TRACE_ONCE
+            and compilation_config.backend == "inductor"
+        ):
+            from torch._inductor import config as inductor_config
+
+            options = compilation_config.inductor_compile_config
+            planning = options.get("memory_planning", inductor_config.memory_planning)
+            pool = options.get("memory_pool", inductor_config.memory_pool)
+            if planning and pool == "intermediates":
+                # Release idle warmup intermediate pools, then prime the
+                # largest shape so smaller requests reuse that segment instead
+                # of retaining several GiB-sized segments as token counts grow.
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                num_tokens = self.scheduler_config.max_num_batched_tokens
+                logger.info(
+                    "Warming intermediate memory pool with %d tokens after "
+                    "clearing idle warmup buffers.",
+                    num_tokens,
+                )
+                self.model_runner._dummy_run(num_tokens, skip_eplb=True)
+                torch.accelerator.synchronize()
+                set_random_seed(self.model_config.seed)
+
+        return compilation_times
 
     def shutdown(self):
         if self._af_client is not None:

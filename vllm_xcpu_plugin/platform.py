@@ -230,6 +230,17 @@ class McpuPlatform(Platform):
                 "combo_kernels": False,
                 "benchmark_combo_kernel": False,
             })
+            # Include the effective pool policy in vLLM's compilation config
+            # and cache hash, including launches outside user_env_template.sh.
+            # Per-model compiler options take precedence over environment defaults.
+            from torch._inductor import config as inductor_config
+
+            compilation_config.inductor_compile_config.setdefault(
+                "memory_planning", inductor_config.memory_planning
+            )
+            compilation_config.inductor_compile_config.setdefault(
+                "memory_pool", inductor_config.memory_pool
+            )
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

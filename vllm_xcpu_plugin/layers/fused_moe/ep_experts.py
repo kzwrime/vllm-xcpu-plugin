@@ -1,5 +1,6 @@
 """vLLM binding and invocation storage for direct routed EP operators."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,10 +14,35 @@ if TYPE_CHECKING:
     from torch_xcpu.ops import FusedMoe
 
 
+@dataclass(frozen=True)
+class XcpuSharedExpertWeights:
+    """A replicated shared MLP as its linear layers packed it at load time.
+
+    w13/w2 are the gate_up/down weights of one linear format: FP8 or MXFP4
+    with scales, their Fp8LinearBackend/Mxfp4LinearBackend value and scale
+    blocks, or unquantized activation-dtype [N, K] weights (backend -1). gate
+    is the optional [1, H] sigmoid gate weight (Qwen3.5/3.6).
+    """
+
+    w13: Tensor
+    w2: Tensor
+    w13_scale: Tensor | None
+    w2_scale: Tensor | None
+    linear_backend: int
+    scale_block_size: tuple[int, int]
+    gate: Tensor | None
+
+    @property
+    def intermediate(self) -> int:
+        return self.w13.size(0) // 2
+
+
 class XcpuEPExperts(torch.nn.Module):
     """Bind one routed EP op; allocate independent storage for each invocation.
 
-    vLLM owns routing, shared experts, scaling and final output transforms.
+    vLLM owns routing, shared experts, scaling and final output transforms,
+    unless bind_shared_experts moved the shared MLP and the routed scaling
+    into the v5 op.
     Calls sharing an MPI window must use one serialized stream.
     Communication metadata must outlive submitted work.
     """
@@ -78,8 +104,29 @@ class XcpuEPExperts(torch.nn.Module):
         expected = torch.where(
             (expected >= 0) & (expected < compute.params.experts), expected, -1
         ).to(torch.int32)
-        # Initialization only: V5/V6 wire routing requires linear placement.
-        if not torch.equal(expert_map.cpu(), expected):
+        # Initialization only; never inspect device map values in forward.
+        # V5 routes by canonical owner and maps experts on the receiver, so it
+        # accepts any injective renumbering/filtering inside the owned range.
+        if expert_map.dtype not in (torch.int32, torch.int64):
+            raise ValueError("EP MoE requires integer expert map values")
+        actual = expert_map.cpu()
+        if actual.shape != expected.shape:
+            raise ValueError("EP MoE expert map shape mismatch")
+        if version == 5:
+            owned = expected >= 0
+            values = actual[owned]
+            active = values[values >= 0]
+            if (
+                torch.any(actual[~owned] != -1)
+                or torch.any(values < -1)
+                or torch.any(values >= compute.params.experts)
+                or active.unique().numel() != active.numel()
+            ):
+                raise ValueError(
+                    "EP MoE v5 requires contiguous ownership "
+                    "and an injective local expert map"
+                )
+        elif not torch.equal(actual, expected):
             raise ValueError("EP MoE requires the uniform linear expert map")
         self.expert_map = expert_map.to(
             device=compute.params.gemm1.params.packed_weight.device,
@@ -90,15 +137,22 @@ class XcpuEPExperts(torch.nn.Module):
             f"fused_ep_moe_v{version}_{compute.backend_type.__name__}",
         ).default
 
+        self.shared: XcpuSharedExpertWeights | None = None
+        self.routed_scaling_factor = 1.0
+        self.workspace_bytes = self._workspace_size()
+
+    def _workspace_size(self, *shared_intermediate: int) -> int:
+        compute = self.compute
         gemm1, gemm2 = compute.params.gemm1.params, compute.params.gemm2.params
         block_n, block_k = gemm1.scale_block_size or (0, 0)
-        self.workspace_bytes = getattr(
+        return getattr(
             torch.ops.torch_xcpu,
-            f"fused_ep_moe_v{version}_workspace_size_{compute.backend_type.__name__}",
+            f"fused_ep_moe_v{self.version}_workspace_size_"
+            f"{compute.backend_type.__name__}",
         )(
-            ep_size,
-            max_num_tokens,
-            topk,
+            self.ep_size,
+            self.max_num_tokens,
+            self.topk,
             compute.params.hidden,
             compute.params.intermediate,
             compute.params.experts,
@@ -108,18 +162,59 @@ class XcpuEPExperts(torch.nn.Module):
             gemm1.bias is not None,
             gemm2.bias is not None,
             self.max_recv_tokens_per_rank,
+            *shared_intermediate,
+        )
+
+    def bind_shared_experts(
+        self, shared: XcpuSharedExpertWeights, routed_scaling_factor: float
+    ) -> None:
+        """Run the shared MLP inside the v5 op, in round 0 under the dispatch.
+
+        The op then returns T(gate * shared) + T(routed * routed_scaling_factor),
+        the complete MoE output; the caller drops its own shared path.
+        """
+        if self.version != 5:
+            raise ValueError("only XCPU EP v5 fuses shared experts")
+        self.shared = shared
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        self.workspace_bytes = self._workspace_size(shared.intermediate)
+
+    def initialize_windows(self) -> None:
+        """Create the v5 dispatch and combine MPI windows (no-op for v6).
+
+        Collective over the EP group, outside forward: every rank calls it
+        for every layer in the same order. All layers share the windows.
+        """
+        if self.version != 5:
+            return
+        params = self.compute.params
+        torch.ops.torch_xcpu.fused_ep_moe_v5_initialize_windows(
+            self.ep_size,
+            self.max_num_tokens,
+            self.topk,
+            params.hidden,
+            params.experts,
+            4 if self.activation_dtype == torch.float32 else 2,
+            self.max_recv_tokens_per_rank,
+            self.comm_ptr_wrapper,
         )
 
     def forward(
         self, hidden_states: Tensor, topk_weights: Tensor, topk_ids: Tensor
     ) -> Tensor:
+        """Routes may cover only the leading rows of hidden_states.
+
+        The remaining rows are sequence-parallel padding: never dispatched, not
+        run through a fused shared expert, and zero in the output.
+        """
         params = self.compute.params
         if hidden_states.dtype != self.activation_dtype:
             raise ValueError("EP MoE activation dtype disagrees with compute backend")
         torch._check(hidden_states.ndim == 2)
         torch._check(hidden_states.size(1) == params.hidden)
         torch._check(hidden_states.size(0) <= self.max_num_tokens)
-        torch._check(topk_ids.shape == (hidden_states.size(0), self.topk))
+        torch._check(topk_ids.size(0) <= hidden_states.size(0))
+        torch._check(topk_ids.size(1) == self.topk)
         torch._check(topk_weights.shape == topk_ids.shape)
         torch._check(hidden_states.device == self.expert_map.device)
         torch._check(topk_ids.device == hidden_states.device)
@@ -135,6 +230,21 @@ class XcpuEPExperts(torch.nn.Module):
             self.workspace_bytes, device=hidden_states.device, dtype=torch.uint8
         )
         output = torch.empty_like(hidden_states)
+        shared = self.shared
+        shared_args: tuple[object, ...]
+        if shared is None:
+            shared_args = ()
+        else:
+            shared_args = (
+                shared.w13,
+                shared.w2,
+                shared.w13_scale,
+                shared.w2_scale,
+                shared.linear_backend,
+                *shared.scale_block_size,
+                shared.gate,
+                self.routed_scaling_factor,
+            )
         self._op(
             output,
             hidden_states,
@@ -155,6 +265,7 @@ class XcpuEPExperts(torch.nn.Module):
             self.comm_ptr_wrapper,
             workspace,
             self.max_recv_tokens_per_rank,
+            *shared_args,
         )
         return output
 
@@ -171,9 +282,13 @@ class XcpuEPKernelAdapter(mk.FusedMoEKernel):
         super().__init__(prepare_finalize, fused_experts)
         self.ep_experts = ep_experts
 
+    def supports_num_valid_tokens(self) -> bool:
+        return True
+
     @property
     def can_overlap_shared_experts(self) -> bool:
-        # Shared experts stay on the upstream MoERunner path.
+        # Shared experts stay on the upstream MoERunner path; a fused v5 shared
+        # MLP is detached from the runner instead (install_fused_shared_experts).
         return False
 
     def validate_routed_contract(
