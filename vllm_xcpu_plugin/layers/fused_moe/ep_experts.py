@@ -202,13 +202,19 @@ class XcpuEPExperts(torch.nn.Module):
     def forward(
         self, hidden_states: Tensor, topk_weights: Tensor, topk_ids: Tensor
     ) -> Tensor:
+        """Routes may cover only the leading rows of hidden_states.
+
+        The remaining rows are sequence-parallel padding: never dispatched, not
+        run through a fused shared expert, and zero in the output.
+        """
         params = self.compute.params
         if hidden_states.dtype != self.activation_dtype:
             raise ValueError("EP MoE activation dtype disagrees with compute backend")
         torch._check(hidden_states.ndim == 2)
         torch._check(hidden_states.size(1) == params.hidden)
         torch._check(hidden_states.size(0) <= self.max_num_tokens)
-        torch._check(topk_ids.shape == (hidden_states.size(0), self.topk))
+        torch._check(topk_ids.size(0) <= hidden_states.size(0))
+        torch._check(topk_ids.size(1) == self.topk)
         torch._check(topk_weights.shape == topk_ids.shape)
         torch._check(hidden_states.device == self.expert_map.device)
         torch._check(topk_ids.device == hidden_states.device)
@@ -275,6 +281,9 @@ class XcpuEPKernelAdapter(mk.FusedMoEKernel):
     def __init__(self, prepare_finalize, fused_experts, ep_experts):
         super().__init__(prepare_finalize, fused_experts)
         self.ep_experts = ep_experts
+
+    def supports_num_valid_tokens(self) -> bool:
+        return True
 
     @property
     def can_overlap_shared_experts(self) -> bool:
