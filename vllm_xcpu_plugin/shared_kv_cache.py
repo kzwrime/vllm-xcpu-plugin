@@ -1,4 +1,12 @@
-"""Node-local replicated GLM cache backing for model runner V2."""
+"""Node-local replicated GLM cache backing for model runner V2.
+
+GLM MLA latent and indexer K caches are computed by replicated projections, so
+every TP rank produces the same bytes for the same slot. All ranks write them
+into the shared pool and read back only what they wrote themselves; concurrent
+writes of identical bytes need no ordering, so the forward pass adds no
+cross-rank synchronization. Only step-start zeroing and CoW block copies store
+different bytes, and update_requests fences around them.
+"""
 
 import dataclasses
 import os
@@ -38,8 +46,6 @@ def validate_config(config):
         )
     if config.model_config.hf_text_config.model_type != "glm_moe_dsa":
         raise ValueError("Shared KV currently supports GLM5.2 only")
-    if os.getenv("VLLM_XCPU_FUSED_INDEXER_K", "1") == "0":
-        raise ValueError("Shared KV requires fused indexer K preprocessing")
 
 
 def memory_budget():
@@ -51,23 +57,13 @@ def memory_budget():
     return budget
 
 
-@torch.library.custom_op("xcpu::shared_kv_publish", mutates_args=("cache",))
-def publish(cache: torch.Tensor) -> None:
-    # Keep device completion and cross-rank publication inside the compiled graph.
-    runtime().fence()
-
-
-@publish.register_fake
-def _publish_fake(cache):
-    pass
-
-
 class SharedKVCache:
     def __init__(self, config, device, draft_layers=()):
         from vllm.distributed import get_pcp_group, get_tp_group
 
         self.group = get_tp_group()
-        self.writer = self.group.rank_in_group == 0
+        # The owner only initializes the pool; every rank writes cache entries.
+        self.owner = self.group.rank_in_group == 0
         self.device = device
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pcp_rank = get_pcp_group().rank_in_group
@@ -127,10 +123,10 @@ class SharedKVCache:
         )
         buf = xmalloc(size, device.index).view(torch.int8)
         self.backing.append(buf)
-        if self.writer:
+        if self.owner:
             buf.zero_()
         self.fence()
-        result = {}
+        result: dict[str, torch.Tensor] = {}
         for tensor in config.kv_cache_tensors:
             name = tensor.layers[0]
             group_id, spec = layer_specs[name]

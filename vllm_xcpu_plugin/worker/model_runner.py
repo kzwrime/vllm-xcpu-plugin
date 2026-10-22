@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from contextlib import contextmanager
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -58,42 +57,20 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         )
         return shared.allocate(*args, **kwargs)
 
-    def _init_kv_zero_meta(self):
-        from vllm.v1.worker.utils import KVBlockZeroer
-
-        shared = shared_kv_cache.runtime()
-        if shared is None or shared.writer:
-            return super()._init_kv_zero_meta()
-        groups = (
-            replace(
-                g, layer_names=[n for n in g.layer_names if n in shared.draft_layers]
-            )
-            for groups in self.attn_groups
-            for g in groups
-        )
-        self.kv_block_zeroer = KVBlockZeroer(
-            self.device,
-            attn_groups_iter=groups,
-            kernel_block_sizes=self.kernel_block_sizes,
-            static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
-        )
-
     def update_requests(self, scheduler_output):
-        from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
-
         shared = shared_kv_cache.runtime()
-        if shared is None:
+        if shared is None or not (
+            scheduler_output.new_block_ids_to_zero
+            or scheduler_output.kv_cache_block_copies
+        ):
+            # Forward cache writes store identical bytes on every rank.
             return super().update_requests(scheduler_output)
-        # Drain the previous step before blocks are cleared, copied or reused.
+        # Zeroing and CoW copies store different bytes into recycled blocks. Every
+        # rank must finish reading them first and finish rewriting them before any
+        # rank appends this step's tokens. TP ranks share the scheduler output, so
+        # they all take this branch together.
         shared.fence()
-        super().update_requests(replace(scheduler_output, kv_cache_block_copies=[]))
-        caches = self.kv_caches if shared.writer else shared.private_caches
-        copy_kv_cache_blocks_inplace(
-            caches,
-            self.kv_cache_config.num_blocks,
-            scheduler_output.kv_cache_block_copies,
-        )
+        super().update_requests(scheduler_output)
         shared.fence()
 
     def execute_model(

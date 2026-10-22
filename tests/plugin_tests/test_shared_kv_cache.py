@@ -211,8 +211,8 @@ def _worker(rank, rendezvous):
         k_cache = torch.compile(k_cache, fullgraph=True)
         qk_cache = torch.compile(qk_cache, fullgraph=True)
     for step in range(8):
-        runtime.fence()
-        # Recycle and overwrite slots while the other rank reads the same pool.
+        # Every rank in a group writes the same bytes and immediately reads them
+        # back while its peers write the same slots; no fence separates the two.
         slots.fill_(64 + step % 3)
         positions.fill_(step)
         value = 10 + rank // tp * 100 + step
@@ -221,10 +221,6 @@ def _worker(rank, rendezvous):
         torch_xcpu.ops.reshape_and_cache(
             kv, pe.squeeze(1), expected_mla, slots, kv_cache_dtype="auto"
         )
-        # Deliberately different follower input catches accidental duplicate writes.
-        if not runtime.writer:
-            kv.fill_(-500)
-            pe.fill_(-500)
         _xcpu_do_kv_cache_update(None, kv, pe, mla, slots, "auto", None)
         torch.testing.assert_close(mla.cpu(), expected_mla.cpu(), rtol=0, atol=0)
         if step % 2:
@@ -246,7 +242,7 @@ def _worker(rank, rendezvous):
             q_result, weights_result = qk_cache(
                 q,
                 weights,
-                k if runtime.writer else k + 10,
+                k,
                 weight,
                 bias,
                 positions,
@@ -265,7 +261,7 @@ def _worker(rank, rendezvous):
                 k, weight, bias, positions, cos_sin, slots, expected_idx, 1e-6, False
             )
             k_cache(
-                k if runtime.writer else k + 10,
+                k,
                 weight,
                 bias,
                 positions,
@@ -276,16 +272,16 @@ def _worker(rank, rendezvous):
                 False,
             )
         torch.testing.assert_close(idx.cpu(), expected_idx.cpu(), rtol=0, atol=0)
+        # Stand-in for the TP collectives that keep ranks within one layer; the
+        # next step recycles these slots with different bytes.
         runtime.fence()
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("writer", [False, True])
-def test_v2_updates_private_draft_and_only_owner_updates_shared(monkeypatch, writer):
+@pytest.mark.parametrize("zero,copies", [([], []), ([5], []), ([], [(2, 5)])])
+def test_v2_fences_only_steps_that_rewrite_blocks(monkeypatch, zero, copies):
     from dataclasses import dataclass
     from types import SimpleNamespace
-
-    from vllm.v1.worker import utils
 
     from vllm_xcpu_plugin import shared_kv_cache
     from vllm_xcpu_plugin.worker.model_runner import GPUModelRunnerV2, McpuModelRunnerV2
@@ -294,72 +290,21 @@ def test_v2_updates_private_draft_and_only_owner_updates_shared(monkeypatch, wri
     class Update:
         new_block_ids_to_zero: list
         kv_cache_block_copies: list
-        block_table_updates: dict
 
-    output = Update([5], [(2, 5)], {"request": [7, 5]})
+    output = Update(zero, copies)
     calls = []
-    shared = SimpleNamespace(
-        writer=writer, private_caches=["draft"], fence=lambda: calls.append("fence")
-    )
-    monkeypatch.setattr(shared_kv_cache, "_runtime", shared)
-    monkeypatch.setattr(
-        GPUModelRunnerV2, "update_requests", lambda self, x: calls.append(x)
-    )
-    monkeypatch.setattr(
-        utils,
-        "copy_kv_cache_blocks_inplace",
-        lambda caches, blocks, copies: calls.append((caches, copies)),
-    )
-    runner = McpuModelRunnerV2.__new__(McpuModelRunnerV2)
-    runner.kv_caches = ["target", "draft"]
-    runner.kv_cache_config = SimpleNamespace(num_blocks=8)
-    runner.update_requests(output)
-    assert calls[0] == calls[-1] == "fence"
-    assert calls[1].block_table_updates is output.block_table_updates
-    assert calls[1].new_block_ids_to_zero == [5]
-    assert calls[1].kv_cache_block_copies == []
-    assert calls[2] == (["target", "draft"] if writer else ["draft"], [(2, 5)])
-    assert output.kv_cache_block_copies == [(2, 5)]
-
-
-@pytest.mark.parametrize("writer", [False, True])
-def test_v2_zeroing_keeps_private_draft_on_followers(monkeypatch, writer):
-    from dataclasses import dataclass
-    from types import SimpleNamespace
-
-    from vllm.v1.worker import utils
-
-    from vllm_xcpu_plugin import shared_kv_cache
-    from vllm_xcpu_plugin.worker.model_runner import GPUModelRunnerV2, McpuModelRunnerV2
-
-    @dataclass
-    class Group:
-        layer_names: list
-
-    captured = []
     monkeypatch.setattr(
         shared_kv_cache,
         "_runtime",
-        SimpleNamespace(writer=writer, draft_layers={"draft"}),
+        SimpleNamespace(fence=lambda: calls.append("fence")),
     )
     monkeypatch.setattr(
-        GPUModelRunnerV2, "_init_kv_zero_meta", lambda self: captured.append("all")
-    )
-    monkeypatch.setattr(
-        utils,
-        "KVBlockZeroer",
-        lambda *args, **kwargs: captured.extend(
-            n for g in kwargs["attn_groups_iter"] for n in g.layer_names
-        ),
+        GPUModelRunnerV2, "update_requests", lambda self, x: calls.append(x)
     )
     runner = McpuModelRunnerV2.__new__(McpuModelRunnerV2)
-    runner.device = None
-    runner.attn_groups = [[Group(["target"]), Group(["draft"])]]
-    runner.kernel_block_sizes = [64, 64]
-    runner.compilation_config = SimpleNamespace(static_forward_context={})
-    runner.kv_cache_config = SimpleNamespace(num_blocks=8)
-    runner._init_kv_zero_meta()
-    assert captured == (["all"] if writer else ["draft"])
+    runner.update_requests(output)
+    # Zeroing and copies run unchanged on every rank, shared layers included.
+    assert calls == (["fence", output, "fence"] if zero or copies else [output])
 
 
 if __name__ == "__main__":
