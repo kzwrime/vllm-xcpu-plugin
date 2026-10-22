@@ -11,6 +11,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_SHARED_KV_CACHE": lambda: (
         os.getenv("VLLM_XCPU_SHARED_KV_CACHE", "0") == "1"
     ),
+    # Contiguous TP ranks per physically shared KV pool; unset means the whole
+    # TP group. Must divide the TP size.
+    "VLLM_XCPU_SHARED_KV_GROUP_SIZE": lambda: (
+        int(os.environ["VLLM_XCPU_SHARED_KV_GROUP_SIZE"])
+        if os.getenv("VLLM_XCPU_SHARED_KV_GROUP_SIZE")
+        else None
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

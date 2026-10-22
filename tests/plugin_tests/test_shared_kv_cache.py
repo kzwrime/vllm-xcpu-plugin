@@ -9,11 +9,11 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "tp,packed,compiled",
-    [(tp, packed, False) for tp in (1, 2, 4) for packed in (False, True)]
-    + [(2, False, True)],
+    "tp,group,packed,compiled",
+    [(tp, tp, packed, False) for tp in (1, 2, 4) for packed in (False, True)]
+    + [(2, 2, False, True), (4, 2, False, False), (4, 2, True, False)],
 )
-def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, compiled):
+def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, group, compiled):
     processes = []
     env = dict(
         os.environ,
@@ -26,6 +26,7 @@ def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, compiled):
         SHARED_TEST_TP=str(tp),
         SHARED_TEST_COMPILED=str(int(compiled)),
         VLLM_XCPU_SHARED_KV_CACHE="1",
+        VLLM_XCPU_SHARED_KV_GROUP_SIZE=str(group),
     )
     env.pop("TORCH_MCPU_SHARED_BASE", None)
     try:
@@ -51,8 +52,14 @@ def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, compiled):
                 failures.append(out + err)
         assert not failures, "\n".join(failures)
         files = sorted(tmp_path.glob("cache.dp*"))
-        assert len(files) == 2
-        assert files[0].read_bytes() != files[1].read_bytes()
+        assert len(files) == 2 * (tp // group)
+        pools = {}
+        for file in files:
+            pools.setdefault(file.name.split(".")[1], set()).add(file.read_bytes())
+        # Domains of one DP rank hold identical replicas; DP ranks differ.
+        assert sorted(pools) == ["dp0", "dp1"]
+        assert all(len(contents) == 1 for contents in pools.values())
+        assert pools["dp0"] != pools["dp1"]
     finally:
         for process in processes:
             if process.poll() is None:
@@ -276,6 +283,35 @@ def _worker(rank, rendezvous):
         # next step recycles these slots with different bytes.
         runtime.fence()
     dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("", 4), ("1", 1), ("2", 2), ("4", 4), ("3", None), ("0", None)]
+)
+def test_group_size_must_divide_tp(monkeypatch, value, expected):
+    from vllm_xcpu_plugin.shared_kv_cache import group_size
+
+    monkeypatch.setenv("VLLM_XCPU_SHARED_KV_GROUP_SIZE", value)
+    if expected is None:
+        with pytest.raises(ValueError, match="must divide TP size 4"):
+            group_size(4)
+    else:
+        assert group_size(4) == expected
+
+
+def test_domain_probe_rejects_mismatched_mapping():
+    from vllm_xcpu_plugin.shared_kv_cache import check_domains
+
+    a, b, unset = b"a" * 8, b"b" * 8, b"\0" * 8
+    check_domains([(0, a, a), (0, None, a), (1, b, b), (1, None, b)])
+    for records in (
+        # Domain 1's second rank does not map its owner's pool.
+        [(0, a, a), (0, None, a), (1, b, b), (1, None, unset)],
+        # Both domains map one pool, so domain 0 reads domain 1's nonce.
+        [(0, a, b), (0, None, b), (1, b, b), (1, None, b)],
+    ):
+        with pytest.raises(RuntimeError, match="does not match the physical"):
+            check_domains(records)
 
 
 @pytest.mark.parametrize("zero,copies", [([], []), ([5], []), ([], [(2, 5)])])

@@ -6,6 +6,10 @@ into the shared pool and read back only what they wrote themselves; concurrent
 writes of identical bytes need no ordering, so the forward pass adds no
 cross-rank synchronization. Only step-start zeroing and CoW block copies store
 different bytes, and update_requests fences around them.
+
+VLLM_XCPU_SHARED_KV_GROUP_SIZE splits the TP group into domains of contiguous
+ranks that map the same physical pool (default: the whole TP group). Fences
+still span the whole TP group, which orders every domain.
 """
 
 import dataclasses
@@ -28,6 +32,28 @@ def runtime():
     return _runtime
 
 
+def group_size(tp_size):
+    value = os.getenv("VLLM_XCPU_SHARED_KV_GROUP_SIZE", "")
+    size = int(value) if value else tp_size
+    if size <= 0 or tp_size % size:
+        raise ValueError(
+            f"VLLM_XCPU_SHARED_KV_GROUP_SIZE={value} must divide TP size {tp_size}"
+        )
+    return size
+
+
+def check_domains(records):
+    """Check (domain, owner nonce or None, bytes read) gathered from TP ranks."""
+    nonces = {domain: nonce for domain, nonce, _ in records if nonce is not None}
+    if len(set(nonces.values())) != len(nonces) or any(
+        seen != nonces.get(domain) for domain, _, seen in records
+    ):
+        raise RuntimeError(
+            "VLLM_XCPU_SHARED_KV_GROUP_SIZE does not match the physical shared "
+            f"mapping: (domain, written, read) per TP rank = {records}"
+        )
+
+
 def validate_config(config):
     if not enabled():
         return
@@ -46,6 +72,7 @@ def validate_config(config):
         )
     if config.model_config.hf_text_config.model_type != "glm_moe_dsa":
         raise ValueError("Shared KV currently supports GLM5.2 only")
+    group_size(p.tensor_parallel_size)
 
 
 def memory_budget():
@@ -62,8 +89,10 @@ class SharedKVCache:
         from vllm.distributed import get_pcp_group, get_tp_group
 
         self.group = get_tp_group()
-        # The owner only initializes the pool; every rank writes cache entries.
-        self.owner = self.group.rank_in_group == 0
+        self.group_size = group_size(self.group.world_size)
+        self.domain, local_rank = divmod(self.group.rank_in_group, self.group_size)
+        # The owner only initializes its domain's pool; every rank writes entries.
+        self.owner = local_rank == 0
         self.device = device
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pcp_rank = get_pcp_group().rank_in_group
@@ -71,11 +100,29 @@ class SharedKVCache:
         self.backing = []
         self.private_caches = []
 
-    def agree(self, value):
+    def gather(self, value):
         values = [None] * self.group.world_size
         dist.all_gather_object(values, value, group=self.group.cpu_group)
-        if any(item != values[0] for item in values):
+        return values
+
+    def agree(self, common, per_domain):
+        # Every rank checks every domain, so all ranks reach the same verdict.
+        values = self.gather((self.domain, common, per_domain))
+        common_differs = any(item != values[0][1] for _, item, _ in values)
+        pairs = {(domain, item) for domain, _, item in values}
+        domain_differs = len(pairs) != len({domain for domain, _ in pairs})
+        if common_differs or domain_differs:
             raise ValueError(f"Shared KV TP configuration mismatch: {values}")
+
+    def probe(self, buf):
+        """Fail if the configured domains differ from the physical mapping."""
+        nonce = os.urandom(8) if self.owner else None
+        if nonce is not None:
+            buf[:8].copy_(torch.frombuffer(bytearray(nonce), dtype=torch.int8))
+        self.fence()
+        seen = bytes(buf[:8].cpu().numpy())
+        # The gather also orders every read before the owner clears the pool.
+        check_domains(self.gather((self.domain, nonce, seen)))
 
     def fence(self):
         torch.mcpu.synchronize(self.device)
@@ -95,15 +142,18 @@ class SharedKVCache:
             raise RuntimeError("Shared KV supports one engine per worker process")
         path = os.getenv("TORCH_MCPU_SHARED_SIM_FILE")
         if path:
-            path = f"{path}.dp{self.dp_rank}.pcp{self.pcp_rank}"
+            path = f"{path}.dp{self.dp_rank}.pcp{self.pcp_rank}.tp{self.domain}"
             os.environ["TORCH_MCPU_SHARED_SIM_FILE"] = path
-        self.agree((
-            socket.gethostname(),
-            path,
-            memory_budget(),
-            dataclasses.asdict(config),
-            sorted(self.draft_layers),
-        ))
+        self.agree(
+            (
+                self.group_size,
+                memory_budget(),
+                dataclasses.asdict(config),
+                sorted(self.draft_layers),
+            ),
+            # Only ranks of one domain must share a host and a backing file.
+            (socket.gethostname(), path),
+        )
         layer_specs = {}
         for group_id, group in enumerate(config.kv_cache_groups):
             for name in group.layer_names:
@@ -123,6 +173,7 @@ class SharedKVCache:
         )
         buf = xmalloc(size, device.index).view(torch.int8)
         self.backing.append(buf)
+        self.probe(buf)
         if self.owner:
             buf.zero_()
         self.fence()
@@ -166,10 +217,12 @@ class SharedKVCache:
                 self.private_caches.extend(views)
         _runtime = self
         logger.info(
-            "Shared KV ready: dp=%d pcp=%d tp=%d shared_bytes=%d file=%s",
+            "Shared KV ready: dp=%d pcp=%d tp=%d domain=%d/%d shared_bytes=%d file=%s",
             self.dp_rank,
             self.pcp_rank,
             self.group.world_size,
+            self.domain,
+            self.group.world_size // self.group_size,
             size,
             path,
         )
