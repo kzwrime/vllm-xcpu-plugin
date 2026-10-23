@@ -58,20 +58,21 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         return shared.allocate(*args, **kwargs)
 
     def update_requests(self, scheduler_output):
+        super().update_requests(scheduler_output)
         shared = shared_kv_cache.runtime()
         if shared is None or not (
             scheduler_output.new_block_ids_to_zero
             or scheduler_output.kv_cache_block_copies
         ):
             # Forward cache writes store identical bytes on every rank.
-            return super().update_requests(scheduler_output)
-        # Zeroing and CoW copies store different bytes into recycled blocks. Every
-        # rank must finish reading them first and finish rewriting them before any
-        # rank appends this step's tokens. TP ranks share the scheduler output, so
-        # they all take this branch together.
-        shared.fence()
-        super().update_requests(scheduler_output)
-        shared.fence()
+            return
+        # Zeroing and CoW copies store different bytes into recycled blocks.
+        # Peers finished reading them last step: each rank's final cache read
+        # precedes that step's last TP all-reduce on its stream, and this rank
+        # queued the rewrite after the same all-reduce. The queued fence keeps any
+        # rank from appending this step's tokens before every rank has rewritten
+        # the blocks. TP ranks share the scheduler output, so they fence together.
+        shared.device_fence()
 
     def execute_model(
         self,

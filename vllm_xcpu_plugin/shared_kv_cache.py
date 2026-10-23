@@ -5,7 +5,9 @@ every TP rank produces the same bytes for the same slot. All ranks write them
 into the shared pool and read back only what they wrote themselves; concurrent
 writes of identical bytes need no ordering, so the forward pass adds no
 cross-rank synchronization. Only step-start zeroing and CoW block copies store
-different bytes, and update_requests fences around them.
+different bytes. Those need device-side ordering only: update_requests queues a
+TP all-reduce after them, so no rank appends this step's tokens before every
+rank has rewritten the blocks. The host waits only during startup.
 
 VLLM_XCPU_SHARED_KV_GROUP_SIZE splits the TP group into domains of contiguous
 ranks that map the same physical pool (default: the whole TP group). Fences
@@ -97,6 +99,7 @@ class SharedKVCache:
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pcp_rank = get_pcp_group().rank_in_group
         self.draft_layers = set(draft_layers)
+        self.fence_token = torch.zeros(1, device=device)
         self.backing = []
         self.private_caches = []
 
@@ -125,9 +128,18 @@ class SharedKVCache:
         check_domains(self.gather((self.domain, nonce, seen)))
 
     def fence(self):
+        """Wait on the host until every rank's queued work is done (startup)."""
         torch.mcpu.synchronize(self.device)
         if self.group.world_size > 1:
             self.group.barrier()
+
+    def device_fence(self):
+        """Order queued writes on every rank before later queued work on any rank.
+
+        With MPI the all-reduce is queued on the current stream and completes only
+        after every rank reaches it, so the host does not wait.
+        """
+        self.group.all_reduce(self.fence_token)
 
     def allocate(self, config, device, layout, kernel_block_sizes=None):
         global _runtime

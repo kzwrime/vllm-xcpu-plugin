@@ -97,13 +97,17 @@ def _worker(rank, rendezvous):
         world_size=2 * tp,
         timeout=timedelta(seconds=45),
     )
-    groups = [dist.new_group(list(range(i * tp, (i + 1) * tp))) for i in range(2)]
+    ranks = [list(range(i * tp, (i + 1) * tp)) for i in range(2)]
+    groups = [dist.new_group(r) for r in ranks]
+    device_groups = [dist.new_group(r, backend="mcpu") for r in ranks]
     group = groups[rank // tp]
+    device_group = device_groups[rank // tp]
     coordinator = SimpleNamespace(
         world_size=tp,
         rank_in_group=rank % tp,
         cpu_group=group,
         barrier=lambda: dist.barrier(group=group),
+        all_reduce=lambda t: dist.all_reduce(t, group=device_group),
     )
 
     vllm.distributed.get_tp_group = lambda: coordinator
@@ -218,6 +222,11 @@ def _worker(rank, rendezvous):
         k_cache = torch.compile(k_cache, fullgraph=True)
         qk_cache = torch.compile(qk_cache, fullgraph=True)
     for step in range(8):
+        # Step start: every rank zeroes the recycled block, and the queued fence
+        # keeps peers from appending tokens until all ranks have zeroed it.
+        for cache in (mla, idx, expected_mla, expected_idx):
+            cache[1].zero_()
+        runtime.device_fence()
         # Every rank in a group writes the same bytes and immediately reads them
         # back while its peers write the same slots; no fence separates the two.
         slots.fill_(64 + step % 3)
@@ -279,9 +288,9 @@ def _worker(rank, rendezvous):
                 False,
             )
         torch.testing.assert_close(idx.cpu(), expected_idx.cpu(), rtol=0, atol=0)
-        # Stand-in for the TP collectives that keep ranks within one layer; the
-        # next step recycles these slots with different bytes.
-        runtime.fence()
+        # Stand-in for the TP all-reduce that follows each rank's last cache read;
+        # the next step zeroes these slots.
+        runtime.device_fence()
     dist.destroy_process_group()
 
 
@@ -315,7 +324,7 @@ def test_domain_probe_rejects_mismatched_mapping():
 
 
 @pytest.mark.parametrize("zero,copies", [([], []), ([5], []), ([], [(2, 5)])])
-def test_v2_fences_only_steps_that_rewrite_blocks(monkeypatch, zero, copies):
+def test_v2_fences_after_steps_that_rewrite_blocks(monkeypatch, zero, copies):
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -332,15 +341,19 @@ def test_v2_fences_only_steps_that_rewrite_blocks(monkeypatch, zero, copies):
     monkeypatch.setattr(
         shared_kv_cache,
         "_runtime",
-        SimpleNamespace(fence=lambda: calls.append("fence")),
+        SimpleNamespace(
+            fence=lambda: calls.append("fence"),
+            device_fence=lambda: calls.append("device_fence"),
+        ),
     )
     monkeypatch.setattr(
         GPUModelRunnerV2, "update_requests", lambda self, x: calls.append(x)
     )
     runner = McpuModelRunnerV2.__new__(McpuModelRunnerV2)
     runner.update_requests(output)
-    # Zeroing and copies run unchanged on every rank, shared layers included.
-    assert calls == (["fence", output, "fence"] if zero or copies else [output])
+    # Zeroing and copies run unchanged on every rank, shared layers included, and
+    # only a queued fence follows them; the host never waits.
+    assert calls == ([output, "device_fence"] if zero or copies else [output])
 
 
 if __name__ == "__main__":
