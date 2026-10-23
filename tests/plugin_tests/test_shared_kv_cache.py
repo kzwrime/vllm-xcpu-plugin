@@ -9,11 +9,16 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "tp,group,packed,compiled",
-    [(tp, tp, packed, False) for tp in (1, 2, 4) for packed in (False, True)]
-    + [(2, 2, False, True), (4, 2, False, False), (4, 2, True, False)],
+    "tp,group,packed,compiled,default_file",
+    [(tp, tp, packed, False, False) for tp in (1, 2, 4) for packed in (False, True)]
+    + [
+        (2, 2, False, True, False),
+        (4, 2, False, False, False),
+        (4, 2, True, False, False),
+        (2, 2, False, False, True),
+    ],
 )
-def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, group, compiled):
+def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, group, compiled, default_file):
     processes = []
     env = dict(
         os.environ,
@@ -25,10 +30,13 @@ def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, group, compiled):
         SHARED_TEST_PACKED=str(int(packed)),
         SHARED_TEST_TP=str(tp),
         SHARED_TEST_COMPILED=str(int(compiled)),
+        SHARED_TEST_OUT=str(tmp_path),
         VLLM_XCPU_SHARED_KV_CACHE="1",
         VLLM_XCPU_SHARED_KV_GROUP_SIZE=str(group),
     )
     env.pop("TORCH_MCPU_SHARED_BASE", None)
+    if default_file:
+        env.pop("TORCH_MCPU_SHARED_SIM_FILE")
     try:
         for rank in range(2 * tp):
             processes.append(
@@ -46,17 +54,25 @@ def test_shared_cache_two_tp_pairs(tmp_path, packed, tp, group, compiled):
                 )
             )
         failures = []
+        paths = set()
         for process in processes:
             out, err = process.communicate(timeout=180)
             if process.returncode:
                 failures.append(out + err)
+            paths.update(
+                line.removeprefix("SHARED_KV_FILE=")
+                for line in out.splitlines()
+                if line.startswith("SHARED_KV_FILE=")
+            )
         assert not failures, "\n".join(failures)
-        files = sorted(tmp_path.glob("cache.dp*"))
-        assert len(files) == 2 * (tp // group)
+        # One file per domain, removed once mapped.
+        prefix = "/dev/shm/xcpu_shared_kv." if default_file else str(tmp_path / "cache")
+        assert len(paths) == 2 * (tp // group)
+        assert all(p.startswith(prefix) and not os.path.exists(p) for p in paths)
         pools = {}
-        for file in files:
+        for file in tmp_path.glob("pool.*"):
             pools.setdefault(file.name.split(".")[1], set()).add(file.read_bytes())
-        # Domains of one DP rank hold identical replicas; DP ranks differ.
+        # Every rank of one DP rank sees identical replicas; DP ranks differ.
         assert sorted(pools) == ["dp0", "dp1"]
         assert all(len(contents) == 1 for contents in pools.values())
         assert pools["dp0"] != pools["dp1"]
@@ -291,6 +307,10 @@ def _worker(rank, rendezvous):
         # Stand-in for the TP all-reduce that follows each rank's last cache read;
         # the next step zeroes these slots.
         runtime.device_fence()
+    print(f"SHARED_KV_FILE={runtime.path}")
+    pool = runtime.backing[0].cpu().numpy().tobytes()
+    out = Path(os.environ["SHARED_TEST_OUT"])
+    (out / f"pool.dp{rank // tp}.rank{rank}").write_bytes(pool)
     dist.destroy_process_group()
 
 

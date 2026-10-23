@@ -12,10 +12,16 @@ rank has rewritten the blocks. The host waits only during startup.
 VLLM_XCPU_SHARED_KV_GROUP_SIZE splits the TP group into domains of contiguous
 ranks that map the same physical pool (default: the whole TP group). Fences
 still span the whole TP group, which orders every domain.
+
+The x86 simulation backs each domain's pool with a file named after
+TORCH_MCPU_SHARED_SIM_FILE, or /dev/shm/xcpu_shared_kv.<job id> when neither it
+nor TORCH_MCPU_SHARED_BASE (required by pre-mapped builds) is set. The owner
+removes the file once every rank has mapped it, so nothing outlives the job.
 """
 
 import dataclasses
 import os
+import secrets
 import socket
 
 import torch
@@ -102,6 +108,9 @@ class SharedKVCache:
         self.fence_token = torch.zeros(1, device=device)
         self.backing = []
         self.private_caches = []
+        self.path = None
+        # (st_dev, st_ino) of the simulation file, recorded before its removal.
+        self.file_id = None
 
     def gather(self, value):
         values = [None] * self.group.world_size
@@ -152,7 +161,11 @@ class SharedKVCache:
 
         if _runtime is not None:
             raise RuntimeError("Shared KV supports one engine per worker process")
+        # Gather unconditionally: a collective must not depend on per-rank env.
+        job = self.gather(secrets.token_hex(8))[0]
         path = os.getenv("TORCH_MCPU_SHARED_SIM_FILE")
+        if not path and not os.getenv("TORCH_MCPU_SHARED_BASE"):
+            path = f"/dev/shm/xcpu_shared_kv.{job}"
         if path:
             path = f"{path}.dp{self.dp_rank}.pcp{self.pcp_rank}.tp{self.domain}"
             os.environ["TORCH_MCPU_SHARED_SIM_FILE"] = path
@@ -185,8 +198,16 @@ class SharedKVCache:
         )
         buf = xmalloc(size, device.index).view(torch.int8)
         self.backing.append(buf)
+        if path:
+            self.path = path
+            stat = os.stat(path)
+            self.file_id = stat.st_dev, stat.st_ino
         self.probe(buf)
         if self.owner:
+            if path:
+                # The probe proved every rank of the domain mapped the file. The
+                # mappings keep it alive, and a later crash leaves nothing behind.
+                os.unlink(path)
             buf.zero_()
         self.fence()
         result: dict[str, torch.Tensor] = {}
