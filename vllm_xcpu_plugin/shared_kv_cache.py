@@ -68,6 +68,7 @@ def validate_config(config):
     p = config.parallel_config
     if (
         p.pipeline_parallel_size != 1
+        or p.prefill_context_parallel_size != 1
         or p.decode_context_parallel_size != 1
         or not config.use_v2_model_runner
         or p.num_ubatches > 1
@@ -76,7 +77,7 @@ def validate_config(config):
         or os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0") != "0"
     ):
         raise ValueError(
-            "Shared KV requires V2, PP1/DCP1; disable SP/DBO/AF-EP/KV transfer"
+            "Shared KV requires V2, PP1/PCP1/DCP1; disable SP/DBO/AF-EP/KV transfer"
         )
     if config.model_config.hf_text_config.model_type != "glm_moe_dsa":
         raise ValueError("Shared KV currently supports GLM5.2 only")
@@ -94,7 +95,7 @@ def memory_budget():
 
 class SharedKVCache:
     def __init__(self, config, device, draft_layers=()):
-        from vllm.distributed import get_pcp_group, get_tp_group
+        from vllm.distributed import get_tp_group
 
         self.group = get_tp_group()
         self.group_size = group_size(self.group.world_size)
@@ -103,7 +104,6 @@ class SharedKVCache:
         self.owner = local_rank == 0
         self.device = device
         self.dp_rank = config.parallel_config.data_parallel_rank
-        self.pcp_rank = get_pcp_group().rank_in_group
         self.draft_layers = set(draft_layers)
         self.fence_token = torch.zeros(1, device=device)
         self.backing = []
@@ -167,7 +167,7 @@ class SharedKVCache:
         if not path and not os.getenv("TORCH_MCPU_SHARED_BASE"):
             path = f"/dev/shm/xcpu_shared_kv.{job}"
         if path:
-            path = f"{path}.dp{self.dp_rank}.pcp{self.pcp_rank}.tp{self.domain}"
+            path = f"{path}.dp{self.dp_rank}.tp{self.domain}"
             os.environ["TORCH_MCPU_SHARED_SIM_FILE"] = path
         self.agree(
             (
@@ -250,9 +250,8 @@ class SharedKVCache:
                 self.private_caches.extend(views)
         _runtime = self
         logger.info(
-            "Shared KV ready: dp=%d pcp=%d tp=%d domain=%d/%d shared_bytes=%d file=%s",
+            "Shared KV ready: dp=%d tp=%d domain=%d/%d shared_bytes=%d file=%s",
             self.dp_rank,
-            self.pcp_rank,
             self.group.world_size,
             self.domain,
             self.group.world_size // self.group_size,

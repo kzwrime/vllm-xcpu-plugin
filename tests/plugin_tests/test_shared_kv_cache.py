@@ -127,7 +127,6 @@ def _worker(rank, rendezvous):
     )
 
     vllm.distributed.get_tp_group = lambda: coordinator
-    vllm.distributed.get_pcp_group = lambda: SimpleNamespace(rank_in_group=0)
     cache_config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[
