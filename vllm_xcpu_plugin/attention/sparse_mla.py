@@ -124,11 +124,8 @@ def _xcpu_forward_mqa(
 
 def validate_sparse_config(config):
     parallel = config.parallel_config
-    if (
-        parallel.prefill_context_parallel_size != 1
-        or parallel.decode_context_parallel_size != 1
-    ):
-        raise NotImplementedError("XCPU sparse MLA requires PCP=DCP=1")
+    if parallel.decode_context_parallel_size != 1:
+        raise NotImplementedError("XCPU sparse MLA requires DCP=1")
     if config.attention_config.hisparse_config is not None:
         raise NotImplementedError("XCPU sparse MLA does not support HiSparse")
     # DFlash/DFlash2 drafts are dense and use the ordinary attention backend;
@@ -262,7 +259,8 @@ class XcpuMLASparseImpl(SparseMLACommonImpl):
                 "XCPU sparse MLA currently supports GLM5.2 dimensions"
             )
         super().__init__(**kwargs)
-        self.dcp_world_size = self.pcp_world_size = 1
+        self.dcp_world_size = 1
+        self.pcp_world_size = config.parallel_config.prefill_context_parallel_size
         # Sparse-only attention consumes the canonical weight once, never the
         # packed linear representation. Set before the loader postprocesses it.
         self.kv_b_proj._xcpu_mla_weight_only = True
