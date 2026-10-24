@@ -11,6 +11,8 @@ from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
     FlashAttnMLASparseMetadata,
 )
 
+from vllm_xcpu_plugin import shared_kv_cache
+
 
 @dataclass
 class XcpuFlashAttnMLASparseMetadata(FlashAttnMLASparseMetadata):
@@ -20,12 +22,14 @@ class XcpuFlashAttnMLASparseMetadata(FlashAttnMLASparseMetadata):
 
 def _xcpu_fused_mla_rope_kvcache_supported(self) -> bool:
     """The patched sparse MLA backend owns exactly this cache-update path."""
-    return True
+    return not shared_kv_cache.enabled()
 
 
 def _xcpu_fused_mla_rope_qproj_kvcache_supported(self) -> bool:
     """Fused rope + q up-projection + concat + cache update."""
-    return self.kv_cache_dtype in ("auto", "bfloat16", "fp8_ds_mla")
+    return not shared_kv_cache.enabled() and self.kv_cache_dtype in (
+        "auto", "bfloat16", "fp8_ds_mla"
+    )
 
 
 def _xcpu_do_fused_mla_rope_qproj_kvcache_update(
@@ -109,6 +113,11 @@ def _xcpu_do_kv_cache_update(
         return
     import torch_xcpu
 
+    shared = shared_kv_cache.runtime()
+    if shared is not None and not shared.writer:
+        shared.fence()
+        return
+
     torch_xcpu.ops.reshape_and_cache(
         kv_c_normed,  # [tokens, kv_lora_rank]
         k_pe.squeeze(1),  # [tokens, qk_rope]
@@ -125,6 +134,8 @@ def _xcpu_do_kv_cache_update(
         slot_mapping.flatten(),
         kv_cache_dtype="auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
     )
+    if shared is not None:
+        shared.fence()
 
 
 def _xcpu_forward_mqa(

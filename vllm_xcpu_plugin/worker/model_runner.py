@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,6 +13,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_xcpu_plugin.envs as envs_xcpu
+from vllm_xcpu_plugin import shared_kv_cache
 
 if TYPE_CHECKING:
     pass
@@ -27,10 +29,44 @@ class McpuModelRunner(GPUModelRunner):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        shared_kv_cache.validate_config(vllm_config)
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
+
+    def _allocate_kv_cache_tensors(self, kv_cache_config):
+        if not shared_kv_cache.enabled():
+            return super()._allocate_kv_cache_tensors(kv_cache_config)
+        self.shared_kv = shared_kv_cache.SharedKVCache(self.vllm_config, self.device)
+        return self.shared_kv.allocate(kv_cache_config)
+
+    @staticmethod
+    def use_uniform_kv_cache(attn_groups):
+        if shared_kv_cache.enabled():
+            return False
+        return GPUModelRunner.use_uniform_kv_cache(attn_groups)
+
+    def _update_states(self, scheduler_output):
+        shared = shared_kv_cache.runtime()
+        if shared is None:
+            return super()._update_states(scheduler_output)
+        shared.fence()
+        if not shared.writer:
+            scheduler_output = replace(
+                scheduler_output, new_block_ids_to_zero=None,
+                kv_cache_block_copies=[],
+            )
+        result = super()._update_states(scheduler_output)
+        shared.fence()
+        return result
+
+    def execute_model(self, *args, **kwargs):
+        result = super().execute_model(*args, **kwargs)
+        shared = shared_kv_cache.runtime()
+        if shared is not None:
+            shared.fence()
+        return result
 
 
 class McpuModelRunnerV2(GPUModelRunnerV2):
@@ -41,6 +77,7 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        shared_kv_cache.validate_config(vllm_config)
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self._af_forward_allreduce = envs_xcpu.VLLM_XCPU_AF_FORWARD_ALLREDUCE

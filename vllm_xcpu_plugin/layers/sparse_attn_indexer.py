@@ -21,6 +21,8 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 
+from vllm_xcpu_plugin import shared_kv_cache
+
 # Handles are allocated in model construction order, just like the GDN state.
 _metadata_handles = itertools.count(1)
 
@@ -410,6 +412,10 @@ def _indexer_k_cache(
     slots = slot_mappings[prefix]
     import torch_xcpu
 
+    shared = shared_kv_cache.runtime()
+    if shared is not None and not shared.writer:
+        shared.fence()
+        return
     torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
         k,
         weight,
@@ -421,6 +427,8 @@ def _indexer_k_cache(
         eps,
         is_neox,
     )
+    if shared is not None:
+        shared.fence()
 
 
 def _indexer_qk_cache(
@@ -453,7 +461,14 @@ def _indexer_qk_cache(
     slot_mappings = forward_context.slot_mapping
     assert isinstance(slot_mappings, dict)
     slots = slot_mappings[prefix]
-    return torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
+    shared = shared_kv_cache.runtime()
+    if shared is not None and not shared.writer:
+        result = torch_xcpu.ops.fused_indexer_q_rope_quant(
+            positions, q, cos_sin, weights, softmax_scale, head_scale, is_neox, False
+        )
+        shared.fence()
+        return result
+    result = torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
         positions,
         q,
         cos_sin,
@@ -468,6 +483,9 @@ def _indexer_qk_cache(
         head_scale,
         is_neox,
     )
+    if shared is not None:
+        shared.fence()
+    return result
 
 
 def _indexer_forward(self, hidden_states, qr, positions, rotary_emb):
