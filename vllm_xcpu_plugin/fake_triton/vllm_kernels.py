@@ -201,7 +201,7 @@ def _gather_block_tables(launch: KernelLaunch) -> None:
     )
     _expect(args["BLOCK_SIZE"] == 1024, "gather BLOCK_SIZE must be 1024")
     torch.ops.mcpu.vllm_gather_block_tables_kernel(
-        args["batch_idx_to_req_idx"],
+        args["batch_idx_to_req_idx"].to(dtype=torch.int32),
         args["src_block_table_ptrs"],
         args["dst_block_table_ptrs"],
         args["block_table_strides"],
