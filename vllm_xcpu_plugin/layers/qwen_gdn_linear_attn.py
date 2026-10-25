@@ -40,8 +40,7 @@ class XcpuQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self._xcpu_native_core:
             return super().forward_cuda(hidden_states)
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._project_qkvz_ba(hidden_states)
         if self.gqa_interleaved_layout:
             q, k, v, z, b, a = self.fix_query_key_value_ordering(mixed_qkvz, ba)
             mixed_qkv = torch.cat([q.flatten(1), k.flatten(1), v.flatten(1)], -1)
