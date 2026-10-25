@@ -6,6 +6,26 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 
+def _rotary_embedding(
+    positions, query, key, head_size, cos_sin_cache,
+    is_neox, rope_dim_offset=0, inverse=False,
+):
+    import torch_xcpu
+
+    if rope_dim_offset != 0 or inverse:
+        raise NotImplementedError("XCPU RoPE requires offset=0 and inverse=False")
+    torch_xcpu.ops.rotary_embedding(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
+
+
+# DFlash's grouped context update calls the low-level op without the RoPE layer.
+import vllm._custom_ops  # noqa: E402,F401
+
+_LIBRARY = torch.library.Library("_C", "IMPL", "PrivateUse1")
+_LIBRARY.impl("rotary_embedding", _rotary_embedding)
+
+
 @RotaryEmbedding.register_oot
 class XcpuRotaryEmbedding(RotaryEmbedding):
     supports_mla_rope_kvcache_fusion = True
