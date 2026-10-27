@@ -50,6 +50,7 @@ def _cpu_mpi_operator_shims(enabled: bool):
 
     ops = torch_mpi_ext.ops
     original_all_reduce = ops.all_reduce_out_wrapper
+    original_all_reduce_inplace = ops.all_reduce__wrapper
     original_all_gatherv = xcpu_ops.all_gatherv_into_tensor_out_v2
     original_reduce_scatter = ops.reduce_scatter_out_wrapper
     original_reduce_scatterv = ops.reduce_scatterv_out_wrapper
@@ -57,6 +58,9 @@ def _cpu_mpi_operator_shims(enabled: bool):
     def all_reduce_out(output, input_, _comm_ptr):
         output.copy_(input_)
         dist.all_reduce(output)
+
+    def all_reduce_inplace(input_, _comm_ptr):
+        dist.all_reduce(input_)
 
     def all_gatherv_out(output, input_, sizes, _comm_ptr, dim):
         gathered: list[torch.Tensor | None] = [None] * dist.get_world_size()
@@ -78,6 +82,7 @@ def _cpu_mpi_operator_shims(enabled: bool):
         output.copy_(reduced.narrow(dim, sum(rank_sizes[:rank]), rank_sizes[rank]))
 
     ops.all_reduce_out_wrapper = all_reduce_out
+    ops.all_reduce__wrapper = all_reduce_inplace
     xcpu_ops.all_gatherv_into_tensor_out_v2 = all_gatherv_out
     ops.reduce_scatter_out_wrapper = reduce_scatter_out
     ops.reduce_scatterv_out_wrapper = reduce_scatterv_out
@@ -85,6 +90,7 @@ def _cpu_mpi_operator_shims(enabled: bool):
         yield
     finally:
         ops.all_reduce_out_wrapper = original_all_reduce
+        ops.all_reduce__wrapper = original_all_reduce_inplace
         xcpu_ops.all_gatherv_into_tensor_out_v2 = original_all_gatherv
         ops.reduce_scatter_out_wrapper = original_reduce_scatter
         ops.reduce_scatterv_out_wrapper = original_reduce_scatterv
@@ -109,6 +115,26 @@ def _all_reduce_worker(rank: int, port: int) -> None:
                 torch.testing.assert_close(base, before)
                 assert actual.is_contiguous()
                 assert actual.data_ptr() != input_.data_ptr()
+    finally:
+        dist.destroy_process_group()
+
+
+def _all_reduce_inplace_worker(rank: int, port: int) -> None:
+    os.environ["VLLM_XCPU_ALLREDUCE_INPLACE"] = "1"
+    _init_process_group(rank, port)
+    try:
+        communicator = _make_communicator(CpuMPICommunicator)
+        with _cpu_mpi_operator_shims(True):
+            base = torch.arange(64, dtype=torch.float32).reshape(16, 4)
+            base += rank * 100
+            before = base.clone()
+            # Reduce only the logical rows of the aligned linear output.
+            input_ = base[:6]
+            expected = WORLD_SIZE * input_ - rank * 200 + 100
+            actual = communicator.all_reduce(input_)
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(base[6:], before[6:])
+            assert actual.data_ptr() == input_.data_ptr()
     finally:
         dist.destroy_process_group()
 
@@ -387,6 +413,10 @@ def _distributed_run(worker: Callable[[int, int], None]) -> None:
 
 def test_mpi_all_reduce_preserves_input() -> None:
     _distributed_run(_all_reduce_worker)
+
+
+def test_mpi_all_reduce_inplace() -> None:
+    _distributed_run(_all_reduce_inplace_worker)
 
 
 def test_all_gatherv() -> None:

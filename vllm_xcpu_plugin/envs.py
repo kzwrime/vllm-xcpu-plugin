@@ -41,6 +41,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_CPU_USE_MPI": lambda: bool(int(os.getenv("VLLM_CPU_USE_MPI", "0"))),
+    # Run MPI TP all-reduce in place on the input instead of into a new output.
+    "VLLM_XCPU_ALLREDUCE_INPLACE": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ALLREDUCE_INPLACE", "0"))
+    ),
     # Complete post-routing V5/V6 EP operation; set 0 for the legacy MK path.
     "VLLM_XCPU_ENABLE_FUSED_EP_MOE": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_FUSED_EP_MOE", "1"))

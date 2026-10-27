@@ -134,6 +134,12 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torch_mpi_ext
 
+        import vllm_xcpu_plugin.envs as envs_xcpu
+
+        if envs_xcpu.VLLM_XCPU_ALLREDUCE_INPLACE:
+            torch_mpi_ext.ops.all_reduce__wrapper(input_, self.comm_ptr_wrapper)
+            return input_
+
         # Keep allocation visible to Inductor so it can plan/reuse the output
         # without functionalizing a mutation of the input (which may be a view).
         output = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)

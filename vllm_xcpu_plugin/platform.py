@@ -211,6 +211,13 @@ class McpuPlatform(Platform):
             compilation_config.inductor_compile_config[
                 "enable_auto_functionalized_v2"
             ] = True
+        if envs_xcpu.VLLM_XCPU_ALLREDUCE_INPLACE:
+            # In-place TP all-reduce mutates a view of the row-padded linear
+            # output. V1 clones the view and scatters it back to the base;
+            # V2 reinplaces the mutation on the base without copies.
+            compilation_config.inductor_compile_config[
+                "enable_auto_functionalized_v2"
+            ] = True
         if vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             compilation_config.mode = CompilationMode.DYNAMO_TRACE_ONCE
             compilation_config.backend = "inductor"
