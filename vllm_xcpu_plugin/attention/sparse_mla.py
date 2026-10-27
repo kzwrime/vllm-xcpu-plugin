@@ -122,6 +122,46 @@ def _xcpu_forward_mqa(
     return output, None
 
 
+def _xcpu_forward_mqa_vproj(
+    self,
+    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    kv_c_and_k_pe_cache: torch.Tensor,
+    attn_metadata: XcpuMLASparseMetadata,
+    layer: AttentionLayer,
+    output: torch.Tensor,
+) -> None:
+    """FP8 forward_mqa followed by output = latent @ layer.W_UV in one op.
+
+    output is [tokens, heads, v_head_dim] rows. Decode steps issue a single
+    launch; other steps keep separate attention and projection launches.
+    """
+    assert self.kv_cache_dtype == "fp8_ds_mla"
+    if isinstance(q, tuple):
+        q = torch.cat(q, dim=-1)
+    backend = attn_metadata.xcpu_backend
+    if backend is None or attn_metadata.xcpu_schedule is None:
+        raise RuntimeError(
+            "FP8 sparse MLA metadata must be built before layer execution"
+        )
+    logical_topk = None
+    if self.is_sparse:
+        assert self.topk_indices_buffer is not None
+        logical_topk = self.topk_indices_buffer[: q.shape[0]]
+    backend.run_vproj(
+        q,
+        kv_c_and_k_pe_cache,
+        logical_topk,
+        attn_metadata.block_table,
+        attn_metadata.seq_lens,
+        self.scale,
+        layer.W_UV,
+        output,
+        attn_metadata.xcpu_schedule,
+        max_query_len=attn_metadata.max_query_len,
+        max_seq_len=attn_metadata.max_seq_len,
+    )
+
+
 def validate_sparse_config(config):
     parallel = config.parallel_config
     if parallel.decode_context_parallel_size != 1:
@@ -272,3 +312,4 @@ class XcpuMLASparseImpl(SparseMLACommonImpl):
 
     do_kv_cache_update = _xcpu_do_kv_cache_update
     forward_mqa = _xcpu_forward_mqa
+    forward_mqa_vproj = _xcpu_forward_mqa_vproj

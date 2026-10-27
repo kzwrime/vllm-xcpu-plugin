@@ -14,6 +14,19 @@ class XcpuMLAAttention(MLAAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fuse_rope_cache = os.getenv("VLLM_XCPU_FUSED_MLA", "1") != "0"
+        # Fuse FP8 sparse attention with the following V up-projection; "0"
+        # keeps the separate forward_mqa + einsum path for debugging.
+        self._fuse_vproj = os.getenv("VLLM_XCPU_FUSED_MLA_VPROJ", "1") != "0"
+
+    def _forward_mqa_vproj(self, q, kv_cache, metadata, output):
+        # output: [tokens, heads, v_head_dim] rows.
+        if self._fuse_vproj and self.impl.kv_cache_dtype == "fp8_ds_mla":
+            self.impl.forward_mqa_vproj(q, kv_cache, metadata, self, output)
+            return
+        import torch_xcpu
+
+        latent, _ = self.impl.forward_mqa(q, kv_cache, metadata, self)
+        torch_xcpu.ops.einsum_mhk_hkn_to_mhn(latent, self.W_UV, output)
 
     def forward_with_rope(self, q, kv_c, k_pe, positions, rotary_emb, scaling):
         context = get_forward_context()
@@ -66,11 +79,11 @@ class XcpuMLAAttention(MLAAttention):
             "auto" if self.kv_cache_dtype == "bfloat16" else self.kv_cache_dtype,
             rotary_emb.is_neox_style,
         )
-        latent, _ = self.impl.forward_mqa(projected, self.kv_cache, metadata, self)
         output = q.new_empty(output_shape)
-        torch_xcpu.ops.einsum_mhk_hkn_to_mhn(
-            latent,
-            self.W_UV,
+        self._forward_mqa_vproj(
+            projected,
+            self.kv_cache,
+            metadata,
             output[:tokens].view(tokens, self.num_heads, self.v_head_dim),
         )
         return output
@@ -144,12 +157,10 @@ class XcpuMLAAttention(MLAAttention):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         projected = q.new_empty((tokens, self.num_heads, self.kv_lora_rank))
         torch_xcpu.ops.einsum_mhk_hkn_to_mhn(q_nope, self.W_UK_T, projected)
-        latent, _ = self.impl.forward_mqa(
-            (projected, q_pe), kv_cache, attn_metadata, self
-        )
-        torch_xcpu.ops.einsum_mhk_hkn_to_mhn(
-            latent,
-            self.W_UV,
+        self._forward_mqa_vproj(
+            (projected, q_pe),
+            kv_cache,
+            attn_metadata,
             output[:tokens].view(tokens, self.num_heads, self.v_head_dim),
         )
         return output

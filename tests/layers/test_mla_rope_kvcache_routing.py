@@ -13,6 +13,7 @@ from vllm_xcpu_plugin.attention.sparse_mla import (
     XcpuMLASparseBackend,
     _xcpu_do_kv_cache_update,
     _xcpu_forward_mqa,
+    _xcpu_forward_mqa_vproj,
 )
 
 
@@ -50,16 +51,19 @@ def make_layer(cache_dtype, tokens):
         scale=256**-0.5,
     )
     layer.impl.forward_mqa = MethodType(_xcpu_forward_mqa, layer.impl)
+    layer.impl.forward_mqa_vproj = MethodType(_xcpu_forward_mqa_vproj, layer.impl)
     layer.impl.do_kv_cache_update = MethodType(_xcpu_do_kv_cache_update, layer.impl)
     layer.process_weights_after_loading(torch.bfloat16)
     assert layer.kv_b_proj.weight.numel() == 0
     return layer
 
 
+@pytest.mark.parametrize("fuse_vproj", [False, True])
+@pytest.mark.parametrize("has_prefill", [True, False])
 @pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
 @pytest.mark.parametrize("tokens", [1, 7])
 def test_fused_sparse_mla_matches_separate_cache_and_projection(
-    monkeypatch, cache_dtype, tokens
+    monkeypatch, cache_dtype, tokens, has_prefill, fuse_vproj
 ):
     import vllm.model_executor.layers.attention.mla_attention as upstream
 
@@ -90,7 +94,7 @@ def test_fused_sparse_mla_matches_separate_cache_and_projection(
             starts,
             tokens,
             query_start_loc_cpu=starts_cpu,
-            has_prefill=True,
+            has_prefill=has_prefill,
             kv_slots_hint=tokens,
         )
     context = SimpleNamespace(
@@ -109,13 +113,13 @@ def test_fused_sparse_mla_matches_separate_cache_and_projection(
             return q_pe, k_pe
 
     with torch.inference_mode():
-        layer._fuse_rope_cache = False
+        layer._fuse_rope_cache = layer._fuse_vproj = False
         reference = layer.forward_with_rope(
             q.clone(), kv, k.clone(), positions, Rope(), None
         ).cpu()
         expected_cache = layer.kv_cache.cpu().clone()
         layer.kv_cache.zero_()
-        layer._fuse_rope_cache = True
+        layer._fuse_rope_cache, layer._fuse_vproj = True, fuse_vproj
         actual = layer.forward_with_rope(
             q.clone(), kv, k.clone(), positions, Rope(), None
         ).cpu()
