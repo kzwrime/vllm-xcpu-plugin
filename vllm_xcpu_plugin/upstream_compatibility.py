@@ -359,7 +359,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadata",
         "7817286309cfac315f4b8b717dcedab2537eebf18634bea35e353820a493afda",
         "127002ec8cee2a101275c778290c778184b1fcfe6ae630ac01b966b21bd60e0f",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -368,7 +368,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder.__init__",
         "9bcd86391de6b79fd5cac69666f784cc596b7088eba87227d720cf568ecc3cef",
         "e73d1aaed9c63b280614c90e3cfe174fae3c007fbe68b0275f223e7868700961",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -377,7 +377,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder.build",
         "f94a339faa63d868b75c9640eaa981f3410b526177c2399b241462fd023d1f98",
         "6a9c419a47084c40387d3cf2cbdb4ea3bc55a2a15a4a237dab55d3e71585ea5a",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -386,7 +386,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder._build_chunk_metadata",
         "09b2029d1c6c376c06b96765d07a56071833ea61d30ca23406353b67344d8023",
         "07d60cbe3244c13eaa846c5b66127d751cb6cd679789cf4e235030a89bfce9c4",
-        "torch_xcpu::build_gdn_metadata_out + _xcpu_gdn_metadata_build",
+        "torch_xcpu._C.build_gdn_metadata + _xcpu_gdn_metadata_build",
         source_version="v0.31; local=b7c90492ea; metadata audit 2026-10-14",
     ),
     _operator(
@@ -395,7 +395,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder._stage_spec_decode",
         "ed4a0dd7f58ffcbe25635000546766dfb3858763a6c4d1c6037095e78fbd6840",
         "4b805450702ff3f5ca3442c702399be4225a1774c5b64383ce8620a473d159e9",
-        "torch_xcpu::build_gdn_metadata_out + _xcpu_gdn_metadata_build",
+        "torch_xcpu._C.build_gdn_metadata + _xcpu_gdn_metadata_build",
         source_version="v0.31; local=b7c90492ea; metadata audit 2026-10-14",
     ),
     _operator(
@@ -404,7 +404,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder._stage_decode",
         "37f208c81ed55c55e6f22e5eb75f6eff62013106210331f5775d6c6bbbac9da6",
         "5f4fe1c0bb533573eb6cd42779720b3e9ab6fc16016725598299c50a1baa70a4",
-        "torch_xcpu::build_gdn_metadata_out + _xcpu_gdn_metadata_build",
+        "torch_xcpu._C.build_gdn_metadata + _xcpu_gdn_metadata_build",
         source_version="v0.31; local=b7c90492ea; metadata audit 2026-10-14",
     ),
     _operator(
@@ -413,7 +413,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "GDNAttentionMetadataBuilder.build_for_cudagraph_capture",
         "7b5c7ce6933d3622f586f710ad1f3a27d084e05342409933271fee1e888d8ffd",
         "c1198accfb83b14e33c7738dacdca0171a94fd3a226e6936d236407e37dbb65e",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -422,7 +422,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "CommonAttentionMetadata.compute_num_computed_tokens",
         "959fb6da987d8ba69582540524655be7d014c9ce8c7ed533e9a68ace578a1812",
         "d66922ee7dbd1de1830c2c0a26b18b8a5fe42592c8d1d7bf09b3dcdf0b175ee1",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -431,7 +431,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "split_decodes_and_prefills",
         "21b78ee405f260ca1faf720cac023103e278d378e45b2610f35c99bc265820e1",
         "441a21b245c30963704e4bcc4aa2a1aa4c994b575954c3318efa2b3d045b08e5",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -440,7 +440,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "mamba_get_block_table_tensor",
         "b9f8c8a73cfd9f9ca9810155e38bf95ad780f7141dba5972965a59fd000b7656",
         "ba09cc29df138885574deba02b9e4c00ed37b29eb4c24b79feaebaef648c288f",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -449,7 +449,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "compute_causal_conv1d_metadata",
         "1554acd8bc1eb87695f895ebae0fa07780043155803edb34cd357b84e91466e4",
         "4fa5cf3493cf2874dc51cd4f3c311ff123d4327e19902bb68cfde506cbf47f36",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -458,7 +458,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "prepare_lens",
         "2cbb1a08d9fa58701823214a0d3f9916b4fb1fa64e49ff2eb7919e593e8dd10b",
         "32ad9d1f25ddc72ee74d78eef7f066bef049be5efeeecce9dc90178ec3fefcd3",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -467,7 +467,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "prepare_chunk_indices",
         "5570ba010b766321161b897258db6a2d6b4bcd14a804e2e8de723b4b902aea64",
         "af2e8eeda7ac8469d8e728556656e91733866950690f917c106fc734633ec3e3",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(
@@ -476,7 +476,7 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "prepare_chunk_offsets",
         "eef70582e66dc90b622986741d57aac543f8e37c28ed22e5c188bdfa5d47771c",
         "af2e8eeda7ac8469d8e728556656e91733866950690f917c106fc734633ec3e3",
-        "torch_xcpu::build_gdn_metadata_out",
+        "torch_xcpu._C.build_gdn_metadata",
         source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
     ),
     _operator(

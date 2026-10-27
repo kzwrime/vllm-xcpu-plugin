@@ -98,6 +98,11 @@ def test_gdn_metadata_patch_fallback_forwards_original_arguments(
         ([-1, -1, -1], [1, 65, 0]),
         ([-1, -1], [129, 65]),
         ([-1, 5, -1, -1], [0, 6, 65, 0]),
+        ([5, 5, -1, -1], [6, 6, 1, 1]),
+        ([5, -1, 3, -1], [6, 130, 4, 0]),
+        ([-1, 0, -1], [1, 1, 1]),
+        ([-1, -1, -1, -1], [1, 1, 200, 0]),
+        ([-1, -1], [0, 0]),
     ],
 )
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
@@ -308,6 +313,28 @@ def test_gdn_metadata_device_indices_match_cpu(
 
 
 @pytest.mark.parametrize(
+    "draft_counts,query_lens",
+    [
+        # More than 1024 conv programs grows batch_ptr past its default size.
+        ([-1, -1, -1], [1, 9000, 70]),
+        ([5, -1, 5], [6, 9000, 6]),
+        (None, [1, 1, 9000]),
+    ],
+)
+@pytest.mark.parametrize("first_chunk", [False, True])
+def test_gdn_metadata_large_prefill(draft_counts, query_lens, first_chunk):
+    test_gdn_metadata_device_indices_match_cpu(
+        draft_counts=draft_counts,
+        query_lens=query_lens,
+        mamba_cache_mode="none",
+        strided=True,
+        use_full_cuda_graph=False,
+        first_chunk=first_chunk,
+        checkpoint_blocks=0,
+    )
+
+
+@pytest.mark.parametrize(
     "mode", ["padded", "no_spec", "no_drafts", "prealigned", "capture"]
 )
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
@@ -354,53 +381,47 @@ def test_gdn_metadata_cpu_outputs_are_ready_while_device_stream_is_pending():
         blocker = torch.empty(1, dtype=torch.int64, device="mcpu")
         torch.ops.mcpu.stream_sleep_fill_(blocker, 1, 300)
         table.fill_(42)
-        tensors = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
-            query, query_cpu, torch.tensor([5, -1, -1], dtype=torch.int64), 5, 65
-        )
-        result = torch.ops.torch_xcpu.build_gdn_metadata_out(
+        tensors, counts, request_rows = torch_xcpu._C.build_gdn_metadata(
             query,
             query_cpu,
             seq_lens,
             table,
             accepted,
             torch.tensor([5, -1, -1], dtype=torch.int64),
+            None,
+            None,
             5,
             72,
-            65,
             0,
             64,
-            tensors,
         )
-        assert result is None
-        counts = tensors[21].tolist()[:6]
         assert not stream.query()
-        assert counts == [2, 66, 0, 0, 1, 6]
+        assert counts[:6] == [2, 66, 0, 0, 1, 6]
+        assert request_rows == [1, 2]
         # nums, mlist, offsetlist are CPU tensors, immediately readable.
         torch.testing.assert_close(tensors[14], torch.tensor([9, 1], dtype=torch.int32))
         torch.testing.assert_close(tensors[15], torch.tensor([0] * 9 + [1]))
         torch.testing.assert_close(
             tensors[16], torch.tensor(list(range(9)) + [0], dtype=torch.int32)
         )
+        torch.testing.assert_close(tensors[19], torch.tensor([True, False, False]))
+        assert tensors[20].tolist() == [2, 0, 1, 72, 0]
         # Retain the first metadata while a later build is queued. Neither
         # device outputs nor asynchronous CPU staging may overwrite it.
         table.fill_(84)
-        later_draft = torch.tensor([-1, 5, -1], dtype=torch.int32)
-        later = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
-            query, query_cpu, later_draft, 5, 65
-        )
-        torch.ops.torch_xcpu.build_gdn_metadata_out(
+        later, _, _ = torch_xcpu._C.build_gdn_metadata(
             query,
             query_cpu,
             seq_lens,
             table,
             accepted,
-            later_draft,
+            torch.tensor([-1, 5, -1], dtype=torch.int32),
+            None,
+            None,
             5,
             72,
-            65,
             0,
             64,
-            later,
         )
     stream.synchronize()
     torch.testing.assert_close(
@@ -411,10 +432,12 @@ def test_gdn_metadata_cpu_outputs_are_ready_while_device_stream_is_pending():
     )
     torch.testing.assert_close(tensors[0].cpu(), torch.tensor([False, True]))
     torch.testing.assert_close(tensors[8].cpu(), torch.tensor([3], dtype=torch.int32))
+    torch.testing.assert_close(tensors[5].cpu(), torch.tensor([True, False, False]))
     torch.testing.assert_close(
         later[3].cpu(), torch.full((1, 6), 84, dtype=torch.int32)
     )
     torch.testing.assert_close(later[8].cpu(), torch.tensor([1], dtype=torch.int32))
+    torch.testing.assert_close(later[5].cpu(), torch.tensor([False, True, False]))
 
 
 def test_causal_conv1d_fn_forwards_cache_all_contract(monkeypatch):
@@ -484,26 +507,23 @@ def test_gdn_metadata_cross_stream_inputs_survive_allocator_reuse():
     table = torch.arange(6, dtype=torch.int32, device="mcpu").view(1, 6)
     accepted = torch.ones(1, dtype=torch.int32, device="mcpu")
     torch.mcpu.synchronize()
-    tensors = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
-        query, query_cpu, torch.tensor([5], dtype=torch.int32), 5, 6
-    )
     stream = torch.Stream(device="mcpu")
     with stream:
         blocker = torch.empty(1, dtype=torch.int64, device="mcpu")
         torch.ops.mcpu.stream_sleep_fill_(blocker, 1, 300)
-        torch.ops.torch_xcpu.build_gdn_metadata_out(
+        tensors, _, _ = torch_xcpu._C.build_gdn_metadata(
             query,
             query_cpu,
             seq_lens,
             table,
             accepted,
             torch.tensor([5], dtype=torch.int32),
+            None,
+            None,
             5,
-            6,
             6,
             0,
             64,
-            tensors,
         )
     old_ptrs = {
         table.data_ptr(),
@@ -511,11 +531,6 @@ def test_gdn_metadata_cross_stream_inputs_survive_allocator_reuse():
         seq_lens.data_ptr(),
         accepted.data_ptr(),
     }
-    old_ptrs.update(
-        t.data_ptr()
-        for t in tensors
-        if t is not None and t.device.type == "mcpu" and t.numel() > 0
-    )
     spec_state_indices_tensor = tensors[3]
     del table, query, seq_lens, accepted, tensors
     replacements = [
@@ -527,32 +542,4 @@ def test_gdn_metadata_cross_stream_inputs_survive_allocator_reuse():
     stream.synchronize()
     torch.testing.assert_close(
         spec_state_indices_tensor.cpu(), torch.arange(6, dtype=torch.int32).view(1, 6)
-    )
-
-
-def test_gdn_metadata_out_schema_has_no_returned_aliases():
-    """Mutation is declared on caller-owned outputs rather than returned views."""
-    query_cpu = torch.tensor([0, 1], dtype=torch.int32)
-    query = query_cpu.to("mcpu")
-    tensors = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
-        query, query_cpu, None, 0, 1
-    )
-    args = (
-        query,
-        query_cpu,
-        torch.tensor([9], dtype=torch.int32, device="mcpu"),
-        torch.tensor([[1]], dtype=torch.int32, device="mcpu"),
-        None,
-        None,
-        0,
-        1,
-        1,
-        0,
-        64,
-        tensors,
-    )
-    torch.library.opcheck(
-        torch.ops.torch_xcpu.build_gdn_metadata_out.default,
-        args,
-        test_utils=("test_schema",),
     )

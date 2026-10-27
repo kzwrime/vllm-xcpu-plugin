@@ -16,6 +16,9 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 _ORIGINAL_GDN_METADATA_BUILD: Callable[..., GDNAttentionMetadata] | None = None
+# Resolved once in maybe_patch_gdn_metadata(), off the per-step path.
+_BUILD_GDN_METADATA: Callable[..., tuple] | None = None
+_FLA_CHUNK_SIZE = 0
 
 
 @dataclass
@@ -23,6 +26,36 @@ class XcpuGDNAttentionMetadata(GDNAttentionMetadata):
     # Immutable per-build CPU scheduling facts, passed as a runtime graph input.
     xcpu_core_counts: torch.Tensor | None = None
     xcpu_core_tensors: tuple[torch.Tensor, ...] = ()
+
+
+def _core_tensors(
+    device: torch.device, *tensors: torch.Tensor | None
+) -> tuple[torch.Tensor, ...]:
+    # Guardless AOT replay must fetch every slot on every invocation, including
+    # slots that were absent during tracing. Distinct views also prevent Dynamo
+    # from specializing two slots to the same Python Tensor object. The C++
+    # builder returns the same slots; this rebuilds them after FULL staging.
+    return tuple(
+        tensor.view(tensor.shape)
+        if tensor is not None
+        else torch.empty(0, dtype=dtype, device=device)
+        for tensor, dtype in zip(
+            tensors,
+            (
+                torch.bool,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int64,
+                torch.int64,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.bool,
+            ),
+        )
+    )
 
 
 def _xcpu_gdn_metadata_build(
@@ -35,7 +68,6 @@ def _xcpu_gdn_metadata_build(
 ) -> GDNAttentionMetadata:
     m = common_attn_metadata
     query_start_loc = m.query_start_loc
-    query_start_loc_cpu = m.query_start_loc_cpu
     if (
         query_start_loc.device.type not in ("mcpu", "privateuseone")
         or self.gdn_prefill_backend == "cutedsl"
@@ -49,10 +81,6 @@ def _xcpu_gdn_metadata_build(
             num_decode_draft_tokens_cpu,
             fast_build,
         )
-
-    from vllm.third_party.flash_linear_attention.ops.utils import (
-        FLA_CHUNK_SIZE,
-    )
 
     # Match upstream build(): precomputed indices are already aligned. The
     # checkpoint builder below must still receive the original block table.
@@ -68,62 +96,23 @@ def _xcpu_gdn_metadata_build(
             else 0
         )
 
-    # A one-token first prefill must clear recycled state; a resumed chunk can
-    # use decode kernels. These are CPU scheduling facts, not device readbacks.
-    no_prior_state_cpu = None
-    if m.is_prefilling is not None:
-        assert m.seq_lens_cpu_upper_bound is not None
-        query_lens_cpu = query_start_loc_cpu.diff()
-        no_prior_state_cpu = (
-            (query_lens_cpu > 0)
-            & (m.seq_lens_cpu_upper_bound <= query_lens_cpu)
-            & m.is_prefilling
-        )
-
-    # Keep this result order in sync with torch_xcpu/csrc/gdn_metadata.cpp.
-    outputs = torch.ops.torch_xcpu.allocate_gdn_metadata_outputs(
+    # One host call covers every batch shape (prefill, decode, spec decode and
+    # their mixes); see torch_xcpu/csrc/gdn_metadata.cpp for the result order.
+    assert _BUILD_GDN_METADATA is not None
+    tensors, counts, request_rows = _BUILD_GDN_METADATA(
         query_start_loc,
-        query_start_loc_cpu,
-        num_decode_draft_tokens_cpu,
-        self.num_spec if self.use_spec_decode else 0,
-        m.max_query_len,
-        FLA_CHUNK_SIZE,
-        no_prior_state_cpu,
-    )
-    torch.ops.torch_xcpu.build_gdn_metadata_out(
-        query_start_loc,
-        query_start_loc_cpu,
+        m.query_start_loc_cpu,
         m.seq_lens,
         block_table_tensor,
         num_accepted_tokens,
         num_decode_draft_tokens_cpu,
+        m.seq_lens_cpu_upper_bound,
+        m.is_prefilling,
         self.num_spec if self.use_spec_decode else 0,
         m.num_actual_tokens,
-        m.max_query_len,
         block_size_to_align,
-        FLA_CHUNK_SIZE,
-        outputs,
-        no_prior_state_cpu,
+        _FLA_CHUNK_SIZE,
     )
-    *counts, present = outputs[21].tolist()
-    tensors = [
-        tensor if present & (1 << i) else None for i, tensor in enumerate(outputs[:19])
-    ]
-    num_prefills, _, num_decodes, _, num_spec_decodes, _ = counts
-    if num_spec_decodes == 0:
-        tensors[2] = query_start_loc
-    elif num_prefills == 0 and num_decodes == 0:
-        tensors[1] = query_start_loc[: num_spec_decodes + 1]
-    else:
-        tensors[6], tensors[7] = outputs[19:21]
-    if num_prefills > 0:
-        if num_spec_decodes == 0 and num_decodes > 0:
-            assert tensors[4] is not None
-            assert tensors[0] is not None
-            tensors[12] = tensors[4][num_decodes:]
-            tensors[13] = tensors[0][num_decodes:]
-        else:
-            tensors[11:14] = [tensors[2], tensors[4], tensors[0]]
     (
         num_prefills,
         num_prefill_tokens,
@@ -131,6 +120,7 @@ def _xcpu_gdn_metadata_build(
         num_decode_tokens,
         num_spec_decodes,
         num_spec_decode_tokens,
+        uniform_spec_sequence_length,
     ) = counts
     (
         has_initial_state,
@@ -152,8 +142,13 @@ def _xcpu_gdn_metadata_build(
         offsetlist,
         batch_ptr,
         token_chunk_offset_ptr,
-    ) = tensors
+        spec_sequence_masks_cpu,
+        core_counts,
+    ) = tensors[:21]
+    core_tensors = tuple(tensors[21:])
+
     nums_dict = None
+    checkpoint = None
     if num_prefills > 0:
         assert mlist is not None
         nums_dict = {
@@ -167,23 +162,9 @@ def _xcpu_gdn_metadata_build(
                 "token_chunk_offset_ptr": token_chunk_offset_ptr,
             }
         }
-
-    spec_sequence_masks_cpu = None
-    uniform_spec_sequence_length = None
-    if num_spec_decodes > 0:
-        assert num_decode_draft_tokens_cpu is not None
-        spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-        spec_lens = query_start_loc_cpu.diff()[spec_sequence_masks_cpu]
-        first_length = int(spec_lens[0])
-        if first_length > 0 and bool(torch.all(spec_lens == first_length)):
-            uniform_spec_sequence_length = first_length
-
-    checkpoint = None
-    if num_prefills > 0:
-        request_rows = list(range(m.num_reqs))
-        if spec_sequence_masks_cpu is not None:
-            request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
-        checkpoint = self.checkpoint_builder.build(m, request_rows)
+        checkpoint = self.checkpoint_builder.build(
+            m, request_rows if num_spec_decodes > 0 else list(range(m.num_reqs))
+        )
 
     # Function code counted on either presency non-spec decode or spec decode,
     # but not both.
@@ -196,6 +177,7 @@ def _xcpu_gdn_metadata_build(
     # metadata below is indexed by request.
     batch_size = m.num_reqs
 
+    staged = False
     if (
         self.use_full_cuda_graph
         and num_prefills == 0
@@ -203,6 +185,7 @@ def _xcpu_gdn_metadata_build(
         and num_spec_decodes <= self.decode_cudagraph_max_bs
         and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
     ):
+        staged = True
         assert spec_sequence_masks is not None
         self.spec_state_indices_tensor[:num_spec_decodes].copy_(
             spec_state_indices_tensor, non_blocking=True
@@ -246,6 +229,7 @@ def _xcpu_gdn_metadata_build(
         and num_spec_decodes == 0
         and num_decodes <= self.decode_cudagraph_max_bs
     ):
+        staged = True
         self.non_spec_state_indices_tensor[:num_decodes].copy_(
             non_spec_state_indices_tensor, non_blocking=True
         )
@@ -259,40 +243,24 @@ def _xcpu_gdn_metadata_build(
         non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
         non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
-    # Guardless AOT replay must fetch every slot on every invocation, including
-    # slots that were absent during tracing. Distinct views also prevent Dynamo
-    # from specializing two slots to the same Python Tensor object.
-    core_tensors = tuple(
-        tensor.view(tensor.shape)
-        if tensor is not None
-        else torch.empty(0, dtype=dtype, device=query_start_loc.device)
-        for tensor, dtype in (
-            (has_initial_state, torch.bool),
-            (spec_query_start_loc, torch.int32),
-            (non_spec_query_start_loc, torch.int32),
-            (spec_state_indices_tensor, torch.int32),
-            (non_spec_state_indices_tensor, torch.int32),
-            (spec_token_indx, torch.int64),
-            (non_spec_token_indx, torch.int64),
-            (num_accepted_tokens, torch.int32),
-            (prefill_query_start_loc, torch.int32),
-            (prefill_state_indices, torch.int32),
-            (prefill_has_initial_state, torch.bool),
+    if staged:
+        core_tensors = _core_tensors(
+            query_start_loc.device,
+            has_initial_state,
+            spec_query_start_loc,
+            non_spec_query_start_loc,
+            spec_state_indices_tensor,
+            non_spec_state_indices_tensor,
+            spec_token_indx,
+            non_spec_token_indx,
+            num_accepted_tokens,
+            prefill_query_start_loc,
+            prefill_state_indices,
+            prefill_has_initial_state,
         )
-    )
     attn_metadata = XcpuGDNAttentionMetadata(
         xcpu_core_tensors=core_tensors,
-        xcpu_core_counts=torch.tensor(
-            [
-                num_prefills,
-                num_decodes,
-                num_spec_decodes,
-                m.num_actual_tokens,
-                num_decode_tokens,
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        ),
+        xcpu_core_counts=core_counts,
         num_prefills=num_prefills,
         num_prefill_tokens=num_prefill_tokens,
         num_decodes=num_decodes,
@@ -313,7 +281,7 @@ def _xcpu_gdn_metadata_build(
         non_spec_state_indices_tensor=non_spec_state_indices_tensor,
         spec_sequence_masks=spec_sequence_masks,
         spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-        uniform_spec_sequence_length=uniform_spec_sequence_length,
+        uniform_spec_sequence_length=uniform_spec_sequence_length or None,
         spec_token_indx=spec_token_indx,
         non_spec_token_indx=non_spec_token_indx,
         num_accepted_tokens=num_accepted_tokens,
@@ -325,16 +293,21 @@ def _xcpu_gdn_metadata_build(
 
 
 def maybe_patch_gdn_metadata() -> None:
-    global _ORIGINAL_GDN_METADATA_BUILD
+    global _ORIGINAL_GDN_METADATA_BUILD, _BUILD_GDN_METADATA, _FLA_CHUNK_SIZE
 
     if _ORIGINAL_GDN_METADATA_BUILD is not None:
         return
+
+    import torch_xcpu
+    from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 
     from vllm_xcpu_plugin.upstream_compatibility import (
         verify_upstream_compatibility,
     )
 
     verify_upstream_compatibility(("gdn_metadata",))
+    _BUILD_GDN_METADATA = torch_xcpu._C.build_gdn_metadata
+    _FLA_CHUNK_SIZE = FLA_CHUNK_SIZE
     _ORIGINAL_GDN_METADATA_BUILD = GDNAttentionMetadataBuilder.build
     GDNAttentionMetadataBuilder.build = wraps(_ORIGINAL_GDN_METADATA_BUILD)(  # type: ignore[method-assign]
         _xcpu_gdn_metadata_build
