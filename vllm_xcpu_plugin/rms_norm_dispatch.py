@@ -3,8 +3,13 @@
 import torch
 
 _LIBRARY: torch.library.Library | None = None
+_REGISTERED = False
 
 
+# The Python kernel is kept for shape coverage (TORCH_XCPU_DUMP_SHAPES): it
+# reaches the native op through torch_xcpu.ops, whose wrapper records the
+# packed arguments. torch_xcpu/csrc/vllm_rms_norm.cpp is the same kernel in
+# C++ and is used otherwise; tests check that both agree bitwise.
 def _rms_norm(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -81,12 +86,18 @@ def _rms_norm(
 
 def register_rms_norm_kernel() -> None:
     """Keep the upstream schema and route PrivateUse1 to native grouped RMS."""
-    global _LIBRARY
-    if _LIBRARY is not None:
+    global _LIBRARY, _REGISTERED
+    if _REGISTERED:
         return
     # Import loads the upstream _C schema before registering its implementation.
+    import torch_xcpu
+    import torch_xcpu.debug
     import vllm._custom_ops  # noqa: F401
 
-    library = torch.library.Library("_C", "IMPL", "PrivateUse1")
-    library.impl("rms_norm", _rms_norm)
-    _LIBRARY = library
+    if torch_xcpu.debug._get_enable_input_print():
+        library = torch.library.Library("_C", "IMPL", "PrivateUse1")
+        library.impl("rms_norm", _rms_norm)
+        _LIBRARY = library
+    else:
+        torch_xcpu._C.register_vllm_rms_norm()
+    _REGISTERED = True

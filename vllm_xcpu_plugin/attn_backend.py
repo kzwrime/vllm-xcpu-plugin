@@ -1,4 +1,5 @@
 import math
+import weakref
 from typing import ClassVar
 
 import torch
@@ -65,6 +66,66 @@ def _cache_write_regions_disjoint(caches: list[torch.Tensor]) -> bool:
     return True
 
 
+# The cache half of _can_group_cache_updates() depends only on the bound KV
+# cache tensors, which are fixed for the life of the model. One entry: the
+# caches (weakly referenced), the key layout they were checked against and
+# their storage pointers, or None if they cannot be grouped.
+_cache_geometry: tuple[tuple[weakref.ref, ...], tuple, frozenset[int] | None] | None = (
+    None
+)
+
+
+def _cache_geometry_storages(
+    caches: list[torch.Tensor], keys: torch.Tensor
+) -> frozenset[int] | None:
+    """Storage pointers of ``caches`` if their pages can take grouped writes."""
+    global _cache_geometry
+    layout = (keys.shape[2], keys.shape[3], keys.dtype, keys.device)
+    cached = _cache_geometry
+    if (
+        cached is not None
+        and cached[1] == layout
+        and len(cached[0]) == len(caches)
+        and all(ref() is cache for ref, cache in zip(cached[0], caches))
+    ):
+        return cached[2]
+    storages: frozenset[int] | None = frozenset(
+        cache.untyped_storage().data_ptr() for cache in caches
+    )
+    for cache in caches:
+        if (
+            cache.ndim != 4
+            or cache.shape[1] != keys.shape[2]
+            or cache.shape[3] != 2 * keys.shape[3]
+            or cache.dtype != keys.dtype
+            or cache.device != keys.device
+            or cache.stride(-1) != 1
+            or cache.data_ptr() % 4
+            or any(n <= 0 for n in cache.shape)
+            or any(s <= 0 for s in cache.stride())
+            or any(
+                n > 1 and (s * cache.element_size()) % 4
+                for n, s in zip(cache.shape[:-1], cache.stride()[:-1])
+            )
+        ):
+            storages = None
+            break
+        span = cache.shape[-1]
+        for stride, size in sorted(
+            (s, n) for n, s in zip(cache.shape[:-1], cache.stride()[:-1]) if n > 1
+        ):
+            if stride < span:
+                storages = None
+                break
+            span += (size - 1) * stride
+        if storages is None:
+            break
+    if storages is not None and not _cache_write_regions_disjoint(caches):
+        storages = None
+    _cache_geometry = (tuple(weakref.ref(c) for c in caches), layout, storages)
+    return storages
+
+
 # Eligibility checks for qwen3_dflash context KV, including inherited DFlash2.
 # These safety checks remain active when optional XCPU debug checks are disabled.
 def _can_group_cache_updates(
@@ -73,6 +134,8 @@ def _can_group_cache_updates(
     caches: list[torch.Tensor],
     slots: list[torch.Tensor],
 ) -> bool:
+    if len(slots) != len(caches):
+        raise ValueError("one slot mapping per cache is required")
     if (
         len(caches) < 2
         or keys.device.type != "mcpu"
@@ -89,41 +152,23 @@ def _can_group_cache_updates(
         or values.data_ptr() % 4
     ):
         return False
+    cache_storage = _cache_geometry_storages(caches, keys)
+    if cache_storage is None:
+        return False
     source_storage = {
         keys.untyped_storage().data_ptr(),
         values.untyped_storage().data_ptr(),
     }
-    source_storage.update(mapping.untyped_storage().data_ptr() for mapping in slots)
-    for cache, mapping in zip(caches, slots, strict=True):
+    for mapping in slots:
         if (
-            cache.ndim != 4
-            or cache.shape[1] != keys.shape[2]
-            or cache.shape[3] != 2 * keys.shape[3]
-            or cache.dtype != keys.dtype
-            or cache.device != keys.device
-            or cache.stride(-1) != 1
-            or cache.data_ptr() % 4
-            or cache.untyped_storage().data_ptr() in source_storage
-            or any(n <= 0 for n in cache.shape)
-            or any(s <= 0 for s in cache.stride())
-            or any(
-                n > 1 and (s * cache.element_size()) % 4
-                for n, s in zip(cache.shape[:-1], cache.stride()[:-1])
-            )
-            or mapping.shape != (keys.shape[1],)
+            mapping.shape != (keys.shape[1],)
             or mapping.dtype != torch.int64
             or mapping.device != keys.device
             or not mapping.is_contiguous()
         ):
             return False
-        span = cache.shape[-1]
-        for stride, size in sorted(
-            (s, n) for n, s in zip(cache.shape[:-1], cache.stride()[:-1]) if n > 1
-        ):
-            if stride < span:
-                return False
-            span += (size - 1) * stride
-    return _cache_write_regions_disjoint(caches)
+        source_storage.add(mapping.untyped_storage().data_ptr())
+    return cache_storage.isdisjoint(source_storage)
 
 
 @register_backend(AttentionBackendEnum.TRITON_ATTN)
