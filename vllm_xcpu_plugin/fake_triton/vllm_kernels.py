@@ -767,6 +767,41 @@ def _preprocess_mamba_align(launch: KernelLaunch) -> None:
     )
 
 
+def _mamba_aligned_state_indices(launch: KernelLaunch) -> None:
+    import torch_xcpu  # noqa: F401
+
+    args = launch.arguments
+    num_reqs = args["num_requests"]
+    block_rows = args["BLOCK_ROWS"]
+    _expect(block_rows > 0, "aligned state-index BLOCK_ROWS must be positive")
+    _expect_grid(launch, ((num_reqs + block_rows - 1) // block_rows,))
+    state_indices = args["state_indices_ptr"]
+    seq_lens = args["seq_lens_ptr"]
+    _expect(
+        args["NUM_GROUPS"] == args["block_table_ptrs_ptr"].numel()
+        and args["NUM_STATE_SLOTS"] == state_indices.shape[2],
+        "aligned state-index groups/slots must match the tensors",
+    )
+    _expect(
+        state_indices.stride()
+        == (
+            args["state_indices_stride_0"],
+            args["state_indices_stride_1"],
+            args["state_indices_stride_2"],
+        )
+        and seq_lens.stride(0) == args["seq_lens_stride"],
+        "aligned state-index strides must match the tensors",
+    )
+    torch.ops.torch_xcpu.mamba_aligned_state_indices(
+        args["block_table_ptrs_ptr"],
+        seq_lens,
+        state_indices,
+        args["block_table_stride_req"],
+        num_reqs,
+        args["CACHE_BLOCK_SIZE"],
+    )
+
+
 def _precopy_mamba_align(launch: KernelLaunch) -> None:
     args = launch.arguments
     total_states = args["state_base_addrs_ptr"].numel()
@@ -1794,6 +1829,19 @@ _KERNELS: tuple[
         ),
         _preprocess_mamba_align,
         (),
+    ),
+    (
+        "vllm.v1.worker.mamba_utils",
+        "get_aligned_state_indices_multi_group_kernel",
+        "bde808e7484e6681fb48c2fcd1c7549dc8c45e102b55c350dd42169e494a4817",
+        "62b91f24a1e4301a05febf4683bd9eddd45376931cf7d7e000c65a1561ec7ef8",
+        KernelSource(
+            tag="v0.31 MRV2 Mamba metadata reuse",
+            local_commit="4fd51eab0abcf2fdcbc8b362d7b82b5ddcd29d64",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _mamba_aligned_state_indices,
+        ("num_warps",),
     ),
     (
         "vllm.v1.worker.mamba_utils",

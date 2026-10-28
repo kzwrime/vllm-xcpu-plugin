@@ -27,7 +27,7 @@ def test_gdn_metadata_patch_is_idempotent_and_preserves_compatibility_source():
     gdn_metadata_patch.maybe_patch_gdn_metadata()
     assert GDNAttentionMetadataBuilder.build is patched
     assert patched.__wrapped__ is gdn_metadata_patch._ORIGINAL_GDN_METADATA_BUILD
-    assert len(verify_upstream_compatibility(("gdn_metadata",))) == 14
+    assert len(verify_upstream_compatibility(("gdn_metadata",))) == 15
 
 
 @pytest.mark.parametrize(
@@ -122,6 +122,7 @@ def test_gdn_metadata_device_indices_match_cpu(
     use_spec_decode=True,
     prealigned=False,
     capture=False,
+    regather=False,
 ):
     """Exercise pure, padded, interleaved mixed, and non-spec metadata builds."""
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -146,9 +147,11 @@ def test_gdn_metadata_device_indices_match_cpu(
             return view
         return tensor.to(device)
 
-    def build(device):
+    builders = {}
+
+    def build(device, table=table_cpu):
         # Isolate build() from model loading and backend selection.
-        builder = object.__new__(GDNAttentionMetadataBuilder)
+        builder = builders[device] = object.__new__(GDNAttentionMetadataBuilder)
         builder.vllm_config = SimpleNamespace(
             cache_config=SimpleNamespace(
                 mamba_cache_mode=mamba_cache_mode, prefix_match_unit=None
@@ -215,7 +218,7 @@ def test_gdn_metadata_device_indices_match_cpu(
             num_actual_tokens=sum(query_lens) + token_padding,
             max_query_len=max(query_lens),
             max_seq_len=max(query_lens) + batch * 17,
-            block_table_tensor=to_device(table_cpu, device),
+            block_table_tensor=to_device(table, device),
             slot_mapping=torch.empty(sum(query_lens), dtype=torch.int64, device=device),
         )
         if capture:
@@ -310,6 +313,51 @@ def test_gdn_metadata_device_indices_match_cpu(
             assert tensor is not source
             assert tensor.data_ptr() == source.data_ptr()
             assert_equal(source, tensor, name)
+
+    if regather:
+        # MRV2 reuses this build for another group of the same MambaSpec
+        # through upstream update_block_table().
+        other_table = table_cpu.flip(1) * 3 + 7
+        builder = builders["mcpu"]
+        if mamba_cache_mode == "align":
+            # MRV2's aligned state-index precompute for the other group.
+            seq_lens = torch.tensor(query_lens) + torch.arange(batch) * 17
+            first = ((seq_lens - 1) // builder.kv_cache_spec.block_size).clamp(min=0)
+            columns = first[:, None] + torch.arange(builder.num_spec + 1)
+            builder.mamba_aligned_state_indices = to_device(
+                other_table.gather(1, columns), "mcpu"
+            )
+        expected = build("cpu", other_table)
+        updated = builder.update_block_table(
+            actual, to_device(other_table, "mcpu"), None
+        )
+        assert isinstance(updated, type(actual))
+        for name, value in vars(expected).items():
+            assert_equal(value, getattr(updated, name), name)
+        # The core slots follow the replaced fields.
+        assert len({id(t) for t in updated.xcpu_core_tensors}) == 11
+        for name, tensor in zip(
+            (
+                "has_initial_state",
+                "spec_query_start_loc",
+                "non_spec_query_start_loc",
+                "spec_state_indices_tensor",
+                "non_spec_state_indices_tensor",
+                "spec_token_indx",
+                "non_spec_token_indx",
+                "num_accepted_tokens",
+                "prefill_query_start_loc",
+                "prefill_state_indices",
+                "prefill_has_initial_state",
+            ),
+            updated.xcpu_core_tensors,
+        ):
+            source = getattr(updated, name)
+            if source is None:
+                assert tensor.numel() == 0
+            else:
+                assert tensor.data_ptr() == source.data_ptr()
+                assert_equal(source, tensor, name)
 
 
 @pytest.mark.parametrize(
@@ -543,3 +591,43 @@ def test_gdn_metadata_cross_stream_inputs_survive_allocator_reuse():
     torch.testing.assert_close(
         spec_state_indices_tensor.cpu(), torch.arange(6, dtype=torch.int32).view(1, 6)
     )
+
+
+@pytest.mark.parametrize(
+    "draft_counts,query_lens",
+    [
+        ([5, 5], [6, 6]),
+        ([5, -1, -1], [6, 0, 0]),
+        ([-1, 5, -1, 5], [7, 6, 1, 6]),
+        ([0, 0, -1], [1, 1, 0]),
+        ([5, 0, -1], [6, 1, 9]),
+        ([-1, -1, -1], [1, 65, 0]),
+        ([-1, -1], [129, 65]),
+        ([5, -1, 3, -1], [6, 130, 4, 0]),
+        ([-1, -1, -1, -1], [1, 1, 200, 0]),
+        (None, [1, 1, 9]),
+        (None, [1, 1]),
+    ],
+)
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("first_chunk", [False, True])
+@pytest.mark.parametrize("checkpoint_blocks", [0, 1])
+def test_gdn_update_block_table_matches_fresh_build(
+    draft_counts, query_lens, mamba_cache_mode, first_chunk, checkpoint_blocks
+):
+    test_gdn_metadata_device_indices_match_cpu(
+        draft_counts=draft_counts,
+        query_lens=query_lens,
+        mamba_cache_mode=mamba_cache_mode,
+        strided=True,
+        use_full_cuda_graph=False,
+        first_chunk=first_chunk,
+        checkpoint_blocks=checkpoint_blocks,
+        regather=True,
+    )
+
+
+def test_mcpu_platform_enables_mamba_metadata_reuse():
+    from vllm_xcpu_plugin.platform import McpuPlatform
+
+    assert McpuPlatform.support_mamba_metadata_reuse()

@@ -254,6 +254,11 @@ class McpuPlatform(Platform):
         return True
 
     @classmethod
+    def support_mamba_metadata_reuse(cls) -> bool:
+        # The aligned state-index precompute runs as a Fake Triton kernel.
+        return True
+
+    @classmethod
     def support_static_graph_mode(cls) -> bool:
         # CUDA, ROCM, XPU return True
         return False

@@ -105,6 +105,35 @@ def _exercise_native_core(packed_decode, head_ratio, compile_core):
         else:
             lengths, decodes, prefills = [3, 1], 0, 2
         total = sum(lengths) + (sum(spec_lengths) if spec else 0)
+        slots = device_int([17, 20, 22][: len(lengths)])
+        has_initial_state = torch.tensor([not fresh] * len(lengths), device="mcpu")
+        fields = dict(
+            non_spec_state_indices_tensor=slots,
+            non_spec_query_start_loc=query_starts(lengths),
+            has_initial_state=has_initial_state,
+            prefill_state_indices=slots[decodes:],
+            prefill_query_start_loc=query_starts(lengths[decodes:]),
+            prefill_has_initial_state=has_initial_state[decodes:],
+        )
+        if spec:
+            fields.update(
+                spec_sequence_masks=torch.tensor(
+                    [True, True] if pure_spec else [False, True, False, True],
+                    device="mcpu",
+                ),
+                spec_query_start_loc=query_starts(spec_lengths),
+                spec_state_indices_tensor=device_int([[2, 3, 4], [10, 11, 12]]),
+                num_accepted_tokens=device_int(
+                    [3, 2] if mode == "spec_zero" else [1, 2]
+                ),
+                spec_token_indx=device_int(
+                    list(range(sum(spec_lengths))) if pure_spec else [3, 4, 5, 7, 8]
+                ).long(),
+                non_spec_token_indx=device_int(
+                    [] if pure_spec else [0, 1, 2, 6]
+                ).long(),
+            )
+        # The graph-input core slots are derived from these fields.
         meta = XcpuGDNAttentionMetadata(
             num_prefills=prefills,
             num_prefill_tokens=sum(lengths[decodes:]),
@@ -113,50 +142,11 @@ def _exercise_native_core(packed_decode, head_ratio, compile_core):
             num_spec_decodes=2 if spec else 0,
             num_spec_decode_tokens=sum(spec_lengths) if spec else 0,
             num_actual_tokens=total,
-        )
-        slots = device_int([17, 20, 22][: len(lengths)])
-        meta.non_spec_state_indices_tensor = slots
-        meta.non_spec_query_start_loc = query_starts(lengths)
-        meta.has_initial_state = torch.tensor([not fresh] * len(lengths), device="mcpu")
-        meta.prefill_state_indices = slots[decodes:]
-        meta.prefill_query_start_loc = query_starts(lengths[decodes:])
-        meta.prefill_has_initial_state = meta.has_initial_state[decodes:]
-        if spec:
-            meta.spec_sequence_masks = torch.tensor(
-                [True, True] if pure_spec else [False, True, False, True], device="mcpu"
-            )
-            meta.spec_query_start_loc = query_starts(spec_lengths)
-            meta.spec_state_indices_tensor = device_int([[2, 3, 4], [10, 11, 12]])
-            meta.num_accepted_tokens = device_int(
-                [3, 2] if mode == "spec_zero" else [1, 2]
-            )
-            meta.spec_token_indx = device_int(
-                list(range(sum(spec_lengths))) if pure_spec else [3, 4, 5, 7, 8]
-            ).long()
-            meta.non_spec_token_indx = device_int(
-                [] if pure_spec else [0, 1, 2, 6]
-            ).long()
-        meta.xcpu_core_counts = torch.tensor(
-            [prefills, decodes, 2 if spec else 0, total, decodes], dtype=torch.int64
-        )
-        names = (
-            "has_initial_state",
-            "spec_query_start_loc",
-            "non_spec_query_start_loc",
-            "spec_state_indices_tensor",
-            "non_spec_state_indices_tensor",
-            "spec_token_indx",
-            "non_spec_token_indx",
-            "num_accepted_tokens",
-            "prefill_query_start_loc",
-            "prefill_state_indices",
-            "prefill_has_initial_state",
-        )
-        meta.xcpu_core_tensors = tuple(
-            getattr(meta, name).view(getattr(meta, name).shape)
-            if getattr(meta, name) is not None
-            else torch.empty(0, dtype=torch.int32, device="mcpu")
-            for name in names
+            xcpu_core_counts=torch.tensor(
+                [prefills, decodes, 2 if spec else 0, total, decodes],
+                dtype=torch.int64,
+            ),
+            **fields,
         )
         n = total + padding
         storage = (torch.randn(n, width + heads * dim, dtype=torch.bfloat16) * 0.1).to(

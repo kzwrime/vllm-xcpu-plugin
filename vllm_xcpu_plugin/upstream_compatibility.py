@@ -366,10 +366,22 @@ UPSTREAM_OPERATORS: tuple[UpstreamOperator, ...] = (
         "gdn_metadata",
         "vllm.v1.attention.backends.gdn_attn",
         "GDNAttentionMetadataBuilder.__init__",
-        "9bcd86391de6b79fd5cac69666f784cc596b7088eba87227d720cf568ecc3cef",
+        "58330aa50f526c096f77a01a0444863af23627df2d1eac081f7c859f642c9c0d",
         "e73d1aaed9c63b280614c90e3cfe174fae3c007fbe68b0275f223e7868700961",
         "torch_xcpu._C.build_gdn_metadata",
-        source_version="v0.31; local=630fdc2cf5; Qwen3.5 semantic review",
+        source_version="v0.31; local=0b852c60d9; platform-gated metadata reuse",
+    ),
+    # MRV2 reuses the first GDN group's metadata for the others through
+    # dataclasses.replace(); XcpuGDNAttentionMetadata.__post_init__ rederives
+    # the core graph-input slots from the replaced fields.
+    _operator(
+        "gdn_metadata",
+        "vllm.v1.attention.backends.gdn_attn",
+        "GDNAttentionMetadataBuilder.update_block_table",
+        "1529be50eaa56b36fe575f8eec3debca5463a05489efed95027ea0f367452d98",
+        "96fbd3a2ac87930c9bb53c21039d913df270b9a1a74169fa2ad3bf131a757e86",
+        "XcpuGDNAttentionMetadata.__post_init__",
+        source_version="v0.31; local=0b852c60d9; platform-gated metadata reuse",
     ),
     _operator(
         "gdn_metadata",

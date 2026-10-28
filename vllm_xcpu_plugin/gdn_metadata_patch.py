@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 
 import torch
@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 _ORIGINAL_GDN_METADATA_BUILD: Callable[..., GDNAttentionMetadata] | None = None
 # Resolved once in maybe_patch_gdn_metadata(), off the per-step path.
 _BUILD_GDN_METADATA: Callable[..., tuple] | None = None
+_GDN_CORE_TENSORS: Callable[[list], list] | None = None
 _FLA_CHUNK_SIZE = 0
 
 
@@ -25,37 +26,30 @@ _FLA_CHUNK_SIZE = 0
 class XcpuGDNAttentionMetadata(GDNAttentionMetadata):
     # Immutable per-build CPU scheduling facts, passed as a runtime graph input.
     xcpu_core_counts: torch.Tensor | None = None
-    xcpu_core_tensors: tuple[torch.Tensor, ...] = ()
+    # Graph-input slots of the native GDN core. Guardless AOT replay fetches
+    # every slot on every invocation, including slots absent during tracing,
+    # and distinct views keep Dynamo from specializing two slots to one Python
+    # object. Derived from the fields, so dataclasses.replace() (FULL staging,
+    # upstream update_block_table) keeps them consistent.
+    xcpu_core_tensors: tuple[torch.Tensor, ...] = field(init=False, default=())
 
-
-def _core_tensors(
-    device: torch.device, *tensors: torch.Tensor | None
-) -> tuple[torch.Tensor, ...]:
-    # Guardless AOT replay must fetch every slot on every invocation, including
-    # slots that were absent during tracing. Distinct views also prevent Dynamo
-    # from specializing two slots to the same Python Tensor object. The C++
-    # builder returns the same slots; this rebuilds them after FULL staging.
-    return tuple(
-        tensor.view(tensor.shape)
-        if tensor is not None
-        else torch.empty(0, dtype=dtype, device=device)
-        for tensor, dtype in zip(
-            tensors,
-            (
-                torch.bool,
-                torch.int32,
-                torch.int32,
-                torch.int32,
-                torch.int32,
-                torch.int64,
-                torch.int64,
-                torch.int32,
-                torch.int32,
-                torch.int32,
-                torch.bool,
-            ),
+    def __post_init__(self) -> None:
+        assert _GDN_CORE_TENSORS is not None
+        self.xcpu_core_tensors = tuple(
+            _GDN_CORE_TENSORS([
+                self.has_initial_state,
+                self.spec_query_start_loc,
+                self.non_spec_query_start_loc,
+                self.spec_state_indices_tensor,
+                self.non_spec_state_indices_tensor,
+                self.spec_token_indx,
+                self.non_spec_token_indx,
+                self.num_accepted_tokens,
+                self.prefill_query_start_loc,
+                self.prefill_state_indices,
+                self.prefill_has_initial_state,
+            ])
         )
-    )
 
 
 def _xcpu_gdn_metadata_build(
@@ -144,8 +138,7 @@ def _xcpu_gdn_metadata_build(
         token_chunk_offset_ptr,
         spec_sequence_masks_cpu,
         core_counts,
-    ) = tensors[:21]
-    core_tensors = tuple(tensors[21:])
+    ) = tensors
 
     nums_dict = None
     checkpoint = None
@@ -177,7 +170,6 @@ def _xcpu_gdn_metadata_build(
     # metadata below is indexed by request.
     batch_size = m.num_reqs
 
-    staged = False
     if (
         self.use_full_cuda_graph
         and num_prefills == 0
@@ -185,7 +177,6 @@ def _xcpu_gdn_metadata_build(
         and num_spec_decodes <= self.decode_cudagraph_max_bs
         and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
     ):
-        staged = True
         assert spec_sequence_masks is not None
         self.spec_state_indices_tensor[:num_spec_decodes].copy_(
             spec_state_indices_tensor, non_blocking=True
@@ -229,7 +220,6 @@ def _xcpu_gdn_metadata_build(
         and num_spec_decodes == 0
         and num_decodes <= self.decode_cudagraph_max_bs
     ):
-        staged = True
         self.non_spec_state_indices_tensor[:num_decodes].copy_(
             non_spec_state_indices_tensor, non_blocking=True
         )
@@ -243,23 +233,7 @@ def _xcpu_gdn_metadata_build(
         non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
         non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
-    if staged:
-        core_tensors = _core_tensors(
-            query_start_loc.device,
-            has_initial_state,
-            spec_query_start_loc,
-            non_spec_query_start_loc,
-            spec_state_indices_tensor,
-            non_spec_state_indices_tensor,
-            spec_token_indx,
-            non_spec_token_indx,
-            num_accepted_tokens,
-            prefill_query_start_loc,
-            prefill_state_indices,
-            prefill_has_initial_state,
-        )
     attn_metadata = XcpuGDNAttentionMetadata(
-        xcpu_core_tensors=core_tensors,
         xcpu_core_counts=core_counts,
         num_prefills=num_prefills,
         num_prefill_tokens=num_prefill_tokens,
@@ -294,6 +268,7 @@ def _xcpu_gdn_metadata_build(
 
 def maybe_patch_gdn_metadata() -> None:
     global _ORIGINAL_GDN_METADATA_BUILD, _BUILD_GDN_METADATA, _FLA_CHUNK_SIZE
+    global _GDN_CORE_TENSORS
 
     if _ORIGINAL_GDN_METADATA_BUILD is not None:
         return
@@ -307,6 +282,7 @@ def maybe_patch_gdn_metadata() -> None:
 
     verify_upstream_compatibility(("gdn_metadata",))
     _BUILD_GDN_METADATA = torch_xcpu._C.build_gdn_metadata
+    _GDN_CORE_TENSORS = torch_xcpu._C.gdn_core_tensors
     _FLA_CHUNK_SIZE = FLA_CHUNK_SIZE
     _ORIGINAL_GDN_METADATA_BUILD = GDNAttentionMetadataBuilder.build
     GDNAttentionMetadataBuilder.build = wraps(_ORIGINAL_GDN_METADATA_BUILD)(  # type: ignore[method-assign]

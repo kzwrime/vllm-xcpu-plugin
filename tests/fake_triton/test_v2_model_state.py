@@ -246,3 +246,52 @@ print(json.dumps({'passed': True}))
         env=env,
     )
     assert json.loads(result.stdout.strip().splitlines()[-1]) == {"passed": True}
+
+
+def test_aligned_state_indices_match_every_group_block_table():
+    repo = Path(__file__).parents[2]
+    code = """
+from types import SimpleNamespace
+import torch
+from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
+
+register_vllm_kernels()
+groups, reqs, width, slots, block = 3, 5, 12, 3, 4
+tables = [torch.randint(0, 1000, (reqs + 2, width), dtype=torch.int32)
+          .to("mcpu") for _ in range(groups)]
+seq_lens = torch.tensor([0, 1, 4, 5, 17, 99, 99], dtype=torch.int32, device="mcpu")
+# A strided output buffer, as allocated for max_num_reqs.
+buffer = torch.full((groups, reqs + 4, slots + 1), -7, dtype=torch.int32,
+                    device="mcpu")
+ctx = SimpleNamespace(
+    is_initialized=True, block_size=block, num_groups=groups,
+    block_table_ptrs=torch.tensor([t.data_ptr() for t in tables],
+                                  dtype=torch.int64, device="mcpu"),
+    block_table_stride_req=width,
+    aligned_state_indices=buffer[:, :, :slots],
+)
+out = MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, reqs)
+torch.mcpu.synchronize()
+assert out.shape == (groups, reqs, slots)
+expected = torch.full_like(buffer.cpu(), -7)
+for g, table in enumerate(tables):
+    table = table.cpu()
+    for r in range(reqs):
+        first = max((int(seq_lens[r]) - 1) // block, 0)
+        expected[g, r, :slots] = table[r, first:first + slots]
+torch.testing.assert_close(buffer.cpu(), expected)
+print("aligned state indices match")
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo)
+    env["VLLM_PLUGINS"] = "xcpu_platform_plugin"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "aligned state indices match" in result.stdout
