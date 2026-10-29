@@ -1133,6 +1133,12 @@ def _rejection_v2(launch: KernelLaunch) -> None:
             args["draft_logits_stride_0"] == 0 and args["draft_logits_stride_1"] == 0,
             "absent draft logits must have zero strides",
         )
+    # Same bound as rejection_sample(): the valid vocabulary is the smaller of
+    # the target and draft logits widths. Draft ids outside [0, vocab_size)
+    # are treated as placeholders and rejected by the operator.
+    vocab_size = args["target_logits_ptr"].shape[1]
+    if args["HAS_DRAFT_LOGITS"]:
+        vocab_size = min(vocab_size, draft_logits.shape[-1])
     torch.ops.mcpu.vllm_rejection(
         args["sampled_ptr"],
         args["rejected_steps_ptr"],
@@ -1155,6 +1161,7 @@ def _rejection_v2(launch: KernelLaunch) -> None:
         args["local_residual_mass_ptr"],
         args["USE_BLOCK_VERIFICATION"],
         vocab_num_blocks,
+        vocab_size,
     )
 
 
