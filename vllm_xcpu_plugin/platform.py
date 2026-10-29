@@ -176,6 +176,19 @@ class McpuPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_xcpu_plugin.worker.worker_v1.McpuWorker"
 
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.enable_sleep_mode:
+            from vllm_xcpu_plugin.sleep_mode import (
+                BACKEND_NAME,
+                register_sleep_mode_backend,
+            )
+
+            register_sleep_mode_backend()
+            # "cumem" is upstream's default and does not exist on xcpu; any
+            # other explicit choice is kept.
+            if model_config.sleep_mode_backend == "cumem":
+                model_config.sleep_mode_backend = BACKEND_NAME
+
         # The F service builds its own VllmConfig without vLLM EP; only A ranks
         # need the loader that drops remote expert tensors.
         if envs_xcpu.VLLM_XCPU_ENABLE_AF_EP and parallel_config.enable_expert_parallel:
@@ -248,6 +261,13 @@ class McpuPlatform(Platform):
             compilation_config.inductor_compile_config.setdefault(
                 "memory_pool", inductor_config.memory_pool
             )
+
+    def is_sleep_mode_available(self) -> bool:
+        # /sleep and /wake_up release and reacquire the device compute runtime
+        # through torch_xcpu while device memory stays mapped; see sleep_mode.py.
+        from vllm_xcpu_plugin.sleep_mode import XcpuSleepModeBackend
+
+        return XcpuSleepModeBackend.is_supported()
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

@@ -46,6 +46,12 @@ class McpuWorker(Worker):
             vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
         )
         self._af_client: ExpertsClient | None = None
+        if vllm_config.model_config.enable_sleep_mode:
+            # Worker processes do not rerun check_and_update_config, so the
+            # backend registry must be populated here as well.
+            from vllm_xcpu_plugin.sleep_mode import register_sleep_mode_backend
+
+            register_sleep_mode_backend()
         device_config = self.device_config
         print(f"device_config: {device_config}")
         assert device_config.device_type == "privateuseone"
@@ -376,6 +382,30 @@ class McpuWorker(Worker):
                 set_random_seed(self.model_config.seed)
 
         return compilation_times
+
+    def sleep(self, level: int = 1) -> None:
+        """Release the device compute runtime for /sleep.
+
+        Device memory stays mapped on xcpu, so unlike the GPU worker nothing is
+        offloaded or discarded and the free-memory accounting upstream relies
+        on does not apply. The engine has already paused the scheduler and
+        reset the prefix cache; the router guarantees no requests arrive until
+        /wake_up.
+        """
+        self.synchronize_device()
+        self.sleep_mode_backend.suspend(level)
+        self.synchronize_device()
+        logger.info("Sleep level %d: xcpu device runtime released", level)
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        self.sleep_mode_backend.resume(tags)
+        self.synchronize_device()
+
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError(
+            "release_kv_cache_memory is not supported on xcpu: device memory "
+            "stays mapped across /sleep and /wake_up."
+        )
 
     def shutdown(self):
         if self._af_client is not None:
