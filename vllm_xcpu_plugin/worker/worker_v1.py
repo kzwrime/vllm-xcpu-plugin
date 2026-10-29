@@ -229,9 +229,6 @@ class McpuWorker(Worker):
         gc.collect()
         torch.accelerator.empty_cache()
 
-        # take current memory snapshot
-        self.init_snapshot = MemorySnapshot(device=self.device)
-        logger.info("worker init memory snapshot: %r", self.init_snapshot)
         kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
         from vllm_xcpu_plugin import shared_kv_cache
 
@@ -239,6 +236,22 @@ class McpuWorker(Worker):
             kv_cache_space = shared_kv_cache.memory_budget() / GiB_bytes
         assert kv_cache_space is not None
         self.requested_memory = kv_cache_space * GiB_bytes
+
+        # Take the KV cache memory now, while the device heap is still empty;
+        # the model runner hands it to the KV cache allocation later. It is
+        # taken before the snapshot so memory profiling does not count it as
+        # non-KV-cache memory.
+        if envs_xcpu.VLLM_XCPU_RESERVE_KV_CACHE and not shared_kv_cache.enabled():
+            from vllm_xcpu_plugin import kv_cache_reservation
+
+            kv_cache_reservation.reserve(
+                self.cache_config.kv_cache_memory_bytes or int(self.requested_memory),
+                self.device,
+            )
+
+        # take current memory snapshot
+        self.init_snapshot = MemorySnapshot(device=self.device)
+        logger.info("worker init memory snapshot: %r", self.init_snapshot)
         # self.requested_memory = request_memory(init_snapshot, self.cache_config)
         # logger.debug(
         #     "worker requested memory: %sGiB", format_gib(self.requested_memory)

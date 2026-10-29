@@ -8,6 +8,12 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Take the KV cache's device memory in init_device, while the device heap
+    # is still empty, and hand it to the KV cache allocation after model
+    # loading and profiling. See vllm_xcpu_plugin/kv_cache_reservation.py.
+    "VLLM_XCPU_RESERVE_KV_CACHE": lambda: (
+        os.getenv("VLLM_XCPU_RESERVE_KV_CACHE", "1") == "1"
+    ),
     "VLLM_XCPU_SHARED_KV_CACHE": lambda: (
         os.getenv("VLLM_XCPU_SHARED_KV_CACHE", "0") == "1"
     ),

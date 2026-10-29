@@ -12,7 +12,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_xcpu_plugin.envs as envs_xcpu
-from vllm_xcpu_plugin import shared_kv_cache
+from vllm_xcpu_plugin import kv_cache_reservation, shared_kv_cache
 
 if TYPE_CHECKING:
     pass
@@ -33,6 +33,23 @@ class McpuModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
+        self._kv_cache_handoff = False
+
+    def initialize_kv_cache(self, kv_cache_config, is_profiling=False, **kwargs):
+        # A profiling run's minimal KV cache must not consume the reservation.
+        self._kv_cache_handoff = not is_profiling
+        try:
+            super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)
+        finally:
+            self._kv_cache_handoff = False
+
+    def initialize_kv_cache_tensors(self, *args, **kwargs):
+        # allocate_kv_cache is the first thing the base method does.
+        if not self._kv_cache_handoff:
+            return super().initialize_kv_cache_tensors(*args, **kwargs)
+        return kv_cache_reservation.handoff(
+            super().initialize_kv_cache_tensors, *args, **kwargs
+        )
 
 
 class McpuModelRunnerV2(GPUModelRunnerV2):
@@ -47,10 +64,23 @@ class McpuModelRunnerV2(GPUModelRunnerV2):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self._af_forward_allreduce = envs_xcpu.VLLM_XCPU_AF_FORWARD_ALLREDUCE
+        self._kv_cache_handoff = False
+
+    def initialize_kv_cache(self, kv_cache_config, is_profiling=False, **kwargs):
+        # A profiling run's minimal KV cache must not consume the reservation.
+        self._kv_cache_handoff = not is_profiling
+        try:
+            super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)
+        finally:
+            self._kv_cache_handoff = False
 
     def allocate_kv_cache(self, *args, **kwargs):
         if not shared_kv_cache.enabled():
-            return super().allocate_kv_cache(*args, **kwargs)
+            if not self._kv_cache_handoff:
+                return super().allocate_kv_cache(*args, **kwargs)
+            return kv_cache_reservation.handoff(
+                super().allocate_kv_cache, *args, **kwargs
+            )
         draft_layers = getattr(self.speculator, "draft_attn_layer_names", ())
         shared = shared_kv_cache.SharedKVCache(
             self.vllm_config, self.device, draft_layers
