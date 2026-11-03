@@ -246,7 +246,9 @@ PY
 版本、source hash 和 signature hash；禁止通过修改 baseline 批量放行。
 
 绕过 Fake Triton 的替代路径登记在
-`vllm_xcpu_plugin/upstream_compatibility.py`。attention、causal-conv、GDN/FLA、
+`vllm_xcpu_plugin/upstream_compatibility.py`。已迁移到上游契约的类别（当前为
+`deepseek_v41`）把 adapter 的指纹与下游位置、语义契约、测试一起登记在
+`models/<category>/upstream.py`，见 `docs/UPSTREAM_CONTRACTS.md`。attention、causal-conv、GDN/FLA、
 Gumbel/temperature、top-k/top-p、grouped-topk 和 topk-softmax 的上游
 Triton kernel 或语义入口都必须在真正安装 patch 前通过同样的指纹检查。
 报错后需要更新 XCPU 实现和差分测试，再单独推进对应记录的版本与哈希。

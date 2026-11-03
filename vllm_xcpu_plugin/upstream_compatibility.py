@@ -88,6 +88,8 @@ UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
         "vllm.model_executor.layers.attention.sparse_mla_attention",
         "59b5cc01f45c9a843db53413fcf970acb90d14cef0282115276b055b98d282d2",
     ),
+    # DeepSeek-V4.1 files are watched by its upstream contract manifest
+    # (vllm_xcpu_plugin.models.deepseek_v41.upstream).
 )
 
 
@@ -684,7 +686,12 @@ def verify_upstream_compatibility(
     categories: Iterable[str] | None = None,
 ) -> tuple[UpstreamOperator, ...]:
     """Validate all selected non-Fake-Triton replacement dependencies."""
+    from vllm_xcpu_plugin import upstream_contracts
+
     selected = set(categories) if categories is not None else None
+    for category in sorted(upstream_contracts.MANIFESTS):
+        if selected is None or category in selected:
+            upstream_contracts.verify(category)
     checked = []
     for source_file in UPSTREAM_SOURCE_FILES:
         if selected is not None and source_file.category not in selected:
@@ -697,8 +704,8 @@ def verify_upstream_compatibility(
                 f"{source_file.module}: upstream source file changed "
                 f"(expected SHA256 {source_file.expected_sha256}, got "
                 f"{actual_sha256}). Review all helper and metadata changes "
-                "against the XCPU sparse-indexer translation before updating "
-                "the file hash in upstream_compatibility.py."
+                f"against the XCPU {source_file.category} replacement before "
+                "updating the file hash in upstream_compatibility.py."
             )
     for target in UPSTREAM_OPERATORS:
         if selected is not None and target.category not in selected:
