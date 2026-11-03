@@ -1,6 +1,6 @@
 import math
 import weakref
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import torch
 from vllm.config.cache import CacheDType
@@ -399,7 +399,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
-            return output
+            return cast(torch.Tensor, output)
 
         if torch_xcpu.config._ENABLE_CHECKS:
             if attn_metadata.use_cascade:
@@ -462,7 +462,7 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             # softmax_segm_max=softmax_segm_max,
             # softmax_segm_expsum=softmax_segm_expsum,
         )
-        return output
+        return cast(torch.Tensor, output)
 
     def do_kv_cache_update(
         self,
@@ -533,10 +533,10 @@ class XcpuTritonAttentionImpl(TritonAttentionImpl):
             if not active:
                 return
             caches = [layer.kv_cache for _, layer, _ in active]
-            slots = [mapping for _, _, mapping in active]
-            if _can_group_cache_updates(keys, values, caches, slots):
+            slot_list = [mapping for _, _, mapping in active]
+            if _can_group_cache_updates(keys, values, caches, slot_list):
                 torch_xcpu.ops.reshape_and_cache_grouped(
-                    keys, values, caches, slots, [i for i, _, _ in active]
+                    keys, values, caches, slot_list, [i for i, _, _ in active]
                 )
                 return
 

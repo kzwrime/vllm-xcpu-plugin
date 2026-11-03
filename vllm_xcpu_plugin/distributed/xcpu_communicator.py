@@ -94,6 +94,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
 
         if self.rank_in_group == dst:
+            assert gather_list is not None
             output_tensor = torch.cat(gather_list, dim=dim)
         else:
             output_tensor = None

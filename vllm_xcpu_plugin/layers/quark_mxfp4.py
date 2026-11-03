@@ -97,7 +97,7 @@ class XcpuQuarkOCPMXLinearScheme(QuarkOCP_MX):
             weight_quant_key == kMxfp4Static and activation_quant_key is None
         )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: Any) -> None:
         if not self._use_xcpu_w4a16:
             return super().process_weights_after_loading(layer)
 
