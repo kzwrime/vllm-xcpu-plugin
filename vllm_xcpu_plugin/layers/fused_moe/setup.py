@@ -89,6 +89,7 @@ def install_fused_moe(
             ep_rank=prepare_finalize.ep_rank,
             max_num_tokens=prepare_finalize.max_moe_tokens_per_rank,
             topk=method.moe.experts_per_token,
+            swiglu_limit=quant_config.gemm1_clamp_limit or 0.0,
         )
         layer._xcpu_ep_experts.initialize_windows()
         method.moe_kernel = XcpuEPKernelAdapter(

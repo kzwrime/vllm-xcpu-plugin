@@ -229,27 +229,33 @@ def test_native_workspace_rejects_invalid_storage_before_dispatch(version):
     )
     native = entry._op
     captured = []
-    entry._op = lambda *args: captured.extend(args)
+    keywords = {}
+    entry._op = lambda *args, **kwargs: (captured.extend(args), keywords.update(kwargs))
     entry.forward(
         torch.empty(1, 128, device="mcpu", dtype=torch.bfloat16),
         torch.ones(1, 6, device="mcpu", dtype=torch.float32),
         torch.zeros(1, 6, device="mcpu", dtype=torch.int32),
     )
+    names = [a.name for a in native._schema.arguments]
+    # swiglu_limit goes by keyword: V5 has optional shared-expert args before it.
     assert len(captured) == 19
+    assert keywords == {"swiglu_limit": 0.0}
     assert [
         a.name
         for a in native._schema.arguments
         if a.alias_info and a.alias_info.is_write
     ] == ["output", "workspace"]
-    workspace = captured[-2]
+    w = names.index("workspace")
+    workspace = captured[w]
+    head, tail = captured[:w], captured[w + 1 :]
     assert workspace.numel() == entry.workspace_bytes
     assert entry.workspace_bytes % 64 == 0
     with pytest.raises(RuntimeError, match="workspace too small"):
-        native(*captured[:-2], workspace[:-1], captured[-1])
+        native(*head, workspace[:-1], *tail)
     with pytest.raises(RuntimeError, match="aligned 1D uint8"):
-        native(*captured[:-2], workspace[1:], captured[-1])
+        native(*head, workspace[1:], *tail)
     with pytest.raises(RuntimeError, match="aligned 1D uint8"):
-        native(*captured[:-2], workspace.view(torch.int8), captured[-1])
+        native(*head, workspace.view(torch.int8), *tail)
     alias_output = workspace[:256].view(torch.bfloat16).view(1, 128)
     with pytest.raises(RuntimeError, match="must not alias"):
         native(alias_output, *captured[1:])
@@ -474,14 +480,14 @@ def test_post_sp_input_bound_does_not_scale_receive_quota(monkeypatch, version):
         topk=6,
     )
     captured = []
-    entry._op = lambda *args: captured.extend(args)
+    entry._op = lambda *args, **kwargs: captured.extend(args)
     entry(
         torch.empty(17, 128, device="mcpu", dtype=torch.bfloat16),
         torch.ones(17, 6, device="mcpu"),
         torch.zeros(17, 6, device="mcpu", dtype=torch.int32),
     )
     assert captured[14] == 17
-    assert captured[-1] == 8
+    assert captured[18] == 8
     monkeypatch.setenv("VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK", "-1")
     with pytest.raises(ValueError, match="nonnegative"):
         XcpuEPExperts(
@@ -586,21 +592,29 @@ def test_bind_shared_experts_passes_linear_weights_and_scale():
     entry.bind_shared_experts(shared, 2.5)
     assert entry.workspace_bytes == entry._workspace_size(64) > routed_only
     calls = []
-    entry._op = lambda *args: calls.append(args)
+    entry._op = lambda *args, **kwargs: calls.append((args, kwargs))
     entry.forward(
         torch.zeros(3, 128, device="mcpu", dtype=torch.bfloat16),
         torch.ones(3, 6, device="mcpu"),
         torch.zeros(3, 6, device="mcpu", dtype=torch.int32),
     )
-    (args,) = calls
+    ((args, kwargs),) = calls
     assert args[19:23] == (shared.w13, shared.w2, None, None)
     assert args[23:] == (-1, 0, 0, shared.gate, 2.5)
+    assert kwargs == {"swiglu_limit": 0.0}
     with pytest.raises(ValueError, match="only XCPU EP v5"):
         _v5_entry(6).bind_shared_experts(shared, 1.0)
 
 
-def _fusable_runner(tp_size=1, sequence_parallel=True, gate=True):
-    from vllm.model_executor.layers.activation import SiluAndMul
+def _fusable_runner(
+    tp_size=1,
+    sequence_parallel=True,
+    gate=True,
+    mlp_type="Qwen2MoeMLP",
+    shared_limit=None,
+    routed_limit=0.0,
+):
+    from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     def linear(out_features, in_features):
@@ -612,9 +626,13 @@ def _fusable_runner(tp_size=1, sequence_parallel=True, gate=True):
         )
 
     # The type name selects the gate_up -> SiLU -> down (-> gate) contract.
-    mlp = type("Qwen2MoeMLP", (), {})()
+    mlp = type(mlp_type, (), {})()
     mlp.gate_up_proj, mlp.down_proj = linear(128, 128), linear(128, 64)
-    mlp.act_fn = object.__new__(SiluAndMul)
+    if shared_limit is None:
+        mlp.act_fn = object.__new__(SiluAndMul)
+    else:
+        mlp.act_fn = object.__new__(SiluAndMulWithClamp)
+        mlp.act_fn.swiglu_limit = shared_limit
     mlp.expert_gate = linear(1, 128) if gate else None
     if mlp.expert_gate is not None:
         mlp.expert_gate.tp_size = 1
@@ -622,6 +640,7 @@ def _fusable_runner(tp_size=1, sequence_parallel=True, gate=True):
     ep_experts = SimpleNamespace(
         version=5,
         activation_dtype=torch.bfloat16,
+        swiglu_limit=routed_limit,
         compute=SimpleNamespace(params=SimpleNamespace(hidden=128)),
         bind_shared_experts=lambda shared, scale: bound.append((shared, scale)),
     )
@@ -677,3 +696,28 @@ def test_install_fused_shared_experts_keeps_tensor_parallel_mlp(
     runner, _, bound = _fusable_runner(tp_size, sequence_parallel)
     assert install_fused_shared_experts(runner) == 0 and not bound
     assert runner._shared_experts is not None and runner.routed_scaling_factor == 2.5
+
+
+@pytest.mark.parametrize(
+    "shared_limit,routed_limit,fused",
+    [(10.0, 10.0, 1), (10.0, 0.0, 0), (None, 10.0, 0)],
+    ids=["same_limit", "routed_unclamped", "shared_unclamped"],
+)
+def test_install_fused_shared_experts_matches_swiglu_limit(
+    monkeypatch, shared_limit, routed_limit, fused
+):
+    from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+        install_fused_shared_experts,
+    )
+
+    # DeepSeek-V4.1: the op clamps the routed and the shared SwiGLU with one
+    # limit, so only a shared MLP with the routed experts' limit fuses.
+    monkeypatch.setenv("VLLM_XCPU_FUSE_SHARED_EXPERTS", "1")
+    runner, _, bound = _fusable_runner(
+        gate=False,
+        mlp_type="DeepseekV4MLP",
+        shared_limit=shared_limit,
+        routed_limit=routed_limit,
+    )
+    assert install_fused_shared_experts(runner) == fused
+    assert len(bound) == fused

@@ -1,5 +1,5 @@
 import torch
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -50,6 +50,22 @@ class XcpuSiluAndMul(SiluAndMul):
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         torch_xcpu.ops.silu_and_mul(out, x)
+        return out
+
+
+@SiluAndMulWithClamp.register_oot
+class XcpuSiluAndMulWithClamp(SiluAndMulWithClamp):
+    """SwiGLU with clamped inputs (DeepSeek-V4.1 shared experts):
+    silu(min(gate, limit)) * clamp(up, -limit, limit)."""
+
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        import torch_xcpu
+
+        if self.alpha != 1.0 or self.beta != 0.0 or not x.is_contiguous():
+            return self.forward_native(x)
+        d = x.shape[-1] // 2
+        out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+        torch_xcpu.ops.silu_and_mul_with_clamp(out, x, self.swiglu_limit)
         return out
 
 

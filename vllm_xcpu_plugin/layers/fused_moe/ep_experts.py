@@ -59,10 +59,12 @@ class XcpuEPExperts(torch.nn.Module):
         ep_rank: int,
         max_num_tokens: int,
         topk: int,
+        swiglu_limit: float = 0.0,
     ):
         super().__init__()
         if version not in (5, 6):
             raise ValueError("XCPU EP requires MPI V5/V6")
+        self.swiglu_limit = float(swiglu_limit)
         if not 0 < ep_size <= 128 or not 0 <= ep_rank < ep_size:
             raise ValueError("invalid XCPU EP topology")
         if max_num_tokens <= 0 or topk not in (6, 8):
@@ -266,6 +268,7 @@ class XcpuEPExperts(torch.nn.Module):
             workspace,
             self.max_recv_tokens_per_rank,
             *shared_args,
+            swiglu_limit=self.swiglu_limit,
         )
         return output
 

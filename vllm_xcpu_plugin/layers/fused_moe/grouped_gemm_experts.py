@@ -147,6 +147,12 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
             raise ValueError("XCPU W8A16/W4A16 experts require BF16 activations")
         if apply_router_weight_on_input:
             raise ValueError("XCPU grouped GEMM experts weight routes on output")
+        if (
+            self.quant_config.gemm1_alpha is not None
+            or self.quant_config.gemm1_beta is not None
+        ):
+            raise ValueError("XCPU grouped GEMM experts have no SwiGLU alpha/beta")
+        swiglu_limit = self.quant_config.gemm1_clamp_limit or 0.0
 
         capacity, hidden = hidden_states.shape
         topk = topk_ids.shape[1]
@@ -219,4 +225,5 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
             expert_offsets=workspace.expert_offsets,
             intermediate_output=workspace.intermediate_output,
             activated=workspace.activated,
+            swiglu_limit=swiglu_limit,
         )

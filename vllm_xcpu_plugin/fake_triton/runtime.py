@@ -223,7 +223,7 @@ class KernelRegistry:
                 "Manually review the upstream Triton source diff and semantic "
                 "changes, update the XCPU implementation and differential tests, "
                 "then update only this kernel's hashes and source_version in "
-                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
+                f"{_pins_of(owner)}."
             )
         if not defer_version_check and kernel.signature_hash != expected_signature_hash:
             raise KernelVersionError(
@@ -233,7 +233,7 @@ class KernelRegistry:
                 "Manually review the upstream Triton signature and semantics, "
                 "update the adapter and differential tests, then update this "
                 "kernel's hashes and source_version in "
-                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
+                f"{_pins_of(owner)}."
             )
         unknown_metadata = set(allowed_metadata) - _TRITON_LAUNCH_METADATA
         if unknown_metadata:
@@ -265,7 +265,12 @@ class KernelRegistry:
         grid: Any,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        *,
+        execute: bool = True,
     ) -> Any:
+        """Validate a launch and run its adapter. ``execute=False`` is Triton's
+        ``warmup``: it compiles without launching, so every check runs but the
+        adapter does not."""
         registration = self._registrations.get(kernel.qualname)
         if registration is None:
             raise UnknownKernelError(
@@ -281,7 +286,7 @@ class KernelRegistry:
                 f"{registration.source_version}; manually review the upstream "
                 "change, update the implementation and differential tests, then "
                 "update only this kernel's hashes and source_version in "
-                "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS."
+                f"{_pins_of(registration.owner)}."
             )
 
         kernel_kwargs = {}
@@ -307,6 +312,8 @@ class KernelRegistry:
                 f"{kernel.qualname}: {len(resolved_grid)}D grid is not allowed"
             )
 
+        if not execute:
+            return None
         launch = KernelLaunch(
             kernel=kernel,
             grid=resolved_grid,
@@ -322,6 +329,16 @@ class KernelRegistry:
 
     def registrations(self) -> dict[str, KernelRegistration]:
         return dict(self._registrations)
+
+
+def _pins_of(owner: str) -> str:
+    """Where a registration's reviewed pins live, for error messages."""
+    if owner == "torch_mcpu":
+        return "vllm_xcpu_plugin.fake_triton.vllm_kernels._KERNELS"
+    return (
+        f"the upstream contract manifest of {owner} (contract, diff and steps: "
+        "python -m vllm_xcpu_plugin.upstream_contracts check)"
+    )
 
 
 def _resolve_grid(grid: Any, arguments: Mapping[str, Any]) -> tuple[int, ...]:
@@ -393,7 +410,7 @@ class FakeJITFunction:
         return self[grid](*args, **kwargs)
 
     def warmup(self, *args: Any, grid: Any, **kwargs: Any) -> Any:
-        return self[grid](*args, **kwargs)
+        return self.registry.dispatch(self, grid, args, kwargs, execute=False)
 
 
 _REGISTRY = KernelRegistry()

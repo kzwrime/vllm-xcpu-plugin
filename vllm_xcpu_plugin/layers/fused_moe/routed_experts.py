@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.quark.quark_moe import (
     QuarkOCP_MX_MoEMethod,
 )
@@ -24,7 +25,7 @@ def xcpu_moe_method_factory(
     quant_config: QuantizationConfig | None,
     layer: RoutedExperts,
 ) -> FusedMoEMethodBase:
-    """Map only the three supported upstream MoE method families."""
+    """Map only the supported upstream MoE method families."""
     if isinstance(upstream, Fp8MoEMethod):
         if not isinstance(quant_config, Fp8Config):
             raise TypeError("upstream FP8 MoE method requires Fp8Config")
@@ -37,6 +38,10 @@ def xcpu_moe_method_factory(
         )
 
         return XcpuCompressedTensorsMxfp4MoEMethod(layer.moe_config)
+    if type(upstream) is Mxfp4MoEMethod:
+        from vllm_xcpu_plugin.layers.mxfp4_moe import XcpuMxfp4MoEMethod
+
+        return XcpuMxfp4MoEMethod(layer.moe_config)
     if isinstance(upstream, QuarkOCP_MX_MoEMethod):
         from vllm_xcpu_plugin.layers.quark_mxfp4 import (
             XcpuQuarkOCPMXMoEMethod,

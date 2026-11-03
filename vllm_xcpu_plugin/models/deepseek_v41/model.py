@@ -1,0 +1,313 @@
+# SPDX-License-Identifier: Apache-2.0
+"""DeepSeek-V4.1 model entry point on XCPU.
+
+The upstream CUDA model (``vllm.models.deepseek_v41.nvidia``) is reused as is:
+its layer graph, engram, weight loading, decoder replay and EP/SP handling are
+platform neutral. Only the symbols that name CUDA kernels are rebound, and
+only on MCPU, after the upstream contracts (``upstream.py``) are verified.
+"""
+
+from itertools import islice
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+import vllm._custom_ops as vllm_ops
+import vllm.models.common.ops.sequence_parallel as sequence_parallel
+import vllm.models.deepseek_v41.attention as v41_attention
+import vllm.models.deepseek_v41.compressor as v41_compressor
+import vllm.models.deepseek_v41.nvidia.dspark as nv_dspark
+import vllm.models.deepseek_v41.nvidia.model as nv_model
+from torch import nn
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.models.deepseek_v41.nvidia.dspark import DSparkDeepseekV4ForCausalLM
+from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
+from vllm.models.deepseek_v41.nvidia.vl_model import DeepseekV41ForCausalLM
+from vllm.platforms import current_platform
+
+from vllm_xcpu_plugin.upstream_compatibility import verify_upstream_compatibility
+from vllm_xcpu_plugin.upstream_contracts import rebind
+
+from . import ops
+from .attention import XcpuDeepseekV41Attention
+from .backends import XcpuDeepseekV41IndexerCache
+from .triton_adapters import register_deepseek_v41_kernels
+
+_INSTALLED = False
+
+
+def _select_attn_cls(vllm_config) -> type[XcpuDeepseekV41Attention]:
+    backend = vllm_config.attention_config.backend
+    if backend is not None:
+        raise ValueError(
+            f"{backend.name} is not an XCPU attention backend; DeepSeek-V4.1 "
+            "always runs XcpuDeepseekV41Attention on XCPU."
+        )
+    return XcpuDeepseekV41Attention
+
+
+def _indexer_uses_fp4(vllm_config) -> bool:
+    # Upstream also gates the MXFP4 indexer cache on SM10x GPUs. XCPU always
+    # stores the 68 B MXFP4 key record; update_deepseek_v41_config has already
+    # pinned indexer_kv_dtype to it.
+    return True
+
+
+def _use_v41_mxfp8_kv_record() -> bool:
+    return True
+
+
+def _insert_context_kv(
+    attn: Any,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """DSpark context KV: ``_C.fused_deepseek_v4_kv_rope_insert`` is the KV
+    half of the fused Q/KV insert, so it runs with zero query heads."""
+    import torch_xcpu
+
+    torch_xcpu.ops.deepseek_v41_qnorm_rope_kv_insert(
+        kv.new_empty((kv.shape[0], 0, kv.shape[-1])),
+        kv,
+        attn.swa_cache_layer.kv_cache,
+        slot_mapping,
+        positions,
+        attn.rotary_emb.cos_sin_cache,
+        0,
+    )
+
+
+def _sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+    """``sp_reduce_scatter`` whose row padding stays in a compiled graph.
+
+    Upstream pads only ``if sp_pad > 0``; the single TRACE_ONCE trace runs
+    with an even token count and would drop the pad for odd ones. Padding by
+    the symbolic remainder (zero rows when even) keeps every count valid.
+    """
+    # Reference: vLLM
+    # vllm/models/common/ops/sequence_parallel.py::sp_reduce_scatter
+    if not torch.compiler.is_compiling():
+        return _upstream_sp_reduce_scatter(x)
+    assert x.ndim == 2
+    tp_size = get_tensor_model_parallel_world_size()
+    x = F.pad(x, (0, 0, 0, (-x.shape[0]) % tp_size))
+    output = sequence_parallel._custom_collective("custom_reduce_scatter", x)
+    if output is not None:
+        return output
+    return sequence_parallel.tensor_model_parallel_reduce_scatter(x, 0)
+
+
+_upstream_sp_reduce_scatter = sequence_parallel.sp_reduce_scatter
+
+
+class _XcpuDeepseekV41LayerStack(nn.Module):
+    """A range of the decoder layers as one compiled graph.
+
+    The CUDA path keeps the model eager around breakable CUDA graphs; here the
+    model forward stays eager (engram hashing, the decoder-replay sub-batch,
+    sequence-parallel bookkeeping) and only the decoder layers are traced,
+    with attention behind its opaque op. The layers are registered here as
+    well as on the model so the graph owns their parameters; the model is held
+    unregistered to keep the module tree acyclic.
+    """
+
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", model: DeepseekV4Model
+    ) -> None:
+        super().__init__()
+        self.layers = model.layers
+        self.__dict__["model"] = model
+
+
+@support_torch_compile
+class _XcpuDeepseekV41SourceLayers(_XcpuDeepseekV41LayerStack):
+    """Layers up to the last KV source; they always see the whole batch."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        # Reference: vLLM
+        # vllm/models/deepseek_v41/nvidia/model.py::DeepseekV4Model._run_layers
+        model: Any = self.model
+        aux: dict[int, torch.Tensor] = {}
+        outputs = DeepseekV4Model._run_layers(
+            model,
+            model.source_layer_ids,
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+            aux,
+            engram_hashes,
+            engram_mask,
+        )
+        return (*outputs, *(aux[i] for i in model.source_aux_layer_ids()))
+
+
+@support_torch_compile
+class _XcpuDeepseekV41ReplayLayers(_XcpuDeepseekV41LayerStack):
+    """Layers past the last KV source plus the collapse; in prefill steps the
+    decoder replay runs them on each request's trailing window only."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        # Reference: vLLM
+        # vllm/models/deepseek_v41/nvidia/model.py::DeepseekV4Model._run_replay_layers
+        return DeepseekV4Model._run_replay_layers(
+            self.model,
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+        )
+
+
+class XcpuDeepseekV41Model(DeepseekV4Model):
+    """``DeepseekV4Model`` with its decoder layers in compiled graphs."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.source_layer_ids = range(self.start_layer, self.decoder_replay_start)
+        self.source_layers = _XcpuDeepseekV41SourceLayers(
+            vllm_config=vllm_config, prefix=f"{prefix}.source_layers", model=self
+        )
+        self.replay_layers = None
+        if self.decoder_replay_layers is not None:
+            self.replay_layers = _XcpuDeepseekV41ReplayLayers(
+                vllm_config=vllm_config, prefix=f"{prefix}.replay_layers", model=self
+            )
+
+    def source_aux_layer_ids(self) -> list[int]:
+        """The aux hidden states the source layers capture, in capture order:
+        each layer's own post, so not the first layer's."""
+        ids = self.source_layer_ids
+        return [i for i in ids[1:] if i in self.aux_hidden_state_layers]
+
+    def _run_layers(
+        self,
+        layer_ids: range,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        engram_hashes: torch.Tensor | None = None,
+        engram_mask: torch.Tensor | None = None,
+    ):
+        if layer_ids != self.source_layer_ids:
+            return super()._run_layers(
+                layer_ids,
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
+        if (
+            engram_hashes is None
+            and self.engram_hash is not None
+            and not self.source_layers.do_not_compile
+        ):
+            # Profile and warmup runs hash nothing; the graph keeps the engram
+            # layers anyway, fed dead n-grams whose gate is shut.
+            engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                if layer.engram is not None:
+                    layer.engram.prepare_embeddings(
+                        engram_hashes[:, layer.engram.layer_hash_index]
+                    )
+        outputs = self.source_layers(
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+            engram_hashes,
+            engram_mask,
+        )
+        aux_hidden_by_layer.update(zip(self.source_aux_layer_ids(), outputs[5:]))
+        return outputs[:5]
+
+    def _run_replay_layers(self, *inputs: torch.Tensor | None):
+        assert self.replay_layers is not None
+        return self.replay_layers(*inputs)
+
+
+def install_deepseek_v41() -> None:
+    global _INSTALLED
+    if _INSTALLED or current_platform.device_name != "mcpu":
+        return
+    import torch_xcpu
+
+    verify_upstream_compatibility(("deepseek_v41",))
+    register_deepseek_v41_kernels()
+    rebind(vllm_ops, "topk_hash_softplus_sqrt", ops.topk_hash_softplus_sqrt)
+    rebind(nv_model, "_select_dsv4_attn_cls", _select_attn_cls)
+    rebind(
+        nv_model,
+        "mhc_pre_delayed_tilelang",
+        torch_xcpu.ops.deepseek_v41_mhc_pre_delayed,
+    )
+    rebind(nv_model, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
+    rebind(nv_model, "mhc_shifted_post_pre", ops.mhc_shifted_post_pre)
+    rebind(nv_model, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
+    rebind(nv_model.DeepseekV41LLMForCausalLM, "model_cls", XcpuDeepseekV41Model)
+    rebind(nv_model, "sp_reduce_scatter", _sp_reduce_scatter)
+    rebind(nv_dspark, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
+    rebind(nv_dspark, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
+    rebind(nv_dspark, "_insert_context_kv", _insert_context_kv)
+    rebind(v41_attention, "dsa_indexer_uses_fp4", _indexer_uses_fp4)
+    rebind(v41_attention, "_use_v41_mxfp8_kv_record", _use_v41_mxfp8_kv_record)
+    rebind(v41_attention, "DeepseekV4IndexerCache", XcpuDeepseekV41IndexerCache)
+    rebind(v41_compressor, "fused_save_compress_norm", ops.fused_save_compress_norm)
+    rebind(v41_compressor, "rope_quant_insert", ops.rope_quant_insert)
+    from . import engram  # noqa: F401  (registers the OOT engram layers)
+
+    _INSTALLED = True
+
+
+install_deepseek_v41()
+
+
+class XcpuDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
+    pass
+
+
+class XcpuDSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):
+    pass

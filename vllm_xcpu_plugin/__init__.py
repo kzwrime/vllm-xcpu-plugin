@@ -44,6 +44,8 @@ def register_ops():
     from vllm_xcpu_plugin.qwen3_dflash2_patch import maybe_patch_qwen3_dflash2
     from vllm_xcpu_plugin.layers.fp8_linear import register_fp8_linear_kernel
     from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
+    from vllm_xcpu_plugin.layers.mxfp8_linear import register_mxfp8_linear_kernel
+    from vllm_xcpu_plugin.models.deepseek_v41 import register_deepseek_v41
     from vllm_xcpu_plugin.layers.quark_mxfp4 import (
         register_quark_mxfp4_linear_scheme,
     )
@@ -78,6 +80,7 @@ def register_ops():
     install_optional_integration("Qwen3 DFlash2", maybe_patch_qwen3_dflash2)
     install_optional_integration("FP8 linear", register_fp8_linear_kernel)
     install_optional_integration("MXFP4 linear", register_mxfp4_linear_kernel)
+    install_optional_integration("MXFP8 linear", register_mxfp8_linear_kernel)
     install_optional_integration(
         "Quark MXFP4 W4A16 linear", register_quark_mxfp4_linear_scheme
     )
@@ -111,3 +114,4 @@ def register_ops():
         "XCPU sparse MLA",
         register_sparse_mla,
     )
+    install_optional_integration("DeepSeek-V4.1", register_deepseek_v41)

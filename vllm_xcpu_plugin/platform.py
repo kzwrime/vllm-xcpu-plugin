@@ -206,6 +206,12 @@ class McpuPlatform(Platform):
                     parallel_config.all2all_backend,
                 )
 
+        from vllm_xcpu_plugin.models.deepseek_v41.config import (
+            update_deepseek_v41_config,
+        )
+
+        update_deepseek_v41_config(vllm_config)
+
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 

@@ -1639,6 +1639,24 @@ def _prompt_logprob_token_ids(launch: KernelLaunch) -> None:
     )
 
 
+def _token_request_mapping(launch: KernelLaunch) -> None:
+    """``CommonAttentionMetadata.token_to_req_indices``: the request of each of
+    the first ``num_mapped`` tokens (a ``query_start_loc`` boundary search),
+    0 for the remaining output rows."""
+    args = launch.arguments
+    qsl = args["query_start_loc"].to(torch.int64)
+    out = args["output"]
+    num_reqs, num_mapped, num_tokens = (
+        args["num_reqs"],
+        args["num_mapped"],
+        args["num_tokens"],
+    )
+    tokens = torch.arange(num_tokens, dtype=torch.int64, device=out.device)
+    req = torch.searchsorted(qsl[1 : num_reqs + 1].contiguous(), tokens, right=True)
+    req = req.clamp_max(num_reqs - 1)
+    out[:num_tokens] = torch.where(tokens < num_mapped, req, 0).to(out.dtype)
+
+
 _KERNELS: tuple[
     tuple[
         str,
@@ -1651,6 +1669,19 @@ _KERNELS: tuple[
     ],
     ...,
 ] = (
+    (
+        "vllm.v1.attention.ops.metadata",
+        "_token_request_mapping_kernel",
+        "af6e2a5fa05e29bd7494e00410f9b5d790ba1c2fe211510d15917fcbac4a89b3",
+        "8489304ae240cf91b2e2b4e15b1f21098cd482e5b2bba702d5563c9e9cc8353d",
+        KernelSource(
+            tag="v0.31.0 CommonAttentionMetadata.token_to_req_indices",
+            local_commit="0670c36056d45530524f498f731bf3847a7d4ce0",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _token_request_mapping,
+        ("num_warps",),
+    ),
     (
         "vllm.model_executor.models.qwen3_vl",
         "_bilinear_pos_embed_kernel",

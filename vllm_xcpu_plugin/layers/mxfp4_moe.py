@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
 from .fused_moe.setup import (
@@ -58,6 +59,58 @@ class XcpuCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
                 mxfp4_backend=Mxfp4MoeBackend.CPU,
                 w1_scale=current_layer.w13_weight_scale,
                 w2_scale=current_layer.w2_weight_scale,
+                layer=current_layer,
+            ),
+            scale_names=("w13_weight_scale", "w2_weight_scale"),
+        )
+
+
+class XcpuMxfp4MoEMethod(Mxfp4MoEMethod):
+    """Native MXFP4 experts (e2m1 + UE8M0 per 32) on the XCPU W4A16 pipeline.
+
+    DeepSeek-V4.1 routes its FP4 experts here; the SwiGLU clamp reaches the
+    kernel through ``gemm1_clamp_limit``.
+    """
+
+    def __init__(self, moe):
+        # Backend selection goes through McpuPlatform.select_mxfp4_moe_backend.
+        super().__init__(moe)
+        self.experts_cls = XcpuGroupedGemmExperts
+
+    @property
+    def supports_eplb(self) -> bool:
+        return False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import torch_xcpu
+
+        from .quark_mxfp4 import _initialize_dummy_e8m0_scale
+
+        if not isinstance(layer, RoutedExperts):
+            raise TypeError("XCPU MXFP4 MoE method requires RoutedExperts")
+        reject_fused_moe_hot_reload(self)
+        if self.moe.has_bias:
+            raise NotImplementedError("XCPU MXFP4 expert bias is unsupported")
+        _initialize_dummy_e8m0_scale(layer.w13_weight_scale)
+        _initialize_dummy_e8m0_scale(layer.w2_weight_scale)
+        fused_moe = torch_xcpu.ops.initialize_fused_moe(
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            scale_block_size=(1, 32),
+            m_capacity=self.moe.max_num_tokens * self.moe.experts_per_token,
+            allocate_scratch=not use_shared_moe_workspace(self.moe),
+        )
+        install_fused_moe(
+            self,
+            layer,
+            fused_moe,
+            lambda current_layer: make_mxfp4_moe_quant_config(
+                mxfp4_backend=Mxfp4MoeBackend.CPU,
+                w1_scale=current_layer.w13_weight_scale,
+                w2_scale=current_layer.w2_weight_scale,
+                swiglu_limit=getattr(current_layer, "swiglu_limit", None),
                 layer=current_layer,
             ),
             scale_names=("w13_weight_scale", "w2_weight_scale"),

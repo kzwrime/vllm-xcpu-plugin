@@ -4,7 +4,7 @@ import os
 
 from torch import nn
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
@@ -14,8 +14,9 @@ from .ep_experts import XcpuEPExperts, XcpuSharedExpertWeights
 
 logger = init_logger(__name__)
 
-# gate_up -> SiluAndMul -> down [-> sigmoid(expert_gate) *], nothing else.
-_SHARED_MLP_TYPES = ("DeepseekV2MLP", "Qwen2MoeMLP")
+# gate_up -> SiluAndMul[WithClamp] -> down [-> sigmoid(expert_gate) *], nothing
+# else.
+_SHARED_MLP_TYPES = ("DeepseekV2MLP", "DeepseekV4MLP", "Qwen2MoeMLP")
 # Fixed by torch_xcpu's MXFP4 linear (ops_defs/mxfp4_linear.py).
 _MXFP4_SCALE_BLOCK_SIZE = (1, 32)
 
@@ -58,9 +59,13 @@ def _shared_expert_weights(
         return None, "routed input/output transforms"
     mlp = runner.shared_experts._layer
     if type(mlp).__name__ not in _SHARED_MLP_TYPES or not isinstance(
-        mlp.act_fn, SiluAndMul
+        mlp.act_fn, (SiluAndMul, SiluAndMulWithClamp)
     ):
         return None, f"unsupported shared MLP {type(mlp).__name__}"
+    # The op clamps the routed and the shared SwiGLU with one limit.
+    limit = getattr(mlp.act_fn, "swiglu_limit", 0.0)
+    if float(limit) != ep_experts.swiglu_limit:
+        return None, "shared MLP swiglu_limit differs from the routed experts"
     # The op runs on this rank's rows with full weights and no all-reduce.
     config = runner.moe_config
     if not (config.is_sequence_parallel or config.tp_size == 1) or any(
@@ -147,4 +152,3 @@ def install_fused_shared_experts(model: nn.Module) -> int:
             scope="process",
         )
     return fused
-
