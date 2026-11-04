@@ -2,6 +2,31 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _parse_fused_mla_qnorm_qb_uk(value: str) -> str | None:
+    """torch_xcpu impl version of fused_mla_qnorm_qb_uk_rope_cache, or None when off.
+
+    A0 = mega-kernel v1, A1 = the unfused operator sequence (debugging reference),
+    A2 = v2, A3 = v1 with RoPE + cache write fused in, B0 = the optimization team's
+    implementation.
+    """
+    versions = {
+        "": None, "0": None, "off": None,
+        "1": "A0", "v1": "A0", "a0": "A0",
+        "unfused": "A1", "a1": "A1",
+        "2": "A2", "v2": "A2", "a2": "A2",
+        "3": "A3", "v3": "A3", "a3": "A3", "on": "A3",
+        "b0": "B0",
+    }  # fmt: skip
+    try:
+        return versions[value.strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"invalid VLLM_XCPU_FUSED_MLA_QNORM_QB_UK={value!r}; "
+            "expected 0 (off), 1/v1, 2/v2, 3/v3 (on), unfused or b0"
+        ) from None
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -83,6 +108,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # packed MXFP4 weights but execute with BF16 activations (W4A16).
     "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16": lambda: bool(
         int(os.getenv("VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16", "0"))
+    ),
+    # GLM-5.2 MLA front half (q/kv RMSNorm + q_b_proj + W_UK_T + RoPE + KV-cache
+    # write) as one torch_xcpu op: "0" (default) off, "3"/"on" the fully fused
+    # mega-kernel (torch_xcpu impl A3), "1"/"2" the v1/v2 mega-kernels with a
+    # separate RoPE/cache kernel (A0/A2), "unfused" the per-operator reference
+    # (A1). The op itself runs the unfused sequence beyond 16 tokens, so it
+    # works eagerly and under torch.compile. An explicit
+    # TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL in the environment takes
+    # precedence over the version chosen here.
+    "VLLM_XCPU_FUSED_MLA_QNORM_QB_UK": lambda: _parse_fused_mla_qnorm_qb_uk(
+        os.getenv("VLLM_XCPU_FUSED_MLA_QNORM_QB_UK", "0")
     ),
 }
 

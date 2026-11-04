@@ -6,7 +6,35 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _select_fused_mla_qnorm_qb_uk_impl() -> None:
+    """Pass VLLM_XCPU_FUSED_MLA_QNORM_QB_UK's version on to torch_xcpu.
+
+    torch_xcpu reads its operator versions once, when it is imported, so this has
+    to run before anything imports it.
+    """
+    import os
+    import sys
+
+    from vllm_xcpu_plugin import envs
+
+    version = envs.VLLM_XCPU_FUSED_MLA_QNORM_QB_UK
+    if version is None:
+        return
+    name = "TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL"
+    if name in os.environ:
+        return  # explicit torch_xcpu setting wins
+    if "torch_xcpu" in sys.modules:
+        logger.warning(
+            "torch_xcpu was imported before the plugin; %s=%s cannot be applied",
+            name,
+            version,
+        )
+        return
+    os.environ[name] = version
+
+
 def xcpu_platform_plugin() -> str | None:
+    _select_fused_mla_qnorm_qb_uk_impl()
     from vllm_xcpu_plugin.fake_triton import install_fake_triton
 
     install_fake_triton(replace_existing=True)
