@@ -264,10 +264,11 @@ class McpuPlatform(Platform):
             # MCPU compiles with DYNAMO_TRACE_ONCE, so vLLM's PostGradPassManager
             # never runs; XCPU pattern fusions hook in as Inductor's custom
             # post-grad pass instead (auto_functionalized form, pre-reinplace).
-            if (
-                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE
-                is not None
-            ):
+            _pass_versions = (
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE,
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE,
+            )
+            if any(v is not None for v in _pass_versions):
                 from vllm_xcpu_plugin.compile_passes import XcpuPostGradPass
 
                 compilation_config.inductor_compile_config[
@@ -275,8 +276,8 @@ class McpuPlatform(Platform):
                 ] = XcpuPostGradPass()
                 logger.info(
                     "XCPU post-grad pattern pass installed "
-                    "(VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE=%s)",
-                    envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE,
+                    "(ADD_NORM_QKVA=%s, QNORM_QB_UK=%s)",
+                    *_pass_versions,
                 )
 
     def is_sleep_mode_available(self) -> bool:

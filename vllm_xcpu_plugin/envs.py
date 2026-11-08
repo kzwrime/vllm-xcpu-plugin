@@ -3,31 +3,42 @@ from collections.abc import Callable
 from typing import Any
 
 
-def _parse_fused_mla_qnorm_qb_uk_rope_cache(value: str) -> str | None:
-    """torch_xcpu impl version of fused_mla_qnorm_qb_uk_rope_cache, or None when off.
+def _make_pass_version_parser(name: str, versions: dict[str, str | None]):
+    def parse(value: str) -> str | None:
+        try:
+            return versions[value.strip().lower()]
+        except KeyError:
+            raise ValueError(
+                f"invalid {name}={value!r}; expected one of "
+                f"{', '.join(k for k in versions if versions[k] is not None)}"
+                " or 0 (off)"
+            ) from None
 
-    A0 = mega-kernel v1, A1 = the unfused operator sequence (debugging reference),
-    A2 = v2, A3 = v1 with RoPE + cache write fused in, B0 = the optimization team's
-    implementation.
-    """
-    versions = {
+    return parse
+
+
+_parse_fused_mla_qnorm_qb_uk_rope_cache = _make_pass_version_parser(
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE",
+    {
         "": None, "0": None, "off": None,
         "1": "A0", "v1": "A0", "a0": "A0",
         "unfused": "A1", "a1": "A1",
         "2": "A2", "v2": "A2", "a2": "A2",
         "3": "A3", "v3": "A3", "a3": "A3", "on": "A3",
         "b0": "B0",
-    }  # fmt: skip
-    try:
-        return versions[value.strip().lower()]
-    except KeyError:
-        name = (
-            "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE"
-        )
-        raise ValueError(
-            f"invalid {name}={value!r}; "
-            "expected 0 (off), 1/v1, 2/v2, 3/v3 (on), unfused or b0"
-        ) from None
+    },  # fmt: skip
+)
+_parse_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache = _make_pass_version_parser(
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+    "QNORM_QB_UK_ROPE_CACHE",
+    {
+        "": None, "0": None, "off": None,
+        "1": "A0", "v1": "A0", "a0": "A0", "on": "A0",
+        "unfused": "A1", "a1": "A1",
+        "2": "A2", "v2": "A2", "a2": "A2",
+        "b0": "B0",
+    },  # fmt: skip
+)
 
 
 # The begin-* and end* here are used by the documentation generator
@@ -123,6 +134,22 @@ env_variables: dict[str, Callable[[], Any]] = {
         lambda: _parse_fused_mla_qnorm_qb_uk_rope_cache(
             os.getenv(
                 "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE",
+                "0",
+            )
+        )
+    ),
+    # Replace the unfused GLM-5.2 input add-norm + fused_qkv_a linear + MLA
+    # front half (see the phase-1 env above) with the torch_xcpu op
+    # fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache. Runs before the phase-1
+    # pass; layers it fuses remove that pass's work, so the first layer (plain
+    # rms_norm input, no residual add) stays phase-1. Only affects compiled
+    # graphs.
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+    "QNORM_QB_UK_ROPE_CACHE": (
+        lambda: _parse_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(
+            os.getenv(
+                "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+                "QNORM_QB_UK_ROPE_CACHE",
                 "0",
             )
         )

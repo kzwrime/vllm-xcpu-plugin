@@ -57,11 +57,22 @@ def _dump_graph(tag: str, graph) -> None:
 class XcpuPostGradPass(CustomGraphPass):
     def __call__(self, graph) -> None:
         from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
-            fused_mla_qnorm_qb_uk_rope_cache as fused_pass,
+            fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache as add_norm_pass,
+        )
+        from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
+            fused_mla_qnorm_qb_uk_rope_cache as qnorm_pass,
         )
 
         _dump_graph("pre", graph)
-        replaced = fused_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph)
+        # The add-norm pass runs first: each layer it fuses removes the
+        # qnorm pass's window (the first layer, with its plain rms_norm
+        # input, is left for the qnorm pass).
+        replaced = (
+            add_norm_pass.replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(
+                graph
+            )
+            + qnorm_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph)
+        )
         if replaced:
             logger.info(
                 "XCPU post-grad pass fused %d MLA front halves", replaced
