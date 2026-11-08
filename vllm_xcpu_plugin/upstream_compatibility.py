@@ -67,7 +67,11 @@ UPSTREAM_SOURCE_FILES: tuple[UpstreamSourceFile, ...] = (
     UpstreamSourceFile(
         "sparse_indexer",
         "vllm.model_executor.models.deepseek_v2",
-        "d547348698a5bab40d6d646213c8dc5fae9e8d98de8d2359dfec45d92e81c1de",
+        # 2026-11-08: aux_hidden_state sum capture added to the decoder layer
+        # forward / model loop (EAGLE3 aux capture reuses the input_layernorm
+        # pre-norm sum; same-day ruff reformat). Indexer/attention untouched;
+        # reviewed against the XCPU sparse-indexer translation.
+        "47100507749ab28505d0742bc01e875bbea24b35faef3bd3928ed3f4f47f2f31",
     ),
     UpstreamSourceFile(
         "sparse_mla",
