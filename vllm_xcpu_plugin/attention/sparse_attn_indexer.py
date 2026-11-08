@@ -260,6 +260,16 @@ def _indexer_k_cache(
     slot_mappings = forward_context.slot_mapping
     assert isinstance(slot_mappings, dict)
     slots = slot_mappings[prefix]
+    # vllm hands out slot mappings as a view of the persistent buffer sized
+    # to the token budget (dummy runs: all max_num_batched_tokens rows). The
+    # full-width view is static under dynamo, so torch_xcpu's
+    # `slots.numel() <= positions.numel()` check emits a constant lower-bound
+    # guard on the dynamic token dim; combined with the upper-bound guards
+    # from max-token-sized buffer slices the solver refines the range to a
+    # singleton and dynamo raises ConstraintViolationError. Trim to the K row
+    # count: tail rows are PAD_SLOT_ID padding the kernel skips, and a
+    # shorter slots tensor is left unchanged by the slice.
+    slots = slots[: k.shape[0]]
     import torch_xcpu
 
     torch_xcpu.ops.fused_indexer_k_norm_rope_cache(
@@ -305,6 +315,8 @@ def _indexer_qk_cache(
     slot_mappings = forward_context.slot_mapping
     assert isinstance(slot_mappings, dict)
     slots = slot_mappings[prefix]
+    # Keep slots symbolic-sized; see _indexer_k_cache for the dynamo rationale.
+    slots = slots[: k.shape[0]]
     return torch_xcpu.ops.fused_indexer_qk_rope_quant_cache(
         positions,
         q,
