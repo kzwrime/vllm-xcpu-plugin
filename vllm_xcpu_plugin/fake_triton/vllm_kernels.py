@@ -36,6 +36,27 @@ def _expect_grid(launch: KernelLaunch, expected: tuple[int, ...]) -> None:
     )
 
 
+def _reject_unadapted_seq_kernel(launch: KernelLaunch) -> None:
+    """Fail with guidance instead of emulating DSv4 sequence pack/unpack.
+
+    The XCPU sparse indexer replaces the upstream code path that launches
+    these triton kernels, so a real launch would mean an unsupported
+    configuration. The only live caller is the JIT warmup that
+    ``SparseAttnIndexer.__init__`` registers when ``enable_jit_warmup``
+    stays at its upstream default; GLM-5.2/DeepSeek-V4 on XCPU does not
+    need triton warmup at all, so point the user at the flag instead of
+    shipping dead emulation code.
+    """
+    raise InvalidLaunchError(
+        f"{launch.kernel.qualname} is not adapted for XCPU: the XCPU sparse "
+        "indexer replaces this code path entirely, so this launch never runs "
+        "in a supported configuration. If you hit this during JIT warmup, "
+        'restart with --kernel-config {"enable_jit_warmup":false} '
+        "(GLM-5.2/DeepSeek-V4 always takes the adapted XCPU path and does "
+        "not need triton JIT warmup)."
+    )
+
+
 def _qwen3_vl_bilinear_pos_embed(launch: KernelLaunch) -> None:
     """Validate and dispatch Qwen3-VL's fused position-embedding launch."""
     args = launch.arguments
@@ -271,6 +292,16 @@ def _compute_slot_mapping(launch: KernelLaunch) -> None:
         args["CP_KV_CACHE_INTERLEAVE_SIZE"],
         args["PAD_ID"],
     )
+
+
+def _pack_seq(launch: KernelLaunch) -> None:
+    """Reject DSv4 sequence pack launches with actionable guidance."""
+    _reject_unadapted_seq_kernel(launch)
+
+
+def _unpack_seq(launch: KernelLaunch) -> None:
+    """Reject DSv4 sequence unpack launches with actionable guidance."""
+    _reject_unadapted_seq_kernel(launch)
 
 
 def _build_indexer_prefill_chunk_metadata(launch: KernelLaunch) -> None:
@@ -1699,6 +1730,32 @@ _KERNELS: tuple[
         ),
         _prepare_indexer_uniform_decode,
         (),
+    ),
+    (
+        "vllm.v1.attention.ops.common",
+        "PackSeqTritonKernel.kernel",
+        "555dc75afc35a0bb9e5ebc1b007d064fed967f342b2ab81f130a75cdee50e203",
+        "6b7033a76675c4b2464e54623a4aa631fa2c0d248d43827dc21b4db01b8399ba",
+        KernelSource(
+            tag="v0.31 DSv4 warmup sequence kernels",
+            local_commit="83b108dd3f46a14c8be753e9cca357119456ff3a",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _pack_seq,
+        ("num_warps", "num_stages"),
+    ),
+    (
+        "vllm.v1.attention.ops.common",
+        "UnpackSeqTritonKernel.kernel",
+        "5f1023f5c80b94c06eb4244aa123443e14c2b666e615adcf1d4eab70ded40922",
+        "9e89a7803643408bb0752338b1cbe7c957964fe3b834c92d63fe64cb97135f9d",
+        KernelSource(
+            tag="v0.31 DSv4 warmup sequence kernels",
+            local_commit="83b108dd3f46a14c8be753e9cca357119456ff3a",
+            main_commit="283d76d56a45d9bbead5ba650402fb0957abc30c",
+        ),
+        _unpack_seq,
+        ("num_warps", "num_stages"),
     ),
     (
         "vllm.v1.worker.gpu.block_table",
