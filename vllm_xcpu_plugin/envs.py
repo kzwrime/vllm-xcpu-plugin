@@ -3,7 +3,7 @@ from collections.abc import Callable
 from typing import Any
 
 
-def _parse_fused_mla_qnorm_qb_uk(value: str) -> str | None:
+def _parse_fused_mla_qnorm_qb_uk_rope_cache(value: str) -> str | None:
     """torch_xcpu impl version of fused_mla_qnorm_qb_uk_rope_cache, or None when off.
 
     A0 = mega-kernel v1, A1 = the unfused operator sequence (debugging reference),
@@ -21,8 +21,11 @@ def _parse_fused_mla_qnorm_qb_uk(value: str) -> str | None:
     try:
         return versions[value.strip().lower()]
     except KeyError:
+        name = (
+            "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE"
+        )
         raise ValueError(
-            f"invalid VLLM_XCPU_FUSED_MLA_QNORM_QB_UK={value!r}; "
+            f"invalid {name}={value!r}; "
             "expected 0 (off), 1/v1, 2/v2, 3/v3 (on), unfused or b0"
         ) from None
 
@@ -109,28 +112,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16": lambda: bool(
         int(os.getenv("VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16", "0"))
     ),
-    # GLM-5.2 MLA front half (q/kv RMSNorm + q_b_proj + W_UK_T + RoPE + KV-cache
-    # write) as one torch_xcpu op: "0" (default) off, "3"/"on" the fully fused
-    # mega-kernel (torch_xcpu impl A3), "1"/"2" the v1/v2 mega-kernels with a
-    # separate RoPE/cache kernel (A0/A2), "unfused" the per-operator reference
-    # (A1). The op itself runs the unfused sequence beyond 16 tokens, so it
-    # works eagerly and under torch.compile. An explicit
-    # TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL in the environment takes
-    # precedence over the version chosen here.
-    "VLLM_XCPU_FUSED_MLA_QNORM_QB_UK": lambda: _parse_fused_mla_qnorm_qb_uk(
-        os.getenv("VLLM_XCPU_FUSED_MLA_QNORM_QB_UK", "0")
-    ),
-    # Replace the unfused GLM-5.2 MLA front half in the compiled FX graph with
-    # fused_mla_qnorm_qb_uk_rope_cache via a post-grad pattern pass, instead of
-    # the Python wrapper above. "0" off; "3"/"on" the fully fused op (impl A3);
-    # "1"/"2"/"unfused" select the torch_xcpu impl just like the Python switch
-    # so eager traces stay comparable. Mutually exclusive with the Python
-    # wrapper by construction: when that one is enabled the graph already
-    # contains the fused op and the pattern cannot match. Also enables the
-    # pass only when compilation is active; eager forwards keep the unfused
-    # path (the accepted regression baseline).
-    "VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK": lambda: _parse_fused_mla_qnorm_qb_uk(
-        os.getenv("VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK", "0")
+    # Replace the unfused GLM-5.2 MLA front half (q/kv RMSNorm + q_b_proj +
+    # W_UK_T + RoPE + KV-cache write) in the compiled FX graph with the
+    # torch_xcpu op fused_mla_qnorm_qb_uk_rope_cache, via the post-grad
+    # pattern pass in compile_passes/deepseek_v32/. "0" (default) off;
+    # "3"/"on" the fully fused op (impl A3); "1"/"2"/"unfused" select the
+    # older torch_xcpu impls. Only affects compiled graphs; eager forwards
+    # keep the unfused path (the accepted regression baseline).
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE": (
+        lambda: _parse_fused_mla_qnorm_qb_uk_rope_cache(
+            os.getenv(
+                "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE",
+                "0",
+            )
+        )
     ),
     # Debug: dump the post-grad FX graph to <value>.<pid>.txt before pattern
     # application (and again after, when patterns changed it).

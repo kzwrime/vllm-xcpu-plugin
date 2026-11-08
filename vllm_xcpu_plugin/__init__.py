@@ -10,22 +10,21 @@ logger = logging.getLogger(__name__)
 logging.getLogger(__name__).parent = logging.getLogger("vllm")
 
 
-def _select_fused_mla_qnorm_qb_uk_impl() -> None:
-    """Pass the operator version on to torch_xcpu.
+def _select_fused_mla_qnorm_qb_uk_rope_cache_impl() -> None:
+    """Pass the compile pass's operator version on to torch_xcpu.
 
-    torch_xcpu reads its operator versions once, when it is imported, so this has
-    to run before anything imports it. ``0`` means the eager fused path is
-    disabled and pins nothing: the compile pattern pass's env decides then,
-    so the op it emits still runs the impl the pass expects.
+    torch_xcpu reads its operator versions once, when it is imported, so this
+    has to run before anything imports it. The compile pattern pass is the only
+    emitter of fused_mla_qnorm_qb_uk_rope_cache, and the impl the op dispatches
+    to must match the version the pass env selected; an explicit
+    TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL in the environment wins.
     """
     import os
     import sys
 
     from vllm_xcpu_plugin import envs
 
-    version = envs.VLLM_XCPU_FUSED_MLA_QNORM_QB_UK
-    if version in (None, "0"):
-        version = envs.VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK
+    version = envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE
     if version in (None, "0"):
         return
     name = "TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL"
@@ -42,7 +41,7 @@ def _select_fused_mla_qnorm_qb_uk_impl() -> None:
 
 
 def xcpu_platform_plugin() -> str | None:
-    _select_fused_mla_qnorm_qb_uk_impl()
+    _select_fused_mla_qnorm_qb_uk_rope_cache_impl()
     from vllm_xcpu_plugin.fake_triton import install_fake_triton
 
     install_fake_triton(replace_existing=True)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Phase-1 pattern: the GLM-5.2 MLA front half as one torch_xcpu operator.
+"""Phase-1 pattern: the GLM-5.2 (DeepSeek-V3.2-style) MLA front half fused.
 
 In the post-grad graph every MLA layer runs (all wrapped in
 ``auto_functionalized``; the pass runs before Inductor's reinplace pass):
@@ -467,10 +467,10 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
     return True
 
 
-def replace_with_fused_mla_qnorm_qb_uk(graph) -> int:
+def replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph) -> int:
     if not _backend_supported():
         logger.info(
-            "qnorm_qb_uk pass: fused_mla_qnorm_qb_uk_rope_cache backend "
+            "deepseek_v32 pass: fused_mla_qnorm_qb_uk_rope_cache backend "
             "unsupported on this build, graph left unfused"
         )
         return 0
@@ -485,5 +485,9 @@ def replace_with_fused_mla_qnorm_qb_uk(graph) -> int:
         try:
             replaced += bool(_replace_one(graph, cache_af, fp8_backend))
         except _Skip as reason:
-            logger.info("qnorm_qb_uk pass: layer skipped (%s)", reason)
+            logger.info(
+                "deepseek_v32 fused_mla_qnorm_qb_uk_rope_cache pass: layer "
+                "skipped (%s)",
+                reason,
+            )
     return replaced
