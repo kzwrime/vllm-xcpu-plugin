@@ -23,8 +23,18 @@ variant never appears on this def-use path.
 
 The linear must be ``fp8_scaled_mm_intel_amx_out`` with a bias-free
 [2624, 6144] packed weight and [21, 48] scales (block 128); other shapes
-stay unfused. ``ag_send``/``ag_comm`` stay null/zero for now — absorbing the
-SP all-gather is the follow-up phase.
+stay unfused.
+
+With sequence-parallel MoE the layer input is a ``[0:T]`` slice of the TP
+all-gather (``all_gather_into_tensor_out_v2``) of the previous MoE's
+per-rank shard. That gather is absorbed too: the fused operator receives
+``ag_send`` (the shard) and ``ag_comm`` (the graph's communicator-wrapper
+placeholder, so the MPI handle stays a runtime value) and ``hidden``
+becomes the gather's landing buffer (``world_size * shard_rows`` rows).
+The collective then runs on the mega-kernel's helper thread while the
+weight DMAs are in flight, instead of as a separate graph node. Windows
+whose add-norm input is not such a slice (e.g. TP1) fall back to the
+non-absorbed form.
 """
 
 import logging
@@ -45,6 +55,7 @@ _SKIP = _fw._Skip
 _FP8_MM = _fw._FP8_MM
 _CACHE_WRITE = _fw._CACHE_WRITE
 _ADD_NORM = torch.ops.torch_xcpu.fused_add_rms_norm_out_bf16.default
+_ALL_GATHER = torch.ops.torch_xcpu.all_gather_into_tensor_out_v2.default
 _FUSED = torch.ops.torch_xcpu.fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache.default
 
 _HIDDEN = 6144
@@ -58,6 +69,7 @@ _IDX = _fw._af_indices(_FUSED)
 _IDX_ADD = _fw._af_indices(_ADD_NORM)
 _IDX_MM_OUT = _fw._af_indices(_FP8_MM)["out"]
 _IDX_CACHE_KV = _fw._af_indices(_CACHE_WRITE)["kv_cache"]
+_IDX_AG_OUT = _fw._af_indices(_ALL_GATHER)["output"]
 
 
 def _backend_supported() -> bool:
@@ -75,9 +87,7 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
         raise _SKIP("qkv source is not fp8_scaled_mm_intel_amx")
     if qkva_af.kwargs.get("bias") is not None:
         raise _SKIP("fused_qkv_a linear has a bias")
-    _fw._check_shape(
-        "w_qkva", qkva_af.kwargs["packed_weight"], _W_QKVA_SHAPE
-    )
+    _fw._check_shape("w_qkva", qkva_af.kwargs["packed_weight"], _W_QKVA_SHAPE)
     _fw._check_shape(
         "w_qkva_scale", qkva_af.kwargs["weight_scale"], _W_QKVA_SCALE_SHAPE
     )
@@ -85,17 +95,38 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
     # And its input: the layer's add-norm. The first layer uses a plain
     # rms_norm (no residual add) and stays with the phase-1 pass.
     hidden_gi = _fw._view_ancestor(qkva_af.kwargs["input"])
-    if not (
-        _fw._is_getitem(hidden_gi) and hidden_gi.args[1] == _IDX_ADD["output"]
-    ):
+    if not (_fw._is_getitem(hidden_gi) and hidden_gi.args[1] == _IDX_ADD["output"]):
         raise _SKIP("fused_qkv_a input is not an add-norm output clone")
     add_norm_af = hidden_gi.args[0]
     if not _fw._is_af_of(add_norm_af, _ADD_NORM):
         raise _SKIP("input norm is not fused_add_rms_norm_out (first layer?)")
     _fw._check_shape("add-norm hidden", hidden_gi, (None, _HIDDEN))
-    _fw._check_shape(
-        "add-norm weight", add_norm_af.kwargs["weight"], (_HIDDEN,)
-    )
+    _fw._check_shape("add-norm weight", add_norm_af.kwargs["weight"], (_HIDDEN,))
+
+    # Upstream of the add-norm: with sequence-parallel MoE the layer input
+    # is a [0:T] slice of the TP all-gather of the previous MoE's per-rank
+    # shard. When present, absorb the gather into the fused operator
+    # (ag_send shard / ag_comm wrapper placeholder / landing buffer as
+    # hidden), so the collective runs on the mega-kernel's helper thread
+    # instead of as a separate graph node.
+    gather_af = None
+    add_in = _fw._view_ancestor(add_norm_af.kwargs["input"])
+    if (
+        _fw._is_getitem(add_in)
+        and isinstance(add_in.args[0], Node)
+        and _fw._is_af_of(add_in.args[0], _ALL_GATHER)
+        and add_in.args[1] == _IDX_AG_OUT
+    ):
+        gather_af = add_in.args[0]
+        if gather_af.kwargs.get("dim") != 0:
+            raise _SKIP("all-gather along a non-leading dim")
+        _fw._check_shape("all-gather landing buffer", add_in, (None, _HIDDEN))
+        _fw._check_shape("all-gather shard", gather_af.kwargs["input"], (None, _HIDDEN))
+        _fw._check_shape(
+            "all-gather comm wrapper",
+            gather_af.kwargs["comm_ptr_wrapper"],
+            (1,),
+        )
 
     # Redirect producers: region results consumed outside the region.
     residual_gi = next(
@@ -127,6 +158,7 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
     region = _fw.close_region(
         graph,
         [
+            *([gather_af] if gather_af is not None else []),
             add_norm_af,
             qkva_af,
             m.q_norm_af,
@@ -158,12 +190,22 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
             ([tokens, _fw._HEADS_PER_RANK, _fw._OUT_HEAD_DIM],),
             dict(m.q_c_out.kwargs),
         )
+        if gather_af is not None:
+            ag_send = gather_af.kwargs["input"]
+            # The graph's communicator-wrapper placeholder: the MPI handle
+            # stays a runtime value, safe across compiled-artifact reuse.
+            ag_comm = gather_af.kwargs["comm_ptr_wrapper"]
+            hidden = gather_af.kwargs["output"]
+        else:
+            ag_send = None
+            ag_comm = None
+            hidden = add_norm_af.kwargs["input"]
         fused = graph.create_node(
             "call_function",
             _AF,
             (_FUSED,),
             dict(
-                hidden=add_norm_af.kwargs["input"],
+                hidden=hidden,
                 residual=add_norm_af.kwargs["residual"],
                 add_norm_weight=add_norm_af.kwargs["weight"],
                 add_norm_eps=add_norm_af.kwargs["epsilon"],
@@ -183,8 +225,8 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
                 kv_cache=cache_af.kwargs["kv_cache"],
                 fp8_ds_mla=True,
                 is_neox=m.rotary_af.kwargs["is_neox"],
-                ag_send=None,
-                ag_comm=0,
+                ag_send=ag_send,
+                ag_comm=ag_comm,
                 qkv=qkv,
                 q_c_norm=m.q_c_out,
                 kv_c_norm=m.kv_c_out,
@@ -192,9 +234,19 @@ def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
                 out_q=out_q,
             ),
         )
-        redirects[hidden_gi] = graph.create_node(
+        hidden_out = graph.create_node(
             "call_function", _GETITEM, (fused, _IDX["hidden"])
         )
+        if gather_af is not None:
+            # hidden is now the full gather landing buffer; consumers expect
+            # the [0:T] slice the unfused gather+slice produced.
+            redirects[hidden_gi] = graph.create_node(
+                "call_function",
+                _ATEN.slice.Tensor,
+                (hidden_out, 0, 0, tokens),
+            )
+        else:
+            redirects[hidden_gi] = hidden_out
         redirects[cache_out] = graph.create_node(
             "call_function", _GETITEM, (fused, _IDX["kv_cache"])
         )
@@ -224,11 +276,7 @@ def replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(graph) -> int:
     from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend
 
     fp8_backend = int(Fp8LinearBackend.INTEL_AMX)
-    cache_afs = [
-        n
-        for n in list(graph.nodes)
-        if _fw._is_af_of(n, _CACHE_WRITE)
-    ]
+    cache_afs = [n for n in list(graph.nodes) if _fw._is_af_of(n, _CACHE_WRITE)]
     if not cache_afs:
         return 0
     replaced = 0
