@@ -120,6 +120,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_FUSED_MLA_QNORM_QB_UK": lambda: _parse_fused_mla_qnorm_qb_uk(
         os.getenv("VLLM_XCPU_FUSED_MLA_QNORM_QB_UK", "0")
     ),
+    # Replace the unfused GLM-5.2 MLA front half in the compiled FX graph with
+    # fused_mla_qnorm_qb_uk_rope_cache via a post-grad pattern pass, instead of
+    # the Python wrapper above. "0" off; "3"/"on" the fully fused op (impl A3);
+    # "1"/"2"/"unfused" select the torch_xcpu impl just like the Python switch
+    # so eager traces stay comparable. Mutually exclusive with the Python
+    # wrapper by construction: when that one is enabled the graph already
+    # contains the fused op and the pattern cannot match. Also enables the
+    # pass only when compilation is active; eager forwards keep the unfused
+    # path (the accepted regression baseline).
+    "VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK": lambda: _parse_fused_mla_qnorm_qb_uk(
+        os.getenv("VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK", "0")
+    ),
+    # Debug: dump the post-grad FX graph to <value>.<pid>.txt before pattern
+    # application (and again after, when patterns changed it).
+    "VLLM_XCPU_DUMP_POST_GRAD_GRAPH": lambda: os.getenv(
+        "VLLM_XCPU_DUMP_POST_GRAD_GRAPH", ""
+    ),
 }
 
 # end-env-vars-definition

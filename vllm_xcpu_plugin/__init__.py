@@ -5,12 +5,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# vLLM configures handlers only on the "vllm" logger hierarchy; plugin
+# records would otherwise never reach any handler below WARNING level.
+logging.getLogger(__name__).parent = logging.getLogger("vllm")
+
 
 def _select_fused_mla_qnorm_qb_uk_impl() -> None:
-    """Pass VLLM_XCPU_FUSED_MLA_QNORM_QB_UK's version on to torch_xcpu.
+    """Pass the operator version on to torch_xcpu.
 
     torch_xcpu reads its operator versions once, when it is imported, so this has
-    to run before anything imports it.
+    to run before anything imports it. ``0`` means the eager fused path is
+    disabled and pins nothing: the compile pattern pass's env decides then,
+    so the op it emits still runs the impl the pass expects.
     """
     import os
     import sys
@@ -18,7 +24,9 @@ def _select_fused_mla_qnorm_qb_uk_impl() -> None:
     from vllm_xcpu_plugin import envs
 
     version = envs.VLLM_XCPU_FUSED_MLA_QNORM_QB_UK
-    if version is None:
+    if version in (None, "0"):
+        version = envs.VLLM_XCPU_COMPILE_PASS_QNORM_QB_UK
+    if version in (None, "0"):
         return
     name = "TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL"
     if name in os.environ:
