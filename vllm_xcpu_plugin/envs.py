@@ -2,45 +2,6 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-
-def _make_pass_version_parser(name: str, versions: dict[str, str | None]):
-    def parse(value: str) -> str | None:
-        try:
-            return versions[value.strip().lower()]
-        except KeyError:
-            raise ValueError(
-                f"invalid {name}={value!r}; expected one of "
-                f"{', '.join(k for k in versions if versions[k] is not None)}"
-                " or 0 (off)"
-            ) from None
-
-    return parse
-
-
-_parse_fused_mla_qnorm_qb_uk_rope_cache = _make_pass_version_parser(
-    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE",
-    {
-        "": None, "0": None, "off": None,
-        "1": "A0", "v1": "A0", "a0": "A0",
-        "unfused": "A1", "a1": "A1",
-        "2": "A2", "v2": "A2", "a2": "A2",
-        "3": "A3", "v3": "A3", "a3": "A3", "on": "A3",
-        "b0": "B0",
-    },  # fmt: skip
-)
-_parse_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache = _make_pass_version_parser(
-    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
-    "QNORM_QB_UK_ROPE_CACHE",
-    {
-        "": None, "0": None, "off": None,
-        "1": "A0", "v1": "A0", "a0": "A0", "on": "A0",
-        "unfused": "A1", "a1": "A1",
-        "2": "A2", "v2": "A2", "a2": "A2",
-        "b0": "B0",
-    },  # fmt: skip
-)
-
-
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -123,34 +84,37 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16": lambda: bool(
         int(os.getenv("VLLM_XCPU_QUARK_MXFP4_FORCE_W4A16", "0"))
     ),
-    # Replace the unfused GLM-5.2 MLA front half (q/kv RMSNorm + q_b_proj +
-    # W_UK_T + RoPE + KV-cache write) in the compiled FX graph with the
-    # torch_xcpu op fused_mla_qnorm_qb_uk_rope_cache, via the post-grad
-    # pattern pass in compile_passes/deepseek_v32/. "0" (default) off;
-    # "3"/"on" the fully fused op (impl A3); "1"/"2"/"unfused" select the
-    # older torch_xcpu impls. Only affects compiled graphs; eager forwards
-    # keep the unfused path (the accepted regression baseline).
+    # Fusion switch (0/1) for the compiled GLM-5.2 MLA front half (q/kv
+    # RMSNorm + q_b_proj + W_UK_T + RoPE + KV-cache write): 1 replaces it
+    # with torch_xcpu's fused_mla_qnorm_qb_uk_rope_cache via the post-grad
+    # pattern pass. The impl version inside the op (A0 unfused baseline,
+    # A1..AN mega-kernels, default: the highest) is torch_xcpu's
+    # TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL. Compiled graphs only.
     "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE": (
-        lambda: _parse_fused_mla_qnorm_qb_uk_rope_cache(
-            os.getenv(
-                "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE",
-                "0",
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_"
+                    "QNORM_QB_UK_ROPE_CACHE",
+                    "0",
+                )
             )
         )
     ),
-    # Replace the unfused GLM-5.2 input add-norm + fused_qkv_a linear + MLA
-    # front half (see the phase-1 env above) with the torch_xcpu op
-    # fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache. Runs before the phase-1
-    # pass; layers it fuses remove that pass's work, so the first layer (plain
-    # rms_norm input, no residual add) stays phase-1. Only affects compiled
-    # graphs.
+    # Same fusion switch for fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache
+    # (input add-norm + fused_qkv_a + the MLA front half); runs before the
+    # phase-1 pass above, whose work it removes on the layers it fuses.
+    # Impl: TORCH_XCPU_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE_IMPL
+    # (default: the highest).
     "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
     "QNORM_QB_UK_ROPE_CACHE": (
-        lambda: _parse_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(
-            os.getenv(
-                "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
-                "QNORM_QB_UK_ROPE_CACHE",
-                "0",
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+                    "QNORM_QB_UK_ROPE_CACHE",
+                    "0",
+                )
             )
         )
     ),

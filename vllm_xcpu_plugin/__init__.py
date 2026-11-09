@@ -10,48 +10,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger(__name__).parent = logging.getLogger("vllm")
 
 
-def _select_compile_pass_impls() -> None:
-    """Pass each compile pass's operator version on to torch_xcpu.
-
-    torch_xcpu reads its operator versions once, when it is imported, so this
-    has to run before anything imports it. The compile pattern passes are the
-    only emitters of their fused operators, and the impl an op dispatches to
-    must match the version its pass env selected; an explicit
-    TORCH_XCPU_*_IMPL variable in the environment wins.
-    """
-    import os
-    import sys
-
-    from vllm_xcpu_plugin import envs
-
-    pairs = (
-        (
-            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE,
-            "TORCH_XCPU_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_IMPL",
-        ),
-        (
-            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE,
-            "TORCH_XCPU_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE_IMPL",
-        ),
-    )
-    for version, name in pairs:
-        if version in (None, "0"):
-            continue
-        if name in os.environ:
-            continue  # explicit torch_xcpu setting wins
-        if "torch_xcpu" in sys.modules:
-            logger.warning(
-                "torch_xcpu was imported before the plugin; %s=%s cannot be "
-                "applied",
-                name,
-                version,
-            )
-            continue
-        os.environ[name] = version
-
-
 def xcpu_platform_plugin() -> str | None:
-    _select_compile_pass_impls()
     from vllm_xcpu_plugin.fake_triton import install_fake_triton
 
     install_fake_triton(replace_existing=True)
