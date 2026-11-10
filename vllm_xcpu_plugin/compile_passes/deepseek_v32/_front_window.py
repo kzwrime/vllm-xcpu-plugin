@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 _ATEN = torch.ops.aten
 _AF = torch.ops.higher_order.auto_functionalized
 _RMS_NORM = torch.ops.torch_xcpu.rms_norm_bf16.default
+# The linear backends each register their own fp8_scaled_mm_<suffix>_out
+# overload with an identical schema; matching accepts all of them and the
+# backend int is read back off the matched op (``_fp8_mm_backend``).
 _FP8_MM = torch.ops.torch_xcpu.fp8_scaled_mm_intel_amx_out.default
 _ROTARY = torch.ops.torch_xcpu.rotary_embedding_bf16.default
 _EINSUM = torch.ops.torch_xcpu.einsum_mhk_hkn_to_mhn.default
@@ -63,6 +66,20 @@ _TRANSPARENT = {
 _GETITEM = operator.getitem
 _EMPTY = _ATEN.empty.memory_format
 
+
+def _fp8_mm_ops() -> dict:
+    from torch_xcpu.ops_defs.fp8_linear import _BACKEND_OP_SUFFIXES
+
+    return {
+        getattr(torch.ops.torch_xcpu, f"fp8_scaled_mm_{suffix}_out").default: int(
+            backend
+        )
+        for backend, suffix in _BACKEND_OP_SUFFIXES.items()
+    }
+
+
+_FP8_MM_OPS = _fp8_mm_ops()
+
 _QKV_WIDTH = 2048 + 512 + 64
 _HEADS_PER_RANK = 16
 _NOPE_DIM = 192
@@ -91,14 +108,28 @@ def _af_indices(op) -> dict[str, int]:
     return {name: offset + i for i, name in enumerate(mutated)}
 
 
-def fp8_backend_int() -> int:
+def _is_fp8_mm_af(node: Node) -> bool:
+    """auto_functionalized call of any fp8_scaled_mm_<backend>_out overload."""
+    return (
+        node.op == "call_function"
+        and node.target == _AF
+        and node.args[0] in _FP8_MM_OPS
+    )
+
+
+def _fp8_mm_backend(node: Node) -> int:
+    """The Fp8LinearBackend int of a matched fp8 mm (see _is_fp8_mm_af)."""
+    return _FP8_MM_OPS[node.args[0]]
+
+
+def backend_supported(supported_op, backend: int | None = None) -> bool:
+    if backend is not None:
+        return bool(supported_op(backend))
+    # Early-out before any graph is seen: any fp8 backend will do here, the
+    # per-layer gate re-checks the backend the graph actually uses.
     from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend
 
-    return int(Fp8LinearBackend.INTEL_AMX)
-
-
-def backend_supported(supported_op) -> bool:
-    return bool(supported_op(fp8_backend_int()))
+    return any(bool(supported_op(int(b))) for b in Fp8LinearBackend)
 
 
 def _shape(node: Node) -> tuple | None:
@@ -252,7 +283,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     q_b_af = None
     q_b_out = None
     for n in graph.nodes:
-        if not _is_af_of(n, _FP8_MM):
+        if not _is_fp8_mm_af(n):
             continue
         if not _roots_at(n.kwargs.get("input"), {q_norm_out}):
             continue

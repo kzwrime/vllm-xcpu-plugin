@@ -49,8 +49,17 @@ def _backend_supported() -> bool:
     )
 
 
-def _replace_one(graph, cache_af: Node, fp8_backend: int) -> bool:
+def _replace_one(graph, cache_af: Node) -> bool:
     m = _fw.match_window(graph, cache_af)
+
+    # The packed-weight layout the operator must read is decided by the
+    # backend that packed q_b_proj -- the graph encodes it in the fp8 mm
+    # overload itself.
+    fp8_backend = _fw._fp8_mm_backend(m.q_b_af)
+    if not torch.ops.torch_xcpu.fused_mla_qnorm_qb_uk_rope_cache_backend_supported(
+        fp8_backend
+    ):
+        raise _SKIP(f"fp8 backend {fp8_backend} unsupported by the fused operator")
 
     # Redirect producers: region results consumed outside the region.
     cache_out = next(
@@ -143,9 +152,6 @@ def replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph) -> int:
             "unsupported on this build, graph left unfused"
         )
         return 0
-    from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend
-
-    fp8_backend = int(Fp8LinearBackend.INTEL_AMX)
     cache_afs = [
         n
         for n in list(graph.nodes)
@@ -156,7 +162,7 @@ def replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph) -> int:
     replaced = 0
     for cache_af in cache_afs:
         try:
-            replaced += bool(_replace_one(graph, cache_af, fp8_backend))
+            replaced += bool(_replace_one(graph, cache_af))
         except _SKIP as reason:
             logger.info(
                 "deepseek_v32 fused_mla_qnorm_qb_uk_rope_cache pass: layer "
