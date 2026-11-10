@@ -12,6 +12,12 @@ class XcpuGateLinear(GateLinear):
     def forward(self, x):
         import torch_xcpu
 
+        # VLLM_USE_XCPU_LINEAR prepacked this gate into the torch_xcpu BF16
+        # linear backend (BF16@BF16 -> BF16/FP32 per self.out_dtype) and freed
+        # the raw weight; the packed path already keeps FP32 accumulators.
+        bf16_linear = getattr(self, "_xcpu_bf16_linear", None)
+        if bf16_linear is not None:
+            return bf16_linear(x), None
         if (
             self.out_dtype == torch.float32
             and self.bias is None
