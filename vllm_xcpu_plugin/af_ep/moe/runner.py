@@ -29,27 +29,24 @@ class ExpertServiceOptions:
 
 def run_expert_service(options: ExpertServiceOptions) -> None:
     """Run the complete synchronous F-rank lifecycle."""
-    mpi, mpi_world = _join_mpi_world()
+    from vllm_xcpu_plugin.disagg import run_role_service
+    from vllm_xcpu_plugin.distributed.mpi_world import ClusterType
 
-    try:
-        service = _load_expert_service(options, mpi_world)
-    except Exception:
-        import traceback
+    def serve(service) -> None:
+        _serve_model_passes(service, options.max_model_passes)
+        import torch_xcpu
 
-        traceback.print_exc()
-        # A may already be waiting in initialization; stop this startup world.
-        mpi.COMM_WORLD.Abort(1)
-        raise
+        if options.all2all_backend == "mpi_alltoallv_v8":
+            torch_xcpu.ops.moe_af_v8_cleanup()
+        else:
+            torch_xcpu.ops.moe_af_v7_cleanup()
 
-    _serve_model_passes(service, options.max_model_passes)
-    import torch_xcpu
-
-    if options.all2all_backend == "mpi_alltoallv_v8":
-        torch_xcpu.ops.moe_af_v8_cleanup()
-    else:
-        torch_xcpu.ops.moe_af_v7_cleanup()
-    mpi_world.global_world_comm.Barrier()
-    mpi.Finalize()
+    run_role_service(
+        ClusterType.MOE,
+        lambda mpi_world: _load_expert_service(options, mpi_world),
+        serve,
+        finalize=True,
+    )
 
 
 def _load_expert_service(options: ExpertServiceOptions, mpi_world):
@@ -148,20 +145,6 @@ def restrict_loader_to_local_experts(loader, local_expert_ids) -> None:
 
     # load_weights() recomputes the filter from the parallel config first.
     loader._init_ep_weight_filter = init_ep_weight_filter
-
-
-def _join_mpi_world():
-    from vllm_xcpu_plugin.distributed.mpi_world import (
-        ClusterType,
-        initialize_mpi,
-        initialize_mpi_world,
-    )
-
-    mpi = initialize_mpi()
-    # A-side run_mp_rpc_worker executes this barrier before importing vLLM.
-    # F ranks must preserve the same MPMD collective order.
-    mpi.COMM_WORLD.Barrier()
-    return mpi, initialize_mpi_world(ClusterType.MOE)
 
 
 def _serve_model_passes(service, max_model_passes: int) -> None:

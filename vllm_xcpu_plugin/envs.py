@@ -70,6 +70,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_ENABLE_AF_EP": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_AF_EP", "0"))
     ),
+    # Enable DeepSeek-V4.1 Engram disaggregation: the Engram tables live on
+    # dedicated MPI ranks (python -m vllm_xcpu_plugin.engram_disagg.server)
+    # that follow the attention ranks in the MPMD world.
+    "VLLM_XCPU_ENABLE_ENGRAM_DISAGG": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ENABLE_ENGRAM_DISAGG", "0"))
+    ),
     # Optional global diagnostic barrier at every full A/F model pass entry.
     "VLLM_XCPU_AF_FORWARD_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_XCPU_AF_FORWARD_ALLREDUCE", "0"))

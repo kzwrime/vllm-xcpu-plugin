@@ -1243,8 +1243,11 @@ MANIFEST = Manifest(
                 "Under torch.compile Engram.embed runs inside the opaque op "
                 "vllm::xcpu_deepseek_v41_engram_embed (DP-sharded tables exchange"
                 " staged rows using the forward context's DP token slot, which a "
-                "graph must not bake in). The op's output is allocated in the "
-                "graph as [ceil(T/tp) if SP else T, n_hash_cols, dim] BF16 and "
+                "graph must not bake in); the op's impl is XcpuEngram._fill_rows, "
+                "which copies Engram.embed's result or, with Engram "
+                "disaggregation (deepseek_v41.engram.remote), decodes the remote "
+                "rows in eager and compile alike. The op's output is allocated in "
+                "the graph as [ceil(T/tp) if SP else T, n_hash_cols, dim] BF16 and "
                 "must equal Engram.embed's result shape. Re-check: embed's output"
                 " shape/dtype, new forward-context reads, staging buffer "
                 "lifetime."
@@ -1332,6 +1335,152 @@ MANIFEST = Manifest(
                 " keyword), staging allocation, embedding construction."
             ),
             tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+        ),
+        Patch(
+            id="deepseek_v41.engram.remote",
+            source=_ENGRAM,
+            downstream=(
+                "vllm_xcpu_plugin.models.deepseek_v41.model:_gather_engram_hashes",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:_get_engram_dp_size",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding.__init__",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding._get_shard_info",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding._allocate_weights",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._init_staging",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram.prepare_embeddings",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._fill_rows",
+                "vllm_xcpu_plugin.engram_disagg.attn.client:RemoteEngramClient",
+                "vllm_xcpu_plugin.engram_disagg.attn.model_loader:EngramAttentionModelLoader",
+                "vllm_xcpu_plugin.engram_disagg.common:EngramShardLayout",
+            ),
+            upstream=(
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:gather_engram_hashes",
+                    expect="vllm.models.deepseek_v41.common.engram:gather_engram_hashes",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:get_engram_dp_size",
+                    expect="vllm.distributed.parallel_state:get_engram_dp_size",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:gather_engram_hashes",
+                    source_hash="21daa026b191221c1d481ee125ca08a3a1cbe931729c839744a90ab23846250b",
+                    signature_hash="a325571fa5ec51c53b3c03ec612de949bff785ec581dc9c19c8874b56dfb62ba",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:NgramHashState.dummy_hashes",
+                    source_hash="da7c9d9ee8d789e231bdcfceaaa1c7d1fb08f848cb2e4579ca719a994586c605",
+                    signature_hash="8ea60dfd46731fa6898943145481862f2a4136af57a2c60af2eb5cef1fa4bb53",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:EngramLayout.__init__",
+                    source_hash="6ef54c9198d26e113271c14d1b72bff56e9dc383bbaf83b71cccc42fa71158a8",
+                    signature_hash="7cb76bfb394aa0cc3337c6ebae2c28058821c1740333dfa9d86d43d98cef6b75",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:ParallelEngramEmbedding.__init__",
+                    source_hash="bfcffab420a3e3f17bb61193d924374c4ea0f4808b34afe94fa3f36595b204b0",
+                    signature_hash="9e155dd9685c456547b8ff806e0c2e061ae933181230422c260bf80e704965e7",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:ParallelEngramEmbedding._get_shard_info",
+                    source_hash="145b91e67a036384c327dbd49be99b35e999fe4ecda03a1b42baa041bc55bc22",
+                    signature_hash="d66922ee7dbd1de1830c2c0a26b18b8a5fe42592c8d1d7bf09b3dcdf0b175ee1",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:ParallelEngramEmbedding._allocate_weights",
+                    source_hash="7ae3df14f95f855b7722c877851cebdf2667cbb3ca641e672d10005848e75f99",
+                    signature_hash="d66922ee7dbd1de1830c2c0a26b18b8a5fe42592c8d1d7bf09b3dcdf0b175ee1",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:_engram_head_shard_weight_loader",
+                    source_hash="eb371335ecb24390c8a642201b9300f7902cd2b41fd52a5b1485dd16d4361a45",
+                    signature_hash="3b8fb179f3ef6294d6fb814577afbbc0db4337b596fd42364921c12726a6a18e",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:Engram.__init__",
+                    source_hash="5f0a0ab3985a27821e2adeba4c360cfab674fe345a2095f9a89a10fe2bdd9d0c",
+                    signature_hash="fd6c9bba29099ca63b82093ca293fa3c8c722c07558dc26338c4cba98672d28a",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:Engram._init_staging",
+                    source_hash="b29bfb924a88e9f9ca7f8ff30ba9be0f6e92f176151e02efdf5b7df53189ce4e",
+                    signature_hash="dee731e4e979a7dc14376ee36e25d2a6a70b255c48f98a15dc018902e5a17ac7",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:Engram.prepare_embeddings",
+                    source_hash="e5ddf2233511f32f11ca6efd99a938e5041036ea4d3d94cc4899fc80f88968c6",
+                    signature_hash="635bcc5d9cad7e4ff6b0206fd3f90c0480e89c878a3c443ea5a583d919baabab",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:Engram._local_kv_tokens",
+                    source_hash="85f5c23034904b5731c081969f8d5a0f577285d468929b91229303bfaa4e6bf3",
+                    signature_hash="3e174853e2b5a4fc65339c92725d36fca88e004ee852119b139038555321d759",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model.forward",
+                    source_hash="24aa409a437ae7c6da1e219af1c6c0ab7d36a8da32e9ccefd97eb5b022a6e1dc",
+                    signature_hash="7c73aeee0e17a617b3d6038ae156bf93af563da7931df94603f79ffab05c87c3",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.model_loader.default_loader:DefaultModelLoader._get_weights_iterator",
+                    source_hash="fd976676c02d33b9442dd84e83fa1d2bfd69cf9660b97eeed4a5f731de7e9550",
+                    signature_hash="976275b36860318cd0eaaa620727a4bc3c8a2f0ef9766707af347989b2dff7e9",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.model_loader.default_loader:DefaultModelLoader._prepare_weights",
+                    source_hash="c5ccb7b24500c4f91585f42471d4f6ad0bfc6d514522bb60c86454805d9df4ce",
+                    signature_hash="e3d6c58df8e7715c3e5e73b50fe3927755a77fffbb9378f2432d659865d2e445",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.model_loader.weight_utils:safetensors_weights_iterator",
+                    source_hash="061bb65f7bdf0d6b5796bd47794ec375537675450597337245d24dc765f2bf41",
+                    signature_hash="d159df39d1c847ed24167463f38d4964ec27e2e2334d397bd2f33441937bc27b",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.model_loader.ep_weight_filter:should_skip_weight",
+                    source_hash="fb7a5a121254ca4762650c93721a465011b5681f05f16cf65fbb0361643b5701",
+                    signature_hash="4daaca1beef199835162c11d8cf86341b743bd118b9e5e4b6a80a80048ec0a12",
+                ),
+            ),
+            contract=(
+                "Engram disaggregation (VLLM_XCPU_ENABLE_ENGRAM_DISAGG): the tables "
+                "live on dedicated Engram MPI ranks; the attention rank's "
+                "ParallelEngramEmbedding holds zero-row parameters and sees all "
+                "hash columns (shard info (1, 0)), the loader never yields "
+                "engram.embed.{weight,scale} (same shard files also carry wkv/q/k "
+                "and possibly expert tensors, so it skips the table names by "
+                "itself and applies should_skip_weight — the same expert filter "
+                "as safetensors_weights_iterator, which never drops scale "
+                "tensors — to the table shards' other tensors), "
+                "Engram._init_staging/prepare_embeddings are no-ops. "
+                "Exactly one request per forward: DeepseekV4Model.forward hashes "
+                "the full token stream before sp_shard and calls "
+                "gather_engram_hashes once, also for forwards without attention "
+                "metadata via the get_engram_dp_size() > 1 dummy_hashes branch "
+                "(the rebound get_engram_dp_size reports 2); the compiled "
+                "_run_layers dummy branch requests too. Each engram layer's embed "
+                "then fills [ceil(T/tp) if SP else T, n_hash_cols, dim] rows for "
+                "the tokens of Engram._local_kv_tokens, layer index 0 collecting "
+                "the reply first. Relies on EngramLayout.primes order for the "
+                "column -> Engram rank mapping and on dummy_hashes using DEAD ids "
+                "(zero rows). Re-check: the forward's hash/gather/prepare order "
+                "and its dummy branch condition, _local_kv_tokens' shard formula, "
+                "ParallelEngramEmbedding.__init__'s use of _get_shard_info / "
+                "_allocate_weights / _weight_loader, safetensors iterator "
+                "signature, should_skip_weight's name pattern and its "
+                "scale-tensor exception, checkpoint tensor names of the tables."
+            ),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_remote_request",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_remote_decode",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_serve",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_engram_remote_decode.py",
+                "torch_xcpu/test/mpi_custom_ops/test_engram_remote_roundtrip_mpi.py",
+                "vllm-xcpu-plugin/tests/engram_disagg",
+                "docs/upgrade/13-dsv41-engram-disagg.md",
+            ),
         ),
         Patch(
             id="deepseek_v41.engram.no_offload",

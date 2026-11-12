@@ -25,6 +25,7 @@ from .model_runner import McpuModelRunner, McpuModelRunnerV2
 
 if TYPE_CHECKING:
     from vllm_xcpu_plugin.af_ep.attn.runtime import ExpertsClient
+    from vllm_xcpu_plugin.engram_disagg.attn.runtime import EngramClient
 
 logger = init_logger(__name__)
 
@@ -46,6 +47,7 @@ class McpuWorker(Worker):
             vllm_config, local_rank, rank, distributed_init_method, is_driver_worker
         )
         self._af_client: ExpertsClient | None = None
+        self._engram_client: EngramClient | None = None
         if vllm_config.model_config.enable_sleep_mode:
             # Worker processes do not rerun check_and_update_config, so the
             # backend registry must be populated here as well.
@@ -136,6 +138,21 @@ class McpuWorker(Worker):
                     "AF-EP attention runtime initialized: world_rank=%d model_rank=%d",
                     mpi_world.global_rank,
                     world_rank_across_dp,
+                )
+            if envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_DISAGG:
+                from vllm_xcpu_plugin.engram_disagg.attn.bootstrap import (
+                    bootstrap_engram_client,
+                )
+
+                self._engram_client = bootstrap_engram_client(
+                    mpi_world=mpi_world, vllm_config=self.vllm_config
+                )
+                logger.info(
+                    "Engram disaggregation client registered: world_rank=%d "
+                    "attention_ranks=%d engram_ranks=%d",
+                    mpi_world.global_rank,
+                    self._engram_client.session.num_attention_ranks,
+                    self._engram_client.session.num_engram_ranks,
                 )
             self.mpi_world_comm = mpi_world.cluster_comm
 
@@ -293,6 +310,25 @@ class McpuWorker(Worker):
             self._af_client.initialize(
                 config.hidden_size, config.num_experts_per_tok, self.model_config.dtype
             )
+        if self._engram_client is not None:
+            from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
+
+            from vllm_xcpu_plugin.engram_disagg.common import EngramShardLayout
+
+            layouts = [
+                module.engram_layout
+                for module in self.model_runner.get_model().modules()
+                if isinstance(module, DeepseekV4Model)
+            ]
+            if len(layouts) != 1 or layouts[0] is None:
+                raise RuntimeError(
+                    "Engram disaggregation needs one DeepseekV4Model with engram layers"
+                )
+            self._engram_client.initialize(
+                EngramShardLayout.from_engram_layout(
+                    layouts[0], self._engram_client.session.num_engram_ranks
+                )
+            )
 
     def determine_available_memory(self) -> int:
         from vllm_xcpu_plugin import shared_kv_cache
@@ -408,6 +444,16 @@ class McpuWorker(Worker):
         )
 
     def shutdown(self):
+        if self._engram_client is not None:
+            from vllm_xcpu_plugin.engram_disagg.attn.runtime import (
+                unregister_engram_client,
+            )
+
+            # Best effort: every attention rank enters the stop collective
+            # from its own shutdown; the launcher ends the world otherwise.
+            self._engram_client.stop()
+            unregister_engram_client(self._engram_client)
+            self._engram_client = None
         if self._af_client is not None:
             from vllm_xcpu_plugin.af_ep.attn.runtime import (
                 unregister_remote_experts_client,

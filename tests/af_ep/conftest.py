@@ -34,6 +34,16 @@ def make_af_session(monkeypatch):
         role_ranks = (
             attention_ranks if cluster_type == ClusterType.ATTN else expert_ranks
         )
+        global_comm = SimpleNamespace(
+            Get_rank=lambda: role_ranks[role_rank],
+            Get_size=lambda: num_attention_ranks + num_expert_ranks,
+            py2f=lambda: 7,
+            allgather=lambda proposal: (
+                [proposal or max_rows] * num_attention_ranks + [0] * num_expert_ranks
+            ),
+        )
+        # Two roles only: the attention/MoE pair is the whole world.
+        global_comm.Split = lambda color, key: global_comm
         world = MpiWorld(
             cluster_instance_id=instance,
             cluster_type=cluster_type,
@@ -41,15 +51,7 @@ def make_af_session(monkeypatch):
                 Get_rank=lambda: role_rank,
                 Get_size=lambda: len(role_ranks),
             ),
-            global_world_comm=SimpleNamespace(
-                Get_rank=lambda: role_ranks[role_rank],
-                Get_size=lambda: num_attention_ranks + num_expert_ranks,
-                py2f=lambda: 7,
-                allgather=lambda proposal: (
-                    [proposal or max_rows] * num_attention_ranks
-                    + [0] * num_expert_ranks
-                ),
-            ),
+            global_world_comm=global_comm,
             clusters={
                 0: MpiCluster(0, ClusterType.ATTN, attention_ranks),
                 1: MpiCluster(1, ClusterType.MOE, expert_ranks),

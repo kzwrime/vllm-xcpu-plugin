@@ -1,4 +1,4 @@
-"""MPI process-world discovery for Attention and MoE role clusters."""
+"""MPI process-world discovery for the attention, MoE and Engram role clusters."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from typing import Any
 class ClusterType(IntEnum):
     ATTN = 0
     MOE = 1
+    # Engram disaggregation: ranks that only serve DeepSeek-V4.1 Engram tables.
+    ENGRAM = 2
 
 
 @dataclass(frozen=True)
@@ -36,9 +38,44 @@ class MpiWorld:
     cluster_comm: Any
     global_world_comm: Any
     clusters: Mapping[int, MpiCluster]
-    # Reserved for special-purpose communicators once a concrete consumer
-    # defines membership, creation order, tag ownership, and lifecycle.
-    _subcomms: dict[str, Any] = field(default_factory=dict, init=False)
+    # Role-pair communicators (attention ranks + one peer role), see pair_comm.
+    _subcomms: dict[ClusterType, Any] = field(default_factory=dict, init=False)
+
+    def ranks_of(self, cluster_type: ClusterType) -> tuple[int, ...]:
+        """Global ranks of every cluster of this role, in instance order."""
+        return tuple(
+            rank
+            for instance_id in sorted(self.clusters)
+            if self.clusters[instance_id].cluster_type == cluster_type
+            for rank in self.clusters[instance_id].global_ranks
+        )
+
+    def pair_comm(self, peer_role: ClusterType):
+        """The communicator of the attention ranks plus the ``peer_role`` ranks.
+
+        Ranks are ordered by global rank, so with the launcher placing the
+        attention ranks first they occupy ``[0, A)`` of the pair and the peer
+        ranks follow. Each disaggregation (AF-EP, Engram) exchanges on its own
+        pair, which lets several coexist in one world.
+
+        Creating it is a collective over the whole world (``MPI_Comm_split``):
+        ``initialize_mpi_world`` creates every pair eagerly, in role order, so
+        all ranks run the same sequence. A rank outside the pair holds None.
+        """
+        if peer_role == ClusterType.ATTN:
+            raise ValueError("a role pair needs a non-attention peer role")
+        if peer_role in self._subcomms:
+            return self._subcomms[peer_role]
+        member = self.cluster_type in (ClusterType.ATTN, peer_role)
+        from mpi4py import MPI
+
+        comm = self.global_world_comm.Split(
+            color=0 if member else MPI.UNDEFINED, key=self.global_rank
+        )
+        if not member or comm == MPI.COMM_NULL:
+            comm = None
+        self._subcomms[peer_role] = comm
+        return comm
 
     @property
     def cluster_rank(self) -> int:
@@ -108,6 +145,10 @@ def initialize_mpi_world(cluster_type: ClusterType) -> MpiWorld:
         global_world_comm=global_comm,
         clusters=MappingProxyType(clusters),
     )
+    # Every rank builds every role pair, in the same order (collective).
+    for peer_role in sorted({c.cluster_type for c in clusters.values()}):
+        if peer_role != ClusterType.ATTN:
+            _MPI_WORLD.pair_comm(peer_role)
     return _MPI_WORLD
 
 

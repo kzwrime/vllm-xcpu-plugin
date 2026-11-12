@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+from vllm_xcpu_plugin.disagg import ClientRegistry
+
 if TYPE_CHECKING:
     import torch
 
@@ -49,19 +51,16 @@ class ExpertsClient(Protocol):
 
 # vLLM's layer factory cannot receive a worker argument. This bridge supplies
 # its client during model construction and optional ModelRunner synchronization.
-_REMOTE_EXPERTS_CLIENT: ExpertsClient | None = None
+REGISTRY: ClientRegistry[ExpertsClient] = ClientRegistry("AF-EP attention")
 
 
 def get_remote_experts_client() -> ExpertsClient | None:
-    return _REMOTE_EXPERTS_CLIENT
+    return REGISTRY.get()
 
 
 def register_remote_experts_client(client: ExpertsClient) -> None:
     """Register one worker's client before constructing its model layers."""
-    global _REMOTE_EXPERTS_CLIENT
-    if _REMOTE_EXPERTS_CLIENT is not None:
-        raise RuntimeError("an AF-EP attention worker is already registered")
-    _REMOTE_EXPERTS_CLIENT = client
+    REGISTRY.register(client)
 
 
 def unregister_remote_experts_client(client: ExpertsClient) -> None:
@@ -71,7 +70,4 @@ def unregister_remote_experts_client(client: ExpertsClient) -> None:
     own references; transport cleanup requires a separate coordinated A/F stop.
     Detaching does not make it safe to start a new transport session.
     """
-    global _REMOTE_EXPERTS_CLIENT
-    if _REMOTE_EXPERTS_CLIENT is not client:
-        raise RuntimeError("cannot unregister another AF-EP worker's client")
-    _REMOTE_EXPERTS_CLIENT = None
+    REGISTRY.unregister(client)

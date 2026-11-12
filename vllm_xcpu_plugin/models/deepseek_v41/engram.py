@@ -5,6 +5,13 @@ The upstream layers are pluggable; these OOT subclasses keep their structure
 (staging rows, TP/DP sharding) and replace only the three Triton kernels with
 the XCPU ops. The table stays an ordinary device tensor (``cpu_offload=False``,
 see the platform hook).
+
+With Engram disaggregation (``VLLM_XCPU_ENABLE_ENGRAM_DISAGG``, a registered
+``EngramClient``) the attention rank holds no table: the model forward sends
+every forward's hash ids to the Engram ranks once (``gather_engram_hashes``
+rebound in ``model.py``) and ``embed`` decodes the returned rows of its own
+tokens, so the staging rows, the DP exchange and the TP all-gather are
+bypassed.
 """
 
 import torch
@@ -23,15 +30,18 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
+from vllm_xcpu_plugin.engram_disagg.attn.runtime import get_engram_client
+
 
 def _xcpu_deepseek_v41_engram_embed(
     out: torch.Tensor, hash_ids: torch.Tensor, layer_name: LayerNameType
 ) -> None:
     """``Engram.embed`` behind an opaque boundary: the staged rows of a
     DP-sharded table are exchanged with a token slot read from the forward
-    context's DP metadata, which a compiled graph must not bake in."""
+    context's DP metadata, which a compiled graph must not bake in; with
+    Engram disaggregation the rows arrive from the Engram ranks."""
     self = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
-    out.copy_(Engram.embed(self, hash_ids))
+    self._fill_rows(out, hash_ids)
 
 
 def _xcpu_deepseek_v41_engram_embed_fake(
@@ -90,8 +100,38 @@ class XcpuNgramHashState(NgramHashState):
         )
 
 
+def _reject_remote_engram_table(
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    raise RuntimeError(
+        "the Engram table is served by the Engram ranks; the attention rank's "
+        "loader must skip engram.embed.* (see engram_disagg.attn.model_loader)"
+    )
+
+
 @ParallelEngramEmbedding.register_oot
 class XcpuParallelEngramEmbedding(ParallelEngramEmbedding):
+    def __init__(self, *args, **kwargs) -> None:
+        if get_engram_client() is not None:
+            # No table on this rank: zero-row parameters, and a loader that
+            # refuses the checkpoint tensor should it ever reach the model.
+            self._weight_loader = _reject_remote_engram_table
+        super().__init__(*args, **kwargs)
+
+    def _get_shard_info(self) -> tuple[int, int]:
+        if get_engram_client() is not None:
+            # The Engram ranks shard the columns; this rank sees all of them.
+            return 1, 0
+        return super()._get_shard_info()
+
+    def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if get_engram_client() is None:
+            return super()._allocate_weights()
+        return (
+            torch.empty(0, self.dim, dtype=torch.float8_e4m3fn),
+            torch.empty(0, self.dim // self.block_size, dtype=torch.uint8),
+        )
+
     def lookup(
         self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
     ) -> None:
@@ -123,9 +163,33 @@ class XcpuEngram(Engram):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        client = get_engram_client()
+        if client is not None:
+            client.bind_layer(self.use_sequence_parallel, self.layer_hash_index)
+
+    def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+        if get_engram_client() is None:
+            super()._init_staging(max_tokens, head_dim)
+            return
+        # Rows are decoded straight into the per-forward output.
+        self.staged_rows = None
+        self._prefetch_stream = None
+
+    def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+        # Disaggregated: the model forward already sent this forward's request.
+        if get_engram_client() is None:
+            super().prepare_embeddings(hash_ids)
+
+    def _fill_rows(self, out: torch.Tensor, hash_ids: torch.Tensor) -> None:
+        """Fill ``out`` [local tokens, n_hash_cols, dim] with this layer's rows."""
+        client = get_engram_client()
+        if client is None:
+            out.copy_(Engram.embed(self, hash_ids))
+        else:
+            client.fill_rows(self.layer_hash_index, out)
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        if not torch.compiler.is_compiling():
+        if get_engram_client() is None and not torch.compiler.is_compiling():
             return super().embed(hash_ids)
         num_tokens = hash_ids.shape[0]
         if self.use_sequence_parallel:

@@ -11,6 +11,9 @@ def test_initialize_splits_single_application_world_by_role(monkeypatch) -> None
     local_comm = type(
         "LocalComm", (), {"Get_rank": lambda self: 0, "Get_size": lambda self: 2}
     )()
+    pair_comm = type(
+        "PairComm", (), {"Get_rank": lambda self: 4, "Get_size": lambda self: 6}
+    )()
 
     class GlobalComm:
         def Get_rank(self):
@@ -20,8 +23,12 @@ def test_initialize_splits_single_application_world_by_role(monkeypatch) -> None
             return 6
 
         def Split(self, color, key):
-            assert (color, key) == (int(ClusterType.MOE), 4)
-            return local_comm
+            # Role split, then the attention/MoE pair (all ranks, in order).
+            assert key == 4
+            if color == int(ClusterType.MOE):
+                return local_comm
+            assert color == 0
+            return pair_comm
 
         def allgather(self, descriptor):
             assert descriptor == (1, int(ClusterType.MOE), 0, 2)
@@ -48,6 +55,45 @@ def test_initialize_splits_single_application_world_by_role(monkeypatch) -> None
     assert world.cluster_size == 2
     assert world.clusters[0].global_ranks == (0, 1, 2, 3)
     assert world.clusters[1].global_ranks == (4, 5)
+    assert world.pair_comm(ClusterType.MOE) is pair_comm
+    assert world.ranks_of(ClusterType.ATTN) == (0, 1, 2, 3)
+
+
+def test_pair_comm_excludes_other_roles(monkeypatch) -> None:
+    """A rank outside a pair splits with MPI.UNDEFINED and holds None."""
+    from types import SimpleNamespace
+
+    from vllm_xcpu_plugin.distributed.mpi_world import MpiCluster, MpiWorld
+
+    calls = []
+
+    class Comm:
+        def Get_rank(self):
+            return 2
+
+        def Split(self, color, key):
+            calls.append((color, key))
+            return "null" if color == "undefined" else "pair"
+
+    fake_mpi = SimpleNamespace(UNDEFINED="undefined", COMM_NULL="null")
+    monkeypatch.setitem(
+        __import__("sys").modules, "mpi4py", SimpleNamespace(MPI=fake_mpi)
+    )
+    world = MpiWorld(
+        cluster_instance_id=1,
+        cluster_type=ClusterType.MOE,
+        cluster_comm=None,
+        global_world_comm=Comm(),
+        clusters={
+            0: MpiCluster(0, ClusterType.ATTN, (0, 1)),
+            1: MpiCluster(1, ClusterType.MOE, (2,)),
+            2: MpiCluster(2, ClusterType.ENGRAM, (3,)),
+        },
+    )
+    assert world.pair_comm(ClusterType.ENGRAM) is None
+    assert world.pair_comm(ClusterType.MOE) == "pair"
+    assert world.pair_comm(ClusterType.MOE) == "pair"  # cached
+    assert calls == [("undefined", 2), (0, 2)]
 
 
 def test_cluster_directory_preserves_local_rank_order() -> None:
@@ -74,7 +120,7 @@ def test_cluster_directory_preserves_local_rank_order() -> None:
         [(0, 0, 0, 2), (0, 0, 0, 2)],
         [(0, 0, 0, 2), (0, 0, 1, 3)],
         [(0, 0, 0, 2), (0, 1, 1, 2)],
-        [(0, 2, 0, 1)],
+        [(0, 7, 0, 1)],
     ],
 )
 def test_cluster_directory_rejects_inconsistent_membership(descriptors) -> None:

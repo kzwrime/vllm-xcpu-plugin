@@ -27,6 +27,7 @@ from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
 from vllm.models.deepseek_v41.nvidia.vl_model import DeepseekV41ForCausalLM
 from vllm.platforms import current_platform
 
+from vllm_xcpu_plugin.engram_disagg.attn.runtime import get_engram_client
 from vllm_xcpu_plugin.upstream_compatibility import verify_upstream_compatibility
 from vllm_xcpu_plugin.upstream_contracts import rebind
 
@@ -101,6 +102,42 @@ def _sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
 
 
 _upstream_sp_reduce_scatter = sequence_parallel.sp_reduce_scatter
+
+
+def _gather_engram_hashes(
+    hash_ids: torch.Tensor, *, dp_shared_memory: bool = False
+) -> torch.Tensor:
+    """With Engram disaggregation, the one request per forward: the model
+    forward calls this once on the full token stream (before sequence-parallel
+    sharding) for every forward, including the dummy hashes of forwards
+    without attention metadata."""
+    # Reference: vLLM
+    # vllm/models/deepseek_v41/common/engram.py::gather_engram_hashes
+    client = get_engram_client()
+    if client is None:
+        return _upstream_gather_engram_hashes(
+            hash_ids, dp_shared_memory=dp_shared_memory
+        )
+    client.request(hash_ids)
+    return hash_ids
+
+
+_upstream_gather_engram_hashes = nv_model.gather_engram_hashes
+
+
+def _get_engram_dp_size() -> int:
+    """DeepseekV4Model.forward feeds dummy hashes through gather_engram_hashes
+    whenever this exceeds 1 (DP-sharded tables need every replica in the
+    collective). The Engram exchange needs exactly that from every forward, so
+    report a sharded table under disaggregation."""
+    # Reference: vLLM
+    # vllm/models/deepseek_v41/nvidia/model.py::DeepseekV4Model.forward
+    if get_engram_client() is None:
+        return _upstream_get_engram_dp_size()
+    return 2
+
+
+_upstream_get_engram_dp_size = nv_model.get_engram_dp_size
 
 
 class _XcpuDeepseekV41LayerStack(nn.Module):
@@ -245,6 +282,10 @@ class XcpuDeepseekV41Model(DeepseekV4Model):
             # Profile and warmup runs hash nothing; the graph keeps the engram
             # layers anyway, fed dead n-grams whose gate is shut.
             engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            client = get_engram_client()
+            if client is not None:
+                # The Engram ranks still expect this forward's request.
+                client.request(engram_hashes)
             for layer in islice(self.layers, self.start_layer, self.end_layer):
                 if layer.engram is not None:
                     layer.engram.prepare_embeddings(
@@ -289,6 +330,8 @@ def install_deepseek_v41() -> None:
     rebind(nv_model, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
     rebind(nv_model.DeepseekV41LLMForCausalLM, "model_cls", XcpuDeepseekV41Model)
     rebind(nv_model, "sp_reduce_scatter", _sp_reduce_scatter)
+    rebind(nv_model, "gather_engram_hashes", _gather_engram_hashes)
+    rebind(nv_model, "get_engram_dp_size", _get_engram_dp_size)
     rebind(nv_dspark, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
     rebind(nv_dspark, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
     rebind(nv_dspark, "_insert_context_kv", _insert_context_kv)

@@ -20,6 +20,12 @@ def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_s
 
     calls = []
     monkeypatch.setattr(Worker, "load_model", lambda self, **kw: calls.append("load"))
+    # Post-load packing runs against the loaded model; keep this test about
+    # the transport order only.
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.layers.fused_moe.shared_experts.install_fused_shared_experts",
+        lambda model: calls.append("pack"),
+    )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: calls.append("drain"))
     monkeypatch.setattr(
         torch_xcpu.ops,
@@ -31,11 +37,18 @@ def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_s
         hf_text_config=SimpleNamespace(hidden_size=16, num_experts_per_tok=6),
         dtype=torch.bfloat16,
     )
+    worker.model_runner = SimpleNamespace(get_model=lambda: None)
     worker._af_client = ExpertsClientV7(make_af_session())
+    worker._engram_client = None
 
     worker.load_model()
 
-    assert calls == ["load", "drain", ("initialize", 8, 16, 6, torch.bfloat16)]
+    assert calls == [
+        "load",
+        "pack",
+        "drain",
+        ("initialize", 8, 16, 6, torch.bfloat16),
+    ]
 
 
 def test_attention_and_expert_rank_counts_are_independent():
@@ -199,7 +212,7 @@ def test_af_capacity_is_negotiated_after_sp_once(
     proposals = [expected] * 4 + [0] * 2
     seen = []
     for session in (attention, expert):
-        session._global_world_comm.allgather = lambda n: seen.append(n) or proposals
+        session.pair_comm.allgather = lambda n: seen.append(n) or proposals
         session.initialize(16, 6, torch.bfloat16)
         session.initialize(16, 6, torch.bfloat16)
         assert session.max_rows_per_attention_rank == expected
@@ -214,6 +227,6 @@ def test_af_capacity_is_negotiated_after_sp_once(
 def test_af_capacity_uses_largest_attention_proposal(make_af_session, version):
     session = make_af_session(max_rows=33, version=version)
     session.register_layer_capacity(4)
-    session._global_world_comm.allgather = lambda _: [9, 17, 0, 0]
+    session.pair_comm.allgather = lambda _: [9, 17, 0, 0]
     session.initialize(16, 6, torch.bfloat16)
     assert session.max_rows_per_attention_rank == 17
