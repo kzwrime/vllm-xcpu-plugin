@@ -90,6 +90,9 @@ def register_ops():
     )
     import vllm_xcpu_plugin.layers.layernorm  # noqa
     import vllm_xcpu_plugin.layers.mm_encoder_attention  # noqa
+    from vllm_xcpu_plugin.models.vision_conv import register_vision_conv
+
+    register_vision_conv()
     import vllm_xcpu_plugin.layers.rotary_embedding  # noqa
     import vllm_xcpu_plugin.layers.qwen_gdn_linear_attn  # noqa
     import vllm_xcpu_plugin.layers.fused_moe.moe_runner  # noqa
