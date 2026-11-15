@@ -118,6 +118,20 @@ env_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # Fusion switch (0/1) for the MoE front segment (post-attention
+    # fused_add_rms_norm + FP32 router gate GEMM): 1 replaces eligible pairs
+    # with torch_xcpu's fused_add_norm_router_gemm via the post-grad pattern
+    # pass. Impl inside the op: TORCH_XCPU_FUSED_ADD_NORM_ROUTER_GEMM_IMPL
+    # (A2 default mega-kernel with internal per-op fallback, A1 v1 mega-kernel,
+    # A0 unfused). Compiled graphs only.
+    "VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM",
+                "0",
+            )
+        )
+    ),
     # Debug: dump the post-grad FX graph to <value>.<pid>.txt before pattern
     # application (and again after, when patterns changed it).
     "VLLM_XCPU_DUMP_POST_GRAD_GRAPH": lambda: os.getenv(

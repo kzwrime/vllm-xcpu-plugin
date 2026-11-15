@@ -16,6 +16,7 @@ callables) pick that hash up, so editing any pass source invalidates both
 cache layers without a separate marker string.
 """
 
+import hashlib
 import itertools
 import logging
 import os
@@ -30,10 +31,24 @@ logger = logging.getLogger(__name__)
 _dump_counter = itertools.count()
 
 
+def _active_pass_flags() -> tuple[bool, bool, bool]:
+    return (
+        bool(
+            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE
+        ),
+        bool(
+            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE
+        ),
+        bool(envs.VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM),
+    )
+
+
 def pass_uuid() -> str:
-    """Hash of every pass source file; the cache-key identity of the passes."""
+    """Hash of every pass source file plus active pass switches."""
     files = sorted(str(p) for p in Path(__file__).parent.rglob("*.py"))
-    return get_hash_for_files(tuple(files)).hex()
+    digest = hashlib.sha256(get_hash_for_files(tuple(files)))
+    digest.update(repr(_active_pass_flags()).encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _dump_graph(tag: str, graph) -> None:
@@ -56,27 +71,55 @@ def _dump_graph(tag: str, graph) -> None:
 
 class XcpuPostGradPass(CustomGraphPass):
     def __call__(self, graph) -> None:
-        from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
-            fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache as add_norm_pass,
-        )
-        from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
-            fused_mla_qnorm_qb_uk_rope_cache as qnorm_pass,
-        )
+        fuse_add_norm, fuse_qnorm, fuse_router_gemm = _active_pass_flags()
+        if not (fuse_add_norm or fuse_qnorm or fuse_router_gemm):
+            return
 
         _dump_graph("pre", graph)
-        # The add-norm pass runs first: each layer it fuses removes the
+        mla_replaced = 0
+        # The MLA add-norm pass runs first: each layer it fuses removes the
         # qnorm pass's window (the first layer, with its plain rms_norm
         # input, is left for the qnorm pass).
-        replaced = (
-            add_norm_pass.replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(
-                graph
+        if fuse_add_norm:
+            from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
+                fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache as add_norm_pass,
             )
-            + qnorm_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph)
-        )
-        if replaced:
+
+            mla_replaced += (
+                add_norm_pass.replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(  # noqa: E501
+                    graph
+                )
+            )
+        if fuse_qnorm:
+            from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
+                fused_mla_qnorm_qb_uk_rope_cache as qnorm_pass,
+            )
+
+            mla_replaced += (
+                qnorm_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph)
+            )
+        if mla_replaced:
             logger.info(
-                "XCPU post-grad pass fused %d MLA front halves", replaced
+                "XCPU post-grad pass fused %d MLA front halves", mla_replaced
             )
+
+        router_replaced = 0
+        if fuse_router_gemm:
+            from vllm_xcpu_plugin.compile_passes import (
+                fused_add_norm_router_gemm as router_gemm_pass,
+            )
+
+            router_replaced = (
+                router_gemm_pass.replace_with_fused_add_norm_router_gemm(graph)
+            )
+            if router_replaced:
+                logger.info(
+                    "XCPU post-grad pass fused %d MoE add-norm + router GEMM "
+                    "front(s)",
+                    router_replaced,
+                )
+
+        if mla_replaced or router_replaced:
             _dump_graph("post", graph)
 
     def uuid(self) -> str:

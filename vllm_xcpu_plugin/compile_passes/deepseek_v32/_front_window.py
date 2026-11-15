@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import torch
 from torch.fx import Node
+from torch.fx.node import map_arg
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +432,9 @@ def rebase_and_erase(
     Clone the region-side view nodes that outside consumers read through, on
     top of the fused results, repoint every outside consumer, then erase the
     region once nothing reads it."""
+    for orig, repl in redirects.items():
+        if "val" in orig.meta and "val" not in repl.meta:
+            repl.meta["val"] = orig.meta["val"]
     clone_map: dict[Node, Node] = dict(redirects)
     # Each clone is an outside-region consumer of its args: a region member
     # it reads may itself now need cloning, so iterate to a fixpoint (the
@@ -444,18 +448,21 @@ def rebase_and_erase(
             if not any(u not in region for u in d.users):
                 continue
             with graph.inserting_before(d):
-                clone_map[d] = graph.create_node(
+                cloned = graph.create_node(
                     d.op,
                     d.target,
                     tuple(clone_map.get(a, a) for a in d.args),
                     {k: clone_map.get(v, v) for k, v in d.kwargs.items()},
                 )
+                if "val" in d.meta:
+                    cloned.meta["val"] = d.meta["val"]
+                clone_map[d] = cloned
             changed = True
     for n in list(graph.nodes):
         if n in region:
             continue
-        n.args = tuple(clone_map.get(a, a) for a in n.args)
-        n.kwargs = {k: clone_map.get(v, v) for k, v in n.kwargs.items()}
+        n.args = map_arg(n.args, lambda a: clone_map.get(a, a))
+        n.kwargs = map_arg(n.kwargs, lambda v: clone_map.get(v, v))
 
     progress = True
     while progress:
