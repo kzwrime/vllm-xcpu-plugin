@@ -18,7 +18,7 @@ Triton metadata kernels run through the Fake Triton adapters in
   the candidate source layer wrote the blocks.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import torch
@@ -59,6 +59,10 @@ class XcpuDeepseekV41SWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
     supports_draft_decode_metadata_update = False
+    _step_cache: ClassVar[
+        dict[torch.device, tuple[tuple[Any, ...], Any, int, set[int]]]
+    ] = {}
+    decode_swa_indices_noncausal: torch.Tensor | None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -108,6 +112,129 @@ class XcpuDeepseekV41SWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
         fast_build: bool = False,
         replay_start: torch.Tensor | None = None,
     ):
+        cm = common_attn_metadata
+        has_mm = (
+            self.max_image_tokens > 0
+            and bool(cm.mm_req_doc_ranges)
+            and any(cm.mm_req_doc_ranges.values())
+        )
+        cache_key = (
+            self.block_size,
+            self.window_size,
+            self.prefill_index_width,
+            self.noncausal_index_width,
+            self.decode_threshold,
+            self.num_local_heads,
+            common_prefix_len,
+            fast_build,
+            cm.query_start_loc.data_ptr(),
+            cm.query_start_loc._version,
+            cm.seq_lens.data_ptr(),
+            cm.seq_lens._version,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+            cm.max_query_len,
+            cm.causal,
+            None
+            if replay_start is None
+            else (replay_start.data_ptr(), replay_start._version),
+        )
+        cached = self._step_cache.get(self.device)
+        if not has_mm and cached is not None:
+            cached_key, base, base_slot_version, seen = cached
+            if cached_key == cache_key and id(self) not in seen:
+                import torch_xcpu
+
+                seen.add(id(self))
+                num_decode_tokens = base.num_decode_tokens
+                num_prefill_tokens = base.num_prefill_tokens
+                same_slots = (
+                    cm.slot_mapping.data_ptr() == base.slot_mapping.data_ptr()
+                    and cm.slot_mapping._version == base_slot_version
+                    and cm.slot_mapping.shape == base.slot_mapping.shape
+                )
+                if same_slots:
+                    is_valid_token = base.is_valid_token
+                else:
+                    is_valid_token = self.is_valid_token[: cm.slot_mapping.shape[0]]
+                    torch.ge(cm.slot_mapping, 0, out=is_valid_token)
+                eff_replay = (
+                    self.no_replay_start if replay_start is None else replay_start
+                )
+                non_causal = not cm.causal
+                decode_buf = self.decode_swa_indices
+                if num_decode_tokens > 0:
+                    if non_causal:
+                        if self.decode_swa_indices_noncausal is None:
+                            self.decode_swa_indices_noncausal = torch.zeros(
+                                self._max_tokens,
+                                1,
+                                self.noncausal_index_width,
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                        decode_buf = self.decode_swa_indices_noncausal
+                    torch_xcpu.ops.deepseek_v41_compute_swa_metadata(
+                        decode_buf,
+                        None if same_slots else self.decode_swa_lens,
+                        cm.query_start_loc,
+                        cm.seq_lens,
+                        base.token_to_req_indices,
+                        is_valid_token,
+                        cm.block_table_tensor,
+                        None if non_causal else eff_replay,
+                        decode_buf.stride(0),
+                        self.window_size,
+                        decode_buf.shape[-1],
+                        self.block_size,
+                        num_decode_tokens,
+                        0,
+                        non_causal,
+                    )
+                decode_swa_lens = (
+                    base.decode_swa_lens
+                    if same_slots
+                    else self.decode_swa_lens[:num_decode_tokens]
+                )
+                prefill_swa_indices = None
+                prefill_swa_lens = None
+                if num_prefill_tokens > 0:
+                    prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+                    prefill_swa_lens = (
+                        base.prefill_swa_lens
+                        if same_slots
+                        else self.prefill_swa_lens[:num_prefill_tokens]
+                    )
+                    torch_xcpu.ops.deepseek_v41_compute_swa_metadata(
+                        prefill_swa_indices,
+                        None if same_slots else prefill_swa_lens,
+                        cm.query_start_loc,
+                        cm.seq_lens,
+                        base.token_to_req_indices,
+                        is_valid_token,
+                        cm.block_table_tensor,
+                        eff_replay,
+                        prefill_swa_indices.stride(0),
+                        self.window_size,
+                        self.prefill_index_width,
+                        self.block_size,
+                        num_prefill_tokens,
+                        num_decode_tokens,
+                        False,
+                    )
+                metadata = replace(
+                    base,
+                    block_table=cm.block_table_tensor,
+                    slot_mapping=cm.slot_mapping,
+                    is_valid_token=is_valid_token,
+                    decode_swa_indices=decode_buf[:num_decode_tokens],
+                    decode_swa_lens=decode_swa_lens,
+                    prefill_swa_indices=prefill_swa_indices,
+                    prefill_swa_lens=prefill_swa_lens,
+                )
+                metadata.xcpu_sparse_mla = base.xcpu_sparse_mla
+                return metadata
+
         metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build, replay_start
         )
@@ -131,6 +258,13 @@ class XcpuDeepseekV41SWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
             for ratio, width in self.compressed_widths.items()
             for part, tokens, swa_width in calls
         }
+        if not has_mm:
+            self._step_cache[self.device] = (
+                cache_key,
+                metadata,
+                cm.slot_mapping._version,
+                {id(self)},
+            )
         return metadata
 
 

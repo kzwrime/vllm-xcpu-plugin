@@ -29,160 +29,127 @@ def _i64(n: int, device: torch.device) -> torch.Tensor:
     return torch.arange(n, dtype=torch.int64, device=device)
 
 
-def _swa_window_slots(
-    start_pos: torch.Tensor,
-    swa_len: torch.Tensor,
-    req: torch.Tensor,
-    block_table: torch.Tensor,
-    block_size: int,
-    width: int,
-) -> torch.Tensor:
-    offset = _i64(width, start_pos.device)
-    pos = start_pos.unsqueeze(-1) + offset
-    valid = offset < swa_len.unsqueeze(-1)
-    page_col = torch.where(valid, pos // block_size, 0)
-    pages = block_table.to(torch.int64)[req.unsqueeze(-1).expand_as(pos), page_col]
-    return torch.where(valid, pages * block_size + pos % block_size, -1)
-
-
-def _swa_rows(args: dict[str, Any], num_tokens: int) -> tuple[torch.Tensor, ...]:
-    token = _i64(num_tokens, args["swa_lens_ptr"].device) + args["token_offset"]
-    is_valid = args["is_valid_token_ptr"][token]
-    req = args["token_to_req_indices_ptr"][token].to(torch.int64)
-    qsl = args["query_start_loc_ptr"].to(torch.int64)
-    query_start = qsl[req]
-    query_len = qsl[req + 1] - query_start
-    seq_len = args["seq_lens_ptr"].to(torch.int64)[req]
-    return token, is_valid, req, query_start, query_len, seq_len
-
-
-def _store_swa(
-    args: dict[str, Any],
-    num_tokens: int,
-    is_valid: torch.Tensor,
-    start_pos: torch.Tensor,
-    swa_len: torch.Tensor,
-    req: torch.Tensor,
-) -> None:
-    width = args["index_width"]
-    swa_len = torch.where(is_valid, swa_len, 0)
-    slots = _swa_window_slots(
-        start_pos, swa_len, req, args["block_table_ptr"], args["block_size"], width
-    )
-    indices = args["swa_indices_ptr"]
-    rows = indices.view(-1)[: indices.numel()].as_strided(
-        (num_tokens, width), (args["swa_indices_stride"], 1)
-    )
-    rows.copy_(slots.to(indices.dtype))
-    args["swa_lens_ptr"][:num_tokens] = swa_len.to(args["swa_lens_ptr"].dtype)
-
-
 def _compute_swa_indices_and_lens(launch: KernelLaunch) -> None:
-    args = dict(launch.arguments)
+    import torch_xcpu
+
+    args = launch.arguments
     _expect(not args["HAS_IMAGE"], "XCPU DSV4.1 SWA indices have no image spans")
     (num_tokens,) = launch.grid
     if num_tokens == 0:
         return
-    token, is_valid, req, query_start, query_len, seq_len = _swa_rows(args, num_tokens)
-    pos = seq_len - query_len + token - query_start
-    window = args["window_size"]
-    start_pos = (pos - (window - 1)).clamp_min(0)
-    replay_start = args["replay_start_ptr"].to(torch.int64)[req]
-    start_pos = torch.maximum(start_pos, replay_start)
-    _store_swa(args, num_tokens, is_valid, start_pos, pos + 1 - start_pos, req)
+    torch_xcpu.ops.deepseek_v41_compute_swa_metadata(
+        args["swa_indices_ptr"],
+        args["swa_lens_ptr"],
+        args["query_start_loc_ptr"],
+        args["seq_lens_ptr"],
+        args["token_to_req_indices_ptr"],
+        args["is_valid_token_ptr"],
+        args["block_table_ptr"],
+        args["replay_start_ptr"],
+        args["swa_indices_stride"],
+        args["window_size"],
+        args["index_width"],
+        args["block_size"],
+        num_tokens,
+        args["token_offset"],
+        False,
+    )
 
 
 def _compute_dspark_noncausal_swa_indices(launch: KernelLaunch) -> None:
-    args = dict(launch.arguments)
+    import torch_xcpu
+
+    args = launch.arguments
     (num_tokens,) = launch.grid
     if num_tokens == 0:
         return
-    _, is_valid, req, _, query_len, seq_len = _swa_rows(args, num_tokens)
-    start_pos = (seq_len - query_len - args["window_size"]).clamp_min(0)
-    _store_swa(args, num_tokens, is_valid, start_pos, seq_len - start_pos, req)
+    torch_xcpu.ops.deepseek_v41_compute_swa_metadata(
+        args["swa_indices_ptr"],
+        args["swa_lens_ptr"],
+        args["query_start_loc_ptr"],
+        args["seq_lens_ptr"],
+        args["token_to_req_indices_ptr"],
+        args["is_valid_token_ptr"],
+        args["block_table_ptr"],
+        None,
+        args["swa_indices_stride"],
+        args["window_size"],
+        args["index_width"],
+        args["block_size"],
+        num_tokens,
+        args["token_offset"],
+        True,
+    )
 
 
 def _compute_prefill_metadata(launch: KernelLaunch) -> None:
+    import torch_xcpu
+
     args = launch.arguments
-    num_prefills, num_decodes = args["num_prefills"], args["num_decodes"]
-    reqs = slice(num_decodes, num_decodes + num_prefills)
-    seq_len = args["seq_lens_ptr"][reqs].to(torch.int64)
-    qsl = args["query_start_loc_ptr"].to(torch.int64)
-    query_len = qsl[num_decodes + 1 : num_decodes + num_prefills + 1] - qsl[reqs]
-    replay_start = args["replay_start_ptr"][reqs].to(torch.int64)
-    visible_prefix = (seq_len - query_len - replay_start).clamp_min(0)
-    gather_len = query_len + visible_prefix.clamp_max(args["window_size"] - 1)
-    out = args["prefill_gather_lens_ptr"]
-    out[:num_prefills] = gather_len.to(out.dtype)
+    torch_xcpu.ops.deepseek_v41_compute_prefill_metadata(
+        args["prefill_gather_lens_ptr"],
+        args["seq_lens_ptr"],
+        args["query_start_loc_ptr"],
+        args["replay_start_ptr"],
+        args["num_prefills"],
+        args["num_decodes"],
+        args["window_size"],
+    )
 
 
 def _compressed_slot_mapping(launch: KernelLaunch) -> None:
+    import torch_xcpu
+
     args = launch.arguments
     _expect(
         args["dcp_world_size"] == 1 and args["cp_interleave"] == 1,
         "XCPU DSV4.1 compressed slot mapping has no decode context parallel",
     )
-    ratio, pad = args["COMPRESS_RATIO"], args["PAD_ID"]
     (num_reqs,) = launch.grid
-    qsl = args["query_start_loc_ptr"].to(torch.int64)
-    num_tokens = int(qsl[num_reqs])
-    out = args["compressed_slot_mapping_ptr"]
-    if num_tokens == 0:
-        return
-    device = out.device
-    token = _i64(num_tokens, device)
-    req = torch.searchsorted(qsl[1 : num_reqs + 1].contiguous(), token, right=True)
-    seq_len = args["seq_lens_ptr"].to(torch.int64)[req]
-    query_len = qsl[req + 1] - qsl[req]
-    pos = seq_len - query_len + token - qsl[req]
-    slot = args["slot_mapping_ptr"][:num_tokens]
-    valid = ((pos + 1) % ratio == 0) & (slot != pad)
-    group = pos // ratio
-    block_size = args["block_size"]
-    page_col = torch.where(valid, group // block_size, 0)
-    pages = args["block_table_ptr"].to(torch.int64)[req, page_col]
-    slots = torch.where(valid, pages * block_size + group % block_size, pad)
-    out[:num_tokens] = slots.to(out.dtype)
+    torch_xcpu.ops.deepseek_v41_compressed_slot_mapping(
+        args["compressed_slot_mapping_ptr"],
+        args["slot_mapping_ptr"],
+        args["query_start_loc_ptr"],
+        args["seq_lens_ptr"],
+        args["block_table_ptr"],
+        num_reqs,
+        args["block_size"],
+        args["COMPRESS_RATIO"],
+        args["PAD_ID"],
+    )
 
 
 def _ring_slot_mapping(launch: KernelLaunch) -> None:
+    import torch_xcpu
+
     args = launch.arguments
-    num_actual, num_tokens = args["num_actual_tokens"], args["num_tokens"]
-    out = args["slot_mapping_ptr"]
-    device = out.device
-    token = _i64(num_tokens, device)
-    valid = token < num_actual
-    safe = torch.where(valid, token, 0)
-    req = args["token_to_req_ptr"][safe].to(torch.int64)
-    block_table = args["block_table_ptr"]
-    stride = args["block_table_stride"]
-    first_page = block_table.view(-1)[req * stride].to(torch.int64)
-    pos = args["positions_ptr"][safe].to(torch.int64)
-    capacity = args["CAPACITY"]
-    slot = first_page * capacity + pos % capacity
-    # Block 0 is the null block: rows without a ring block must not write.
-    out[:num_tokens] = torch.where(valid & (first_page != 0), slot, -1).to(out.dtype)
+    torch_xcpu.ops.deepseek_v41_ring_slot_mapping(
+        args["slot_mapping_ptr"],
+        args["token_to_req_ptr"],
+        args["block_table_ptr"],
+        args["positions_ptr"],
+        args["block_table_stride"],
+        args["num_actual_tokens"],
+        args["num_tokens"],
+        args["CAPACITY"],
+    )
 
 
 def _gather_lookback(launch: KernelLaunch) -> None:
+    import torch_xcpu
+
     args = launch.arguments
-    out = args["lookback_ptr"]
-    depth, num_reqs = args["DEPTH"], args["num_reqs"]
     (rows,) = launch.grid
-    device = out.device
-    batch = _i64(rows, device)
-    in_batch = batch < num_reqs
-    req_state = torch.where(
-        in_batch, args["idx_mapping_ptr"][batch.clamp_max(max(num_reqs - 1, 0))], 0
-    ).to(torch.int64)
-    num_computed = args["num_computed_tokens_ptr"][req_state].to(torch.int64)
-    pos = num_computed.unsqueeze(-1) - 1 - _i64(depth, device)
-    valid = in_batch.unsqueeze(-1) & (pos >= 0)
-    table = args["all_token_ids_ptr"]
-    stride = args["all_token_ids_stride"]
-    flat = table.view(-1)[: table.numel()]
-    ids = flat[torch.where(valid, req_state.unsqueeze(-1) * stride + pos, 0)]
-    out.view(-1)[: rows * depth] = torch.where(valid, ids, -1).to(out.dtype).view(-1)
+    torch_xcpu.ops.deepseek_v41_gather_lookback(
+        args["lookback_ptr"],
+        args["idx_mapping_ptr"],
+        args["num_computed_tokens_ptr"],
+        args["all_token_ids_ptr"],
+        args["all_token_ids_stride"],
+        rows,
+        args["num_reqs"],
+        args["DEPTH"],
+    )
 
 
 def _pad_replayed_slots(launch: KernelLaunch) -> None:
@@ -260,21 +227,20 @@ def _engram_select_rows(launch: KernelLaunch) -> None:
     """Copy one token window out of a rank-major gathered engram buffer:
     output[t, c] = gathered[c // LOCAL_WIDTH][token_start + t][c % LOCAL_WIDTH],
     zero past ``num_tokens``."""
+    import torch_xcpu
+
     args = launch.arguments
     gathered, output = args["gathered"], args["output"]
     num_tokens, token_start = args["num_tokens"], args["token_start"]
     local_width, width = args["LOCAL_WIDTH"], args["WIDTH"]
     _expect(args["num_elements"] == output.numel(), "engram select size mismatch")
     _expect(width % local_width == 0, "engram width is not a multiple of local width")
-    ranks, rows = width // local_width, output.numel() // width
-    out = output.view(rows, ranks, local_width)
-    tokens = token_start + _i64(rows, output.device)
-    valid = tokens < num_tokens
-    source = gathered.view(-1)[: ranks * num_tokens * local_width].view(
-        ranks, num_tokens, local_width
+    rows = output.numel() // width
+    if rows == 0:
+        return
+    torch_xcpu.ops.deepseek_v41_engram_select_rows(
+        output.view(rows, width), gathered, num_tokens, token_start, local_width
     )
-    picked = source[:, tokens.clamp_max(max(num_tokens - 1, 0))].permute(1, 0, 2)
-    out.copy_(torch.where(valid.view(rows, 1, 1), picked, 0))
 
 
 # (module, kernel qualname, adapter)

@@ -16,6 +16,10 @@ bypassed.
 
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
@@ -183,10 +187,29 @@ class XcpuEngram(Engram):
     def _fill_rows(self, out: torch.Tensor, hash_ids: torch.Tensor) -> None:
         """Fill ``out`` [local tokens, n_hash_cols, dim] with this layer's rows."""
         client = get_engram_client()
-        if client is None:
-            out.copy_(Engram.embed(self, hash_ids))
-        else:
+        if client is not None:
             client.fill_rows(self.layer_hash_index, out)
+            return
+        rows = self._ready_rows(hash_ids.shape[0])
+        if self.embed_tokens.tp_size == 1:
+            out.copy_(rows[:, : self.embed_tokens.n_hash_cols])
+        elif self.use_sequence_parallel:
+            import torch_xcpu
+
+            tp_size = self.embed_tokens.tp_size
+            num_tokens, local_heads, dim = rows.shape
+            gathered = tensor_model_parallel_all_gather(rows, dim=0)
+            chunk = (num_tokens + tp_size - 1) // tp_size
+            torch_xcpu.ops.deepseek_v41_engram_select_rows(
+                out,
+                gathered,
+                num_tokens,
+                get_tensor_model_parallel_rank() * chunk,
+                local_heads * dim,
+            )
+        else:
+            rows = tensor_model_parallel_all_gather(rows, dim=1)
+            out.copy_(rows[:, : self.embed_tokens.n_hash_cols])
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         if get_engram_client() is None and not torch.compiler.is_compiling():

@@ -1,7 +1,10 @@
+from typing import Any
+
 import torch
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -143,3 +146,78 @@ class XcpuVocabParallelEmbedding(VocabParallelEmbedding):
 
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output
+
+
+class _XcpuUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
+    """Unquantized LMHead method backed by torch_xcpu Bf16Linear."""
+
+    @staticmethod
+    def _get_or_init_bf16_linear(layer: torch.nn.Module):
+        import torch_xcpu
+
+        weight = getattr(layer, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return None
+        key = (
+            weight.data_ptr(),
+            weight._version,
+            tuple(weight.shape),
+            weight.dtype,
+            weight.device,
+        )
+        if getattr(layer, "_xcpu_bf16_weight_key", None) == key:
+            return getattr(layer, "_xcpu_bf16_linear", None)
+        linear = None
+        if (
+            weight.ndim == 2
+            and weight.dtype == torch.bfloat16
+            and weight.device.type in ("privateuseone", "mcpu")
+            and torch_xcpu.ops.bf16_linear_supported()
+            and torch_xcpu.ops.bf16_linear_shape_supported(
+                weight.size(0), weight.size(1)
+            )
+        ):
+            linear = torch_xcpu.ops.initialize_bf16_linear(weight.data)
+        layer._xcpu_bf16_linear = linear  # type: ignore[assignment]
+        layer._xcpu_bf16_weight_key = key  # type: ignore[assignment]
+        return linear
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        self._get_or_init_bf16_linear(layer)
+
+    def tie_weights(
+        self, layer: torch.nn.Module, embed_tokens: VocabParallelEmbedding
+    ):
+        res = super().tie_weights(layer, embed_tokens)
+        layer._xcpu_bf16_linear = None  # type: ignore[assignment]
+        layer._xcpu_bf16_weight_key = None  # type: ignore[assignment]
+        return res
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dtype == torch.bfloat16 and x.dim() >= 2:
+            linear = self._get_or_init_bf16_linear(layer)
+            if linear is not None:
+                out = linear(x if x.is_contiguous() else x.contiguous())
+                return out + bias if bias is not None else out
+        return super().apply(layer, x, bias)
+
+
+@ParallelLMHead.register_oot
+class XcpuParallelLMHead(ParallelLMHead):
+    """ParallelLMHead routing unquantized BF16 GEMM to torch_xcpu Bf16Linear."""
+
+    quant_method: Any
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if type(self.quant_method) in (
+            UnquantizedEmbeddingMethod,
+            UnquantizedLinearMethod,
+        ):
+            self.quant_method = _XcpuUnquantizedLMHeadMethod()

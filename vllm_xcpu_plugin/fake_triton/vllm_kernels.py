@@ -1643,18 +1643,16 @@ def _token_request_mapping(launch: KernelLaunch) -> None:
     """``CommonAttentionMetadata.token_to_req_indices``: the request of each of
     the first ``num_mapped`` tokens (a ``query_start_loc`` boundary search),
     0 for the remaining output rows."""
+    import torch_xcpu
+
     args = launch.arguments
-    qsl = args["query_start_loc"].to(torch.int64)
-    out = args["output"]
-    num_reqs, num_mapped, num_tokens = (
+    torch_xcpu.ops.vllm_token_request_mapping(
+        args["output"],
+        args["query_start_loc"],
         args["num_reqs"],
         args["num_mapped"],
         args["num_tokens"],
     )
-    tokens = torch.arange(num_tokens, dtype=torch.int64, device=out.device)
-    req = torch.searchsorted(qsl[1 : num_reqs + 1].contiguous(), tokens, right=True)
-    req = req.clamp_max(num_reqs - 1)
-    out[:num_tokens] = torch.where(tokens < num_mapped, req, 0).to(out.dtype)
 
 
 _KERNELS: tuple[

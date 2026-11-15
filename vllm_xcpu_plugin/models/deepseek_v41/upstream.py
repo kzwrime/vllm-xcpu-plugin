@@ -984,8 +984,12 @@ MANIFEST = Manifest(
             ),
             impl=(
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_sparse_mla_metadata",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_compute_swa_metadata",
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.backends.sparse_mla",
@@ -1210,6 +1214,7 @@ MANIFEST = Manifest(
             source=_ENGRAM,
             downstream=(
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram.embed",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._fill_rows",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:_xcpu_deepseek_v41_engram_embed",
             ),
             upstream=(
@@ -1244,7 +1249,8 @@ MANIFEST = Manifest(
                 "vllm::xcpu_deepseek_v41_engram_embed (DP-sharded tables exchange"
                 " staged rows using the forward context's DP token slot, which a "
                 "graph must not bake in); the op's impl is XcpuEngram._fill_rows, "
-                "which copies Engram.embed's result or, with Engram "
+                "which writes directly into out via deepseek_v41_engram_select_rows"
+                " (or copy_ when not SP) or, with Engram "
                 "disaggregation (deepseek_v41.engram.remote), decodes the remote "
                 "rows in eager and compile alike. The op's output is allocated in "
                 "the graph as [ceil(T/tp) if SP else T, n_hash_cols, dim] BF16 and "
@@ -1252,7 +1258,13 @@ MANIFEST = Manifest(
                 " shape/dtype, new forward-context reads, staging buffer "
                 "lifetime."
             ),
-            tests=("docs/upgrade/12-dsv41-dp2tp2-ep.md (SP, DP-sharded engram)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_select_rows",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/12-dsv41-dp2tp2-ep.md (SP, DP-sharded engram)",
+            ),
         ),
         Patch(
             id="deepseek_v41.engram.post_wkv",
@@ -1523,12 +1535,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_compute_swa_metadata on the launch "
+                "stream and validates its launch arguments. Re-check "
                 "the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_compute_swa_metadata",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.compute_dspark_noncausal_swa_indices",
@@ -1544,12 +1563,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
-                "the kernel body, every launch site, grid and constexprs "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_compute_swa_metadata (non_causal=True)"
+                " on the launch stream and validates its launch arguments. "
+                "Re-check the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_compute_swa_metadata",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.compute_prefill_metadata",
@@ -1565,12 +1591,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_compute_prefill_metadata on the "
+                "launch stream and validates its launch arguments. Re-check "
                 "the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_compute_prefill_metadata",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.compressed_slot_mapping",
@@ -1586,12 +1619,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_compressed_slot_mapping on the "
+                "launch stream and validates its launch arguments. Re-check "
                 "the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_compressed_slot_mapping",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.ring_slot_mapping",
@@ -1607,12 +1647,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_ring_slot_mapping on the launch "
+                "stream and validates its launch arguments. Re-check "
                 "the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_ring_slot_mapping",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.gather_lookback",
@@ -1628,12 +1675,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Fake Triton adapter: re-expresses the kernel with ATen ops on "
-                "the launch stream and validates its launch arguments. Re-check "
+                "Fake Triton adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_gather_lookback on the launch "
+                "stream and validates its launch arguments. Re-check "
                 "the kernel body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_gather_lookback",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
         Patch(
             id="deepseek_v41.metadata.pad_replayed_slots",
@@ -1694,12 +1748,19 @@ MANIFEST = Manifest(
                 "Copy one token window out of a rank-major gathered engram "
                 "buffer: output[t, c] = gathered[c // LOCAL_WIDTH][token_start + "
                 "t][c % LOCAL_WIDTH], zero past ``num_tokens``. Fake Triton "
-                "adapter: re-expresses the kernel with ATen ops on the launch "
+                "adapter: routes the kernel to "
+                "torch_xcpu.ops.deepseek_v41_engram_select_rows on the launch "
                 "stream and validates its launch arguments. Re-check the kernel "
                 "body, every launch site, grid and constexprs "
                 "(docs/TRITON_COMPATIBILITY_GUIDE.md 3.6)."
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_select_rows",
+            ),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_metadata_ops.py",
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+            ),
         ),
     ),
 )
