@@ -47,6 +47,7 @@ def register_ops():
     from vllm_xcpu_plugin.layers.mxfp4_linear import register_mxfp4_linear_kernel
     from vllm_xcpu_plugin.layers.mxfp8_linear import register_mxfp8_linear_kernel
     from vllm_xcpu_plugin.models.deepseek_v41 import register_deepseek_v41
+    from vllm_xcpu_plugin.models.dspark import register_dspark
     from vllm_xcpu_plugin.layers.quark_mxfp4 import (
         register_quark_mxfp4_linear_scheme,
     )
@@ -119,3 +120,4 @@ def register_ops():
         register_sparse_mla,
     )
     install_optional_integration("DeepSeek-V4.1", register_deepseek_v41)
+    install_optional_integration("DSpark", register_dspark)

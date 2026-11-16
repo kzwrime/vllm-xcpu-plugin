@@ -74,3 +74,23 @@ def test_patched_gumbel_forwards_non_xcpu_source(monkeypatch):
     assert gumbel_module.gumbel_sample(*args, logits_cache_source=source) is sentinel
     assert calls[0][0] == args
     assert calls[0][1]["logits_cache_source"] is source
+
+
+def test_patched_gumbel_updates_preimported_dspark_speculator(monkeypatch):
+    import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
+    import vllm.v1.worker.gpu.sample.sampler as sampler_module
+    import vllm.v1.worker.gpu.spec_decode.dspark.speculator as dspark_speculator
+    import vllm.v1.worker.gpu.spec_decode.speculator as base_speculator
+
+    monkeypatch.setattr(gumbel_module, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(sampler_module, "gumbel_sample", sampler_module.gumbel_sample)
+    monkeypatch.setattr(base_speculator, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(dspark_speculator, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(sampler_patch, "_GUMBEL_SAMPLE_PATCHED", False)
+    monkeypatch.setenv("VLLM_USE_XCPU_GUMBEL_SAMPLE", "1")
+
+    sampler_patch.maybe_patch_vllm_gumbel_sample()
+
+    assert sampler_module.gumbel_sample is gumbel_module.gumbel_sample
+    assert base_speculator.gumbel_sample is gumbel_module.gumbel_sample
+    assert dspark_speculator.gumbel_sample is gumbel_module.gumbel_sample

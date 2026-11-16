@@ -7,6 +7,7 @@ platform neutral. Only the symbols that name CUDA kernels are rebound, and
 only on MCPU, after the upstream contracts (``upstream.py``) are verified.
 """
 
+from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
@@ -22,7 +23,12 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.models.deepseek_v41.nvidia.dspark import DSparkDeepseekV4ForCausalLM
+from vllm.logger import init_logger
+from vllm.model_executor.layers.utils import xcpu_raw_linear_weight
+from vllm.models.deepseek_v41.nvidia.dspark import (
+    DSparkDeepseekV4ForCausalLM,
+    DSparkDeepseekV4Model,
+)
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
 from vllm.models.deepseek_v41.nvidia.vl_model import DeepseekV41ForCausalLM
 from vllm.platforms import current_platform
@@ -35,6 +41,8 @@ from . import ops
 from .attention import XcpuDeepseekV41Attention
 from .backends import XcpuDeepseekV41IndexerCache
 from .triton_adapters import register_deepseek_v41_kernels
+
+logger = init_logger(__name__)
 
 _INSTALLED = False
 
@@ -310,6 +318,144 @@ class XcpuDeepseekV41Model(DeepseekV4Model):
         return self.replay_layers(*inputs)
 
 
+class XcpuDSparkDeepseekV41Model(DSparkDeepseekV4Model):
+    """``DSparkDeepseekV4Model`` with stacked KV-only context projection and
+    runtime idle-DP dummy short-circuits."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._context_wkv_linear: Any = None
+        for layer in self.layers:
+            proj = layer.attn.fused_wqa_wkv
+            # Mark raw WKV row offset before submodule quant packing so
+            # build_context_wkv_linear can initialize one stacked linear
+            # without touching opaque packed weights.
+            proj._xcpu_keep_raw_wkv_offset = layer.attn.q_lora_rank
+            proj._xcpu_keep_raw_weight = True
+
+    def build_context_wkv_linear(self) -> None:
+        import torch_xcpu
+
+        projs = [layer.attn.fused_wqa_wkv for layer in self.layers]
+        offsets = [layer.attn.q_lora_rank for layer in self.layers]
+        try:
+            if not projs:
+                return
+            raw_fp8_list = [
+                item
+                for proj in projs
+                if (item := getattr(proj, "_xcpu_raw_wkv_fp8", None)) is not None
+            ]
+            if len(raw_fp8_list) == len(projs):
+                block_sizes = {item[2] for item in raw_fp8_list}
+                scale_dtypes = {item[1].dtype for item in raw_fp8_list}
+                if len(block_sizes) == 1 and len(scale_dtypes) == 1:
+                    stacked_w = torch.cat(
+                        [item[0] for item in raw_fp8_list], dim=0
+                    ).contiguous()
+                    stacked_s = torch.cat(
+                        [item[1] for item in raw_fp8_list], dim=0
+                    ).contiguous()
+                    block_size = raw_fp8_list[0][2]
+                    self._context_wkv_linear = torch_xcpu.ops.initialize_fp8_linear(
+                        stacked_w, stacked_s, block_size
+                    )
+                    logger.info_once(
+                        "DSpark context KV: stacked %d wkv layers into FP8 "
+                        "linear (%s, backend=%s)",
+                        len(projs),
+                        tuple(stacked_w.shape),
+                        self._context_wkv_linear.params.backend.name.lower(),
+                    )
+                    return
+
+            raw_weights = [xcpu_raw_linear_weight(proj) for proj in projs]
+            if all(
+                isinstance(w, torch.Tensor)
+                and w.ndim == 2
+                and w.dtype == torch.bfloat16
+                and w.device.type in ("mcpu", "privateuseone")
+                and w.shape[0] > offset
+                and getattr(proj, "bias", None) is None
+                for w, proj, offset in zip(raw_weights, projs, offsets, strict=True)
+            ):
+                stacked_w = torch.cat(
+                    [
+                        w[offset:]
+                        for w, offset in zip(raw_weights, offsets, strict=True)
+                    ],
+                    dim=0,
+                ).contiguous()
+                if torch_xcpu.ops.bf16_linear_shape_supported(
+                    stacked_w.size(0), stacked_w.size(1)
+                ):
+                    self._context_wkv_linear = torch_xcpu.ops.initialize_bf16_linear(
+                        stacked_w.detach(), None
+                    )
+                    logger.info_once(
+                        "DSpark context KV: stacked %d wkv layers into BF16 "
+                        "linear (%s, backend=%s)",
+                        len(projs),
+                        tuple(stacked_w.shape),
+                        self._context_wkv_linear.params.backend.name.lower(),
+                    )
+        finally:
+            for proj in projs:
+                proj._xcpu_raw_wkv_fp8 = None
+                proj._xcpu_raw_weight = None
+
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+        import torch_xcpu
+
+        if (
+            aux_hidden_states.device.type in ("mcpu", "privateuseone")
+            and torch_xcpu.ops.is_dummy_run()
+        ):
+            return aux_hidden_states.new_zeros((
+                aux_hidden_states.shape[0],
+                self.hidden_size,
+            ))
+        return super().combine_hidden_states(aux_hidden_states)
+
+    @torch.inference_mode()
+    def precompute_and_store_context_kv(
+        self,
+        main_x: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mappings: list[torch.Tensor | None] | None = None,
+    ) -> None:
+        import torch_xcpu
+
+        if main_x.shape[0] == 0:
+            return
+        if (
+            context_slot_mappings is None
+            and main_x.device.type in ("mcpu", "privateuseone")
+            and torch_xcpu.ops.is_dummy_run()
+        ):
+            return
+        if self._context_wkv_linear is None:
+            super().precompute_and_store_context_kv(
+                main_x, context_positions, context_slot_mappings
+            )
+            return
+        x = main_x if main_x.is_contiguous() else main_x.contiguous()
+        all_kv = self._context_wkv_linear(x).view(
+            main_x.shape[0], self.num_dspark_layers, self.config.head_dim
+        )
+        for i, (layer, kv) in enumerate(
+            zip(self.layers, all_kv.unbind(1), strict=True)
+        ):
+            slot_mapping = (
+                None if context_slot_mappings is None else context_slot_mappings[i]
+            )
+            attn = layer.attn
+            kv = attn.kv_norm(kv)
+            if slot_mapping is None:
+                continue
+            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+
+
 def install_deepseek_v41() -> None:
     global _INSTALLED
     if _INSTALLED or current_platform.device_name != "mcpu":
@@ -332,6 +478,7 @@ def install_deepseek_v41() -> None:
     rebind(nv_model, "sp_reduce_scatter", _sp_reduce_scatter)
     rebind(nv_model, "gather_engram_hashes", _gather_engram_hashes)
     rebind(nv_model, "get_engram_dp_size", _get_engram_dp_size)
+    rebind(nv_dspark, "DSparkDeepseekV4Model", XcpuDSparkDeepseekV41Model)
     rebind(nv_dspark, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
     rebind(nv_dspark, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
     rebind(nv_dspark, "_insert_context_kv", _insert_context_kv)
@@ -353,4 +500,16 @@ class XcpuDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
 
 
 class XcpuDSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):
-    pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self._loading_checkpoint_weights = True
+        try:
+            return super().load_weights(weights)
+        finally:
+            self._loading_checkpoint_weights = False
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        if not getattr(self, "_loading_checkpoint_weights", False) and hasattr(
+            self.model, "build_context_wkv_linear"
+        ):
+            self.model.build_context_wkv_linear()

@@ -43,6 +43,7 @@ from . import _source
 # Category -> module defining ``MANIFEST``.
 MANIFESTS: dict[str, str] = {
     "deepseek_v41": "vllm_xcpu_plugin.models.deepseek_v41.upstream",
+    "dspark": "vllm_xcpu_plugin.models.dspark.upstream",
     "vision_conv": "vllm_xcpu_plugin.models.vision_conv.upstream",
 }
 

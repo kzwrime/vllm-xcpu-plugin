@@ -467,8 +467,27 @@ MANIFEST = Manifest(
             source=_V031,
             downstream=(
                 "vllm_xcpu_plugin.models.deepseek_v41.model:_insert_context_kv",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDSparkDeepseekV41Model.__init__",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDSparkDeepseekV41Model.combine_hidden_states",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDSparkDeepseekV41Model.precompute_and_store_context_kv",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDSparkDeepseekV41ForCausalLM.load_weights",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDSparkDeepseekV41ForCausalLM.process_weights_after_loading",
             ),
             upstream=(
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model",
+                    expect="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.__init__",
+                    source_hash="e32693e1543b42d4191226d01354f1f25f7cf433b2a340c5c6d095639e24afb1",
+                    signature_hash="0268aa001d71a5bab9e4761758b7b321b8822f20f4554d61286ec2ca4dd91920",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.combine_hidden_states",
+                    source_hash="717f5792ab3b82f953159a3ecb8880f2fcf9b5bb3d0a13e801b1613349e35433",
+                    signature_hash="331c951c98976528ab552b056abf24f28b117d36ef4ead37aa37fed6befb58b9",
+                ),
                 UpstreamRef(
                     target="vllm.models.deepseek_v41.nvidia.dspark:_insert_context_kv",
                     source_hash="03397d5d5c05000d9518e718f5a6822cebd9d722779b08dc70f632f5db96e610",
@@ -479,18 +498,53 @@ MANIFEST = Manifest(
                     source_hash="9567877a2e2ee63382f22fc2cc349e8132a2c81f859fed3bff5154045550cce4",
                     signature_hash="ca37bf2241f93a2e40ef31570104253af3358390d0fecb4658f0d7638ded6794",
                 ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.__init__",
+                    source_hash="19d27a794c12036dc94d704054c31699c6d9589990a0ca476032cb3cddca7e8b",
+                    signature_hash="0268aa001d71a5bab9e4761758b7b321b8822f20f4554d61286ec2ca4dd91920",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.load_weights",
+                    source_hash="e1ccc2a56a3f7570bbc12f7fb9079b6b6404a20e640eef8e1f1f51a1bbc8611d",
+                    signature_hash="24bcf75dc8091fd46a88cb78817a9f1f45d8eff388d0d84c185e4f7f2c4424da",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.process_weights_after_loading",
+                    source_hash="5a873008b7f7ebbcba694b0c626ac9b0c8d4dc60b5d82f03660af443bf49af58",
+                    signature_hash="d66922ee7dbd1de1830c2c0a26b18b8a5fe42592c8d1d7bf09b3dcdf0b175ee1",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.attention:DeepseekV4Attention.__init__",
+                    source_hash="c39e8002fdd59dfc601443545aa26e60eea3ae6c452fcbfa83dff5248ffb4599",
+                    signature_hash="8fd601110da1a879ac85a8e1e8d9067b86cdeeb97da54849fa5cf47f2d4ce089",
+                ),
             ),
             contract=(
-                "DSpark context KV: the KV half of the fused Q/KV insert "
-                "(_C.fused_deepseek_v4_kv_rope_insert) with zero query heads, "
-                "writing attn.swa_cache_layer.kv_cache at slot_mapping with the "
-                "layer's rotary cos/sin cache. Re-check: KV record layout, RoPE "
-                "application, which cache receives the context KV."
+                "DSpark context KV: (1) _insert_context_kv is the KV half of "
+                "fused Q/KV insert writing attn.swa_cache_layer.kv_cache at "
+                "slot_mapping with the layer's rotary cos/sin cache; "
+                "(2) XcpuDSparkDeepseekV41Model marks fused_wqa_wkv's "
+                "[q_lora_rank, head_dim] wkv offset before quant/bf16 packing "
+                "and stacks the 3 layers' unpacked wkv slices once in post-quant "
+                "process_weights_after_loading (skipped during load_weights's "
+                "pre-quant call via _loading_checkpoint_weights) into one "
+                "torch_xcpu FP8/BF16 linear, freeing temporary raw stashes; "
+                "(3) under torch_xcpu.ops.is_dummy_run() (runtime idle-DP sync "
+                "batches), combine_hidden_states and unslotted "
+                "precompute_and_store_context_kv return without GEMMs. "
+                "Re-check: fused_wqa_wkv shard order, q_lora_rank scale-block "
+                "alignment, load_weights vs model_loader "
+                "process_weights_after_loading order, and KV record layout."
             ),
             impl=(
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_qnorm_rope_kv_insert",
+                "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/mxfp8_linear.py::XcpuMxfp8LinearKernel",
+                "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/fp8_linear.py::XcpuFp8BlockScaledMMLinearKernel",
             ),
-            tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
+            tests=(
+                "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
+                "vllm-xcpu-plugin/tests/plugin_tests/test_dspark_phase1.py",
+            ),
             upstream_files=(
                 "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu",
             ),

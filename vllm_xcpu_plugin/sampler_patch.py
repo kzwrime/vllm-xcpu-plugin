@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import sys
+from typing import Any, cast
 
 import torch
 
@@ -145,13 +147,22 @@ def maybe_patch_vllm_gumbel_sample() -> None:
 
     gumbel_module.gumbel_sample = _patched_gumbel_sample
 
-    # If sampler.py was imported before plugin registration, its direct import
-    # has already captured the original function object. Patch that binding too.
+    # If sampler.py or spec_decode modules were imported before plugin
+    # registration, their direct imports captured the original function object.
+    # Patch those bindings too without eagerly importing unused modules.
     try:
         import vllm.v1.worker.gpu.sample.sampler as sampler_module
 
         sampler_module.gumbel_sample = _patched_gumbel_sample
     except ImportError:
         pass
+
+    for spec_mod_name in (
+        "vllm.v1.worker.gpu.spec_decode.speculator",
+        "vllm.v1.worker.gpu.spec_decode.dspark.speculator",
+    ):
+        spec_module = sys.modules.get(spec_mod_name)
+        if spec_module is not None and hasattr(spec_module, "gumbel_sample"):
+            cast(Any, spec_module).gumbel_sample = _patched_gumbel_sample
 
     _GUMBEL_SAMPLE_PATCHED = True

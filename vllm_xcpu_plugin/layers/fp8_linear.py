@@ -5,6 +5,8 @@ details stay below torch_xcpu's stable API so the portable simulator and real
 NPU implementation can replace the phase-1 backend without changing vLLM.
 """
 
+from typing import Any, cast
+
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.scaled_mm import (
@@ -127,6 +129,21 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         if layer_bias is not None:
             assert isinstance(layer_bias, torch.Tensor)
             bias_fp32 = layer_bias.float().contiguous()
+
+        wkv_offset = getattr(layer, "_xcpu_keep_raw_wkv_offset", None)
+        bn, bk = tuple(self.weight_group_shape)
+        if (
+            isinstance(wkv_offset, int)
+            and 0 < wkv_offset < params.weight.shape[0]
+            and bias_fp32 is None
+            and wkv_offset % bn == 0
+            and (params.weight.shape[0] - wkv_offset) % bn == 0
+        ):
+            cast(Any, layer)._xcpu_raw_wkv_fp8 = (
+                params.weight.data[wkv_offset:].detach().contiguous(),
+                weight_scale[wkv_offset // bn :].detach().contiguous(),
+                (bn, bk),
+            )
 
         fp8_linear = torch_xcpu.ops.initialize_fp8_linear(
             params.weight,

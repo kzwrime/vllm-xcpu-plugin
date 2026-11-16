@@ -88,6 +88,18 @@ class XcpuMxfp8LinearKernel(EmulationMxfp8LinearKernel):
                 torch_xcpu.ops.einsum_fp8_tgd_grd_to_tgr_version(),
             )
         else:
+            wkv_offset = getattr(layer, "_xcpu_keep_raw_wkv_offset", None)
+            if (
+                isinstance(wkv_offset, int)
+                and 0 < wkv_offset < weight.shape[0]
+                and wkv_offset % MXFP8_BLOCK == 0
+                and (weight.shape[0] - wkv_offset) % MXFP8_BLOCK == 0
+            ):
+                layer._xcpu_raw_wkv_fp8 = (
+                    weight[wkv_offset:].detach().contiguous(),
+                    scales[wkv_offset // MXFP8_BLOCK :].detach().contiguous(),
+                    (MXFP8_BLOCK, MXFP8_BLOCK),
+                )
             linear = torch_xcpu.ops.initialize_fp8_linear(
                 weight.contiguous(), scales, (MXFP8_BLOCK, MXFP8_BLOCK)
             )
