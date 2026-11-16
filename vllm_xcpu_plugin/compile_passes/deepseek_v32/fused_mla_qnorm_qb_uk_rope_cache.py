@@ -67,7 +67,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
         for u in cache_af.users
         if _fw._is_getitem(u) and u.args[1] == _IDX_CACHE_KV
     )
-    redirects: dict[Node, Node] = {
+    redirects: dict[Node, Node | None] = {
         m.q_norm_out: None,
         cache_out: None,
         m.cat: None,
@@ -87,7 +87,9 @@ def _replace_one(graph, cache_af: Node) -> bool:
     _fw.ensure_no_escape(region, redirects)
 
     # --- mutation below this line; no more _Skip ---
-    tokens = m.q_c_out.args[0][0]
+    q_c_shape = m.q_c_out.args[0]
+    assert isinstance(q_c_shape, (list, tuple))
+    tokens = q_c_shape[0]
     with graph.inserting_before(m.cat):
         slots = graph.create_node(
             "call_function",

@@ -138,7 +138,7 @@ class SharedKVCache:
 
     def fence(self):
         """Wait on the host until every rank's queued work is done (startup)."""
-        torch.mcpu.synchronize(self.device)
+        torch.mcpu.synchronize(self.device)  # type: ignore[attr-defined]
         if self.group.world_size > 1:
             self.group.barrier()
 

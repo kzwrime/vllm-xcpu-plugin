@@ -43,6 +43,7 @@ Safety gates (mismatches stay unfused):
 
 import logging
 import operator
+from typing import Any
 
 import torch
 from torch.fx import Node
@@ -181,7 +182,7 @@ def _mutable_arg_info(
         )
         if base_uses != 1:
             return None
-        op = af_node.args[0]
+        op: Any = af_node.args[0]
         offset = max(1, len(op._schema.returns))
         return all_bases[base_idx], offset + base_idx
 
@@ -192,7 +193,7 @@ def _is_getitem(node: Node) -> bool:
     return node.op == "call_function" and node.target == _GETITEM
 
 
-def _strip_alias(node: Node) -> Node:
+def _strip_alias(node: object) -> Any:
     while (
         isinstance(node, Node)
         and node.op == "call_function"

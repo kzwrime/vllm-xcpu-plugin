@@ -24,7 +24,9 @@ and :func:`rebase_and_erase` then perform the rewrite.
 
 import logging
 import operator
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TypeGuard
 
 import torch
 from torch.fx import Node
@@ -109,10 +111,11 @@ def _af_indices(op) -> dict[str, int]:
     return {name: offset + i for i, name in enumerate(mutated)}
 
 
-def _is_fp8_mm_af(node: Node) -> bool:
+def _is_fp8_mm_af(node: object) -> TypeGuard[Node]:
     """auto_functionalized call of any fp8_scaled_mm_<backend>_out overload."""
     return (
-        node.op == "call_function"
+        isinstance(node, Node)
+        and node.op == "call_function"
         and node.target == _AF
         and node.args[0] in _FP8_MM_OPS
     )
@@ -133,20 +136,25 @@ def backend_supported(supported_op, backend: int | None = None) -> bool:
     return any(bool(supported_op(int(b))) for b in Fp8LinearBackend)
 
 
-def _shape(node: Node) -> tuple | None:
+def _shape(node: object) -> tuple | None:
+    if not isinstance(node, Node):
+        return None
     val = node.meta.get("val")
     return tuple(val.shape) if val is not None else None
 
 
-def _check_shape(where: str, node: Node, want: tuple) -> None:
+def _check_shape(where: str, node: object, want: tuple) -> None:
     got = _shape(node)
     if got is None or any(w is not None and g != w for g, w in zip(got, want)):
         raise _Skip(f"{where} shape {got} does not fit the operator")
 
 
-def _is_af_of(node: Node, op) -> bool:
+def _is_af_of(node: object, op) -> TypeGuard[Node]:
     return (
-        node.op == "call_function" and node.target == _AF and node.args[0] == op
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target == _AF
+        and node.args[0] == op
     )
 
 
@@ -160,8 +168,12 @@ def _arg_nodes(node: Node):
                     yield x
 
 
-def _is_getitem(node: Node) -> bool:
-    return node.op == "call_function" and node.target == _GETITEM
+def _is_getitem(node: object) -> TypeGuard[Node]:
+    return (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target == _GETITEM
+    )
 
 
 def _is_result_view(node: Node) -> bool:
@@ -181,7 +193,7 @@ def _walkable(node: Node) -> bool:
     return True
 
 
-def _roots_at(node: Node | None, targets: set[Node]) -> bool:
+def _roots_at(node: object, targets: set[Node]) -> bool:
     """Whether a view-chain walk from ``node`` reaches any of ``targets``."""
     seen = set()
     work = [node]
@@ -197,20 +209,27 @@ def _roots_at(node: Node | None, targets: set[Node]) -> bool:
     return False
 
 
-def _view_ancestor(node: Node) -> Node:
+def _view_ancestor(node: object) -> Node:
     """Walk a view chain down to its first non-view producer.
 
     The result of a foreign auto_functionalized call (e.g. the fused_qkv_a
     linear) is a producer: the walk stops at its result getitem.
     """
-    while _walkable(node):
+    while isinstance(node, Node) and _walkable(node):
         node = node.args[0]
+    if not isinstance(node, Node):
+        raise _Skip("expected FX Node in view chain")
     return node
 
 
-def _strip_alias(node: Node) -> Node:
-    while node.op == "call_function" and node.target == _ATEN.alias.default:
+def _strip_alias(node: object) -> Node:
+    while (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target == _ATEN.alias.default
+    ):
         node = node.args[0]
+    assert isinstance(node, Node)
     return node
 
 
@@ -301,13 +320,15 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
             ),
             None,
         )
+        if cand_out is None:
+            continue
         if not any(_roots_at(e.kwargs["input"], {cand_out}) for e in einsum_afs):
             continue
         if q_b_af is not None:
             raise _Skip("ambiguous q_b_proj")
         q_b_af = n
         q_b_out = cand_out
-    if q_b_af is None:
+    if q_b_af is None or q_b_out is None:
         raise _Skip(
             f"no q_b_proj with FP8 weights {_QB_PACKED_SHAPE} feeding W_UK "
             f"(heads per rank != {_HEADS_PER_RANK}?)"
@@ -357,6 +378,16 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     if not _roots_at(cache_af.kwargs["value"], {rotary_af}):
         raise _Skip("cache-write value does not come from the q rope")
 
+    q_c_out = q_norm_af.kwargs["out"]
+    kv_c_out = kv_norm_af.kwargs["out"]
+    q_ws = q_b_af.kwargs["out"]
+    if not (
+        isinstance(q_c_out, Node)
+        and isinstance(kv_c_out, Node)
+        and isinstance(q_ws, Node)
+    ):
+        raise _Skip("norm/q_b out buffer is not a Node")
+
     return WindowMatch(
         cache_af=cache_af,
         kv_norm_af=kv_norm_af,
@@ -368,9 +399,9 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
         einsum_out=einsum_out,
         rotary_af=rotary_af,
         cat=cat,
-        q_c_out=q_norm_af.kwargs["out"],
-        kv_c_out=kv_norm_af.kwargs["out"],
-        q_ws=q_b_af.kwargs["out"],
+        q_c_out=q_c_out,
+        kv_c_out=kv_c_out,
+        q_ws=q_ws,
     )
 
 
@@ -406,7 +437,9 @@ def close_region(graph, seeds: list[Node]) -> set[Node]:
     return region
 
 
-def ensure_no_escape(region: set[Node], redirects: dict[Node, Node]) -> None:
+def ensure_no_escape(
+    region: set[Node], redirects: Mapping[Node, Node | None]
+) -> None:
     """Redirect reachable set: the producers plus their transparent fan-out
     inside the region; only those may have consumers outside the region."""
     reach = set(redirects)
@@ -425,17 +458,19 @@ def ensure_no_escape(region: set[Node], redirects: dict[Node, Node]) -> None:
 
 
 def rebase_and_erase(
-    graph, region: set[Node], redirects: dict[Node, Node]
+    graph, region: set[Node], redirects: Mapping[Node, Node | None]
 ) -> None:
     """Rebase redirect chains and erase the region (users first).
 
     Clone the region-side view nodes that outside consumers read through, on
     top of the fused results, repoint every outside consumer, then erase the
     region once nothing reads it."""
+    clone_map: dict[Node, Node] = {}
     for orig, repl in redirects.items():
+        assert repl is not None
         if "val" in orig.meta and "val" not in repl.meta:
             repl.meta["val"] = orig.meta["val"]
-    clone_map: dict[Node, Node] = dict(redirects)
+        clone_map[orig] = repl
     # Each clone is an outside-region consumer of its args: a region member
     # it reads may itself now need cloning, so iterate to a fixpoint (the
     # chain exits the region at foreign af results / placeholders).

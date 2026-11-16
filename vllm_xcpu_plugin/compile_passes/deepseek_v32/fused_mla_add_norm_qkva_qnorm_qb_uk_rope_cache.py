@@ -364,7 +364,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
     )
     if cache_out is None:
         raise _SKIP("KV-cache result missing")
-    redirects: dict[Node, Node] = {
+    redirects: dict[Node, Node | None] = {
         hidden_gi: None,
         m.q_norm_out: None,
         cache_out: None,
@@ -396,7 +396,9 @@ def _replace_one(graph, cache_af: Node) -> bool:
     _fw.ensure_no_escape(region, redirects)
 
     # --- mutation below this line; no more _Skip ---
-    tokens = m.q_c_out.args[0][0]
+    q_c_shape = m.q_c_out.args[0]
+    assert isinstance(q_c_shape, (list, tuple))
+    tokens = q_c_shape[0]
     with graph.inserting_before(m.cat):
         slots = graph.create_node(
             "call_function",
@@ -501,6 +503,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
             "call_function", _GETITEM, (fused, idx["out_q"])
         )
         if full:
+            assert wq_b_out is not None and wk_out is not None
             redirects[wq_b_out] = graph.create_node(
                 "call_function", _GETITEM, (fused, idx["indexer_q"])
             )
