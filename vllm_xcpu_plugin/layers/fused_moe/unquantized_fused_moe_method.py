@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 
 from .setup import (
+    initialize_padded_expert_slots,
     install_fused_moe,
     reject_fused_moe_hot_reload,
     use_shared_moe_workspace,
@@ -42,6 +43,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         if self.moe.has_bias:
             raise NotImplementedError("XCPU BF16 expert bias is unsupported")
+        initialize_padded_expert_slots(layer)
         fused_moe = torch_xcpu.ops.initialize_fused_moe(
             w13,
             w2,

@@ -353,14 +353,14 @@ def run(
     if os.getenv("XCPU_EP_COMPILE", "0") != "1":
         native = execution._op
 
-        def guarded(*args):
+        def guarded(*args, **kwargs):
             storage = torch.full(
                 (execution.workspace_bytes + 128,),
                 0xA5,
                 device="mcpu",
                 dtype=torch.uint8,
             )
-            native(*args[:-2], storage[64:-64], args[-1])
+            native(*args[:-2], storage[64:-64], args[-1], **kwargs)
             guards.append(storage)
 
         execution._op = guarded
@@ -708,7 +708,7 @@ if __name__ == "__main__":
                                 shape,
                             )
                 else:
-                    for topk in (6, 8):
+                    for topk in (3, 6, 8):
                         for dtype in (torch.bfloat16, torch.float32):
                             run(MPI.COMM_WORLD, version, topk, dtype, shape=shape)
         MPI.Finalize()

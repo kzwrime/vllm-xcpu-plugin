@@ -26,7 +26,11 @@ from vllm.model_executor.utils import replace_parameter
 import vllm_xcpu_plugin.envs as envs_xcpu
 
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
-from .fused_moe.setup import install_fused_moe, reject_fused_moe_hot_reload
+from .fused_moe.setup import (
+    initialize_padded_expert_slots,
+    install_fused_moe,
+    reject_fused_moe_hot_reload,
+)
 
 logger = init_logger(__name__)
 
@@ -206,6 +210,7 @@ class XcpuQuarkOCPMXMoEMethod(QuarkOCP_MX_MoEMethod):
         w2_weight_scale = layer.w2_weight_scale
         assert isinstance(w13_weight_scale, torch.Tensor)
         assert isinstance(w2_weight_scale, torch.Tensor)
+        initialize_padded_expert_slots(layer)
         _initialize_dummy_e8m0_scale(w13_weight_scale)
         _initialize_dummy_e8m0_scale(w2_weight_scale)
         fused_moe = torch_xcpu.ops.initialize_fused_moe(

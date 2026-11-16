@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
 from .fused_moe.setup import (
+    initialize_padded_expert_slots,
     install_fused_moe,
     reject_fused_moe_hot_reload,
     use_shared_moe_workspace,
@@ -96,6 +97,7 @@ class XcpuFp8MoEMethod(Fp8MoEMethod):
 
         if w13_input_scale is not None or w2_input_scale is not None:
             raise ValueError("XCPU FP8 W8A16 does not use input scales")
+        initialize_padded_expert_slots(layer)
         fused_moe = torch_xcpu.ops.initialize_fused_moe(
             w13,
             w2,

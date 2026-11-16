@@ -271,6 +271,7 @@ def test_workspace_query_checks_capacity_and_overflow(version):
     )
     args = [4, 17, 8, 128, 128, 4, 2, 0, 0, False, False]
     assert query(*args) > 0
+    assert query(4, 17, 3, 128, 128, 4, 2, 0, 0, False, False) > 0
     for index, value in ((0, 129), (1, 0), (2, 7), (3, -1), (4, 2**62), (6, 1)):
         invalid = args.copy()
         invalid[index] = value
@@ -721,3 +722,204 @@ def test_install_fused_shared_experts_matches_swiglu_limit(
     )
     assert install_fused_shared_experts(runner) == fused
     assert len(bound) == fused
+
+
+@pytest.mark.parametrize("version", [5, 6])
+def test_xcpu_ep_experts_accepts_topk3(version):
+    plan = ops.initialize_fused_moe(
+        torch.zeros(2, 256, 128, device="mcpu", dtype=torch.bfloat16),
+        torch.zeros(2, 128, 128, device="mcpu", dtype=torch.bfloat16),
+        backend=ops.MoeGroupedGemmBackend.PORTABLE,
+    )
+    metadata = torch.tensor([2, 0], dtype=torch.int64, device="cpu")
+    communicator = torch.tensor([0], dtype=torch.int64, device="cpu")
+    expert_map = torch.tensor([0, 1, -1, -1], device="mcpu", dtype=torch.int32)
+    ep = XcpuEPExperts(
+        plan,
+        metadata,
+        communicator,
+        expert_map,
+        version=version,
+        ep_size=2,
+        ep_rank=0,
+        max_num_tokens=16,
+        topk=3,
+    )
+    assert ep.topk == 3
+    with pytest.raises(ValueError, match="topk=3/6/8"):
+        XcpuEPExperts(
+            plan,
+            metadata,
+            communicator,
+            expert_map,
+            version=version,
+            ep_size=2,
+            ep_rank=0,
+            max_num_tokens=16,
+            topk=7,
+        )
+
+
+@pytest.mark.parametrize("backend", ["mpi_alltoallv_v5", "mpi_alltoallv_v6"])
+@pytest.mark.parametrize(
+    ("ep_rank", "expected_active", "expected_ids"),
+    [
+        (0, 3, [0, 1, 2]),
+        (42, 2, [126, 127]),
+        (47, 0, []),
+    ],
+)
+def test_xcpu_routed_experts_ep_padding(
+    backend: str, ep_rank: int, expected_active: int, expected_ids: list[int]
+):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+        ExpertMapManager,
+    )
+
+    from vllm_xcpu_plugin.layers.fused_moe.routed_experts import XcpuRoutedExperts
+    from vllm_xcpu_plugin.layers.fused_moe.setup import (
+        initialize_padded_expert_slots,
+    )
+
+    parallel = FusedMoEParallelConfig(
+        tp_size=2,
+        pcp_size=1,
+        dp_size=24,
+        ep_size=48,
+        tp_rank=ep_rank % 2,
+        pcp_rank=0,
+        dp_rank=ep_rank // 2,
+        ep_rank=ep_rank,
+        sp_size=1,
+        use_ep=True,
+        all2all_backend=backend,
+        enable_eplb=False,
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=128,
+        experts_per_token=3,
+        hidden_dim=64,
+        intermediate_size=128,
+        num_local_experts=2,
+        num_logical_experts=128,
+        activation=MoEActivation.SILU,
+        device="mcpu",
+        routing_method=RoutingMethodType.DeepseekV4,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+        max_num_tokens=16,
+    )
+    emm = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=3,
+        global_num_experts=128,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    with set_current_vllm_config(VllmConfig()):
+        layer = XcpuRoutedExperts(
+            layer_name=f"mtp.layers.{ep_rank}.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=moe_config,
+            quant_config=None,
+            expert_map_manager=emm,
+            is_fused_checkpoint_transposed=True,
+            scoring_func="sqrtsoftplus",
+            swiglu_limit=7.0,
+        )
+    assert moe_config.num_experts == 144
+    assert moe_config.num_local_experts == 3
+    assert emm.global_num_experts == 144
+    assert emm.local_num_experts == 3
+    assert emm._expert_map.shape == (144,)
+    assert layer._xcpu_padded_experts is True
+    assert layer._xcpu_active_local_experts == expected_active
+
+    # Uniform contiguous linear ownership across padded [0..143] satisfies v5 & v6.
+    start = ep_rank * 3
+    assert emm._expert_map[start : start + 3].tolist() == [0, 1, 2]
+    for gid in range(144):
+        expected_val = gid - start if start <= gid < start + 3 else -1
+        assert int(emm._expert_map[gid].item()) == expected_val
+    for gid in range(128):
+        expected_local = expected_ids.index(gid) if gid in expected_ids else -1
+        assert int(emm._expert_map[gid].item()) == expected_local
+
+    mapping = layer.get_expert_mapping()
+    assert {eid for _, _, eid, _ in mapping} == set(range(128))
+    assert len(mapping) == 128 * 3
+
+    for _, param in layer.named_parameters(recurse=False):
+        param.data.fill_(7.0)
+    # Build per-expert weights for logical experts in checkpoint shapes (TP=2).
+    ckpt_weights = []
+    for eid in range(128):
+        val = float(eid + 1)
+        ckpt_weights.append(
+            (
+                f"{eid}.gate_proj.weight",
+                torch.full((128, 64), val, dtype=torch.bfloat16),
+            )
+        )
+        ckpt_weights.append(
+            (
+                f"{eid}.up_proj.weight",
+                torch.full((128, 64), val, dtype=torch.bfloat16),
+            )
+        )
+        ckpt_weights.append(
+            (
+                f"{eid}.down_proj.weight",
+                torch.full((64, 128), val, dtype=torch.bfloat16),
+            )
+        )
+    loaded = set(layer.load_weights(ckpt_weights))
+    assert {name for name, _ in layer.named_parameters(recurse=False)} <= loaded
+
+    initialize_padded_expert_slots(layer)
+    for _, param in layer.named_parameters(recurse=False):
+        if expected_active < 3:
+            assert torch.all(param.data[expected_active:].cpu() == 0)
+        for local_id, gid in enumerate(expected_ids):
+            assert torch.all(param.data[local_id].cpu() == float(gid + 1))
+
+
+def test_initialize_padded_expert_slots_scales():
+    from vllm_xcpu_plugin.layers.fused_moe.setup import (
+        initialize_padded_expert_slots,
+    )
+
+    mod = torch.nn.Module()
+    mod._xcpu_active_local_experts = 2
+    mod.w13_weight = torch.nn.Parameter(
+        torch.full((3, 4, 4), 5.0, dtype=torch.bfloat16), requires_grad=False
+    )
+    mod.w13_weight_scale = torch.nn.Parameter(
+        torch.zeros((3, 4, 1), dtype=torch.uint8), requires_grad=False
+    )
+    mod.w2_weight_scale = torch.nn.Parameter(
+        torch.full((3, 4, 1), 2.0, dtype=torch.float8_e8m0fnu),
+        requires_grad=False,
+    )
+    mod.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.full((3, 4, 1), 3.0, dtype=torch.float32), requires_grad=False
+    )
+    mod.w13_weight_scale.data[:2].fill_(120)
+    initialize_padded_expert_slots(mod)
+    assert torch.all(mod.w13_weight.data[:2] == 5.0)
+    assert torch.all(mod.w13_weight.data[2:] == 0)
+    assert torch.all(mod.w13_weight_scale.data[:2] == 120)
+    assert torch.all(mod.w13_weight_scale.data[2:] == 127)
+    assert torch.all(mod.w2_weight_scale.data[:2].float() == 2.0)
+    assert torch.all(mod.w2_weight_scale.data[2:].view(torch.uint8) == 127)
+    assert torch.all(mod.w2_weight_scale_inv.data[:2] == 3.0)
+    assert torch.all(mod.w2_weight_scale_inv.data[2:] == 1.0)

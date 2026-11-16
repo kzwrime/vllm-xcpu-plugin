@@ -67,8 +67,8 @@ class XcpuEPExperts(torch.nn.Module):
         self.swiglu_limit = float(swiglu_limit)
         if not 0 < ep_size <= 128 or not 0 <= ep_rank < ep_size:
             raise ValueError("invalid XCPU EP topology")
-        if max_num_tokens <= 0 or topk not in (6, 8):
-            raise ValueError("XCPU EP requires positive capacity and topk=6/8")
+        if max_num_tokens <= 0 or topk not in (3, 6, 8):
+            raise ValueError("XCPU EP requires positive capacity and topk=3/6/8")
         self.version = version
         self.ep_size = ep_size
         self.ep_rank = ep_rank

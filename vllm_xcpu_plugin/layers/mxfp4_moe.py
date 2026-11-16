@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
 from .fused_moe.grouped_gemm_experts import XcpuGroupedGemmExperts
 from .fused_moe.setup import (
+    initialize_padded_expert_slots,
     install_fused_moe,
     reject_fused_moe_hot_reload,
     use_shared_moe_workspace,
@@ -40,6 +41,7 @@ class XcpuCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
         reject_fused_moe_hot_reload(self)
         if self.moe.has_bias:
             raise NotImplementedError("XCPU MXFP4 expert bias is unsupported")
+        initialize_padded_expert_slots(layer)
         fused_moe = torch_xcpu.ops.initialize_fused_moe(
             layer.w13_weight_packed,
             layer.w2_weight_packed,
@@ -91,6 +93,7 @@ class XcpuMxfp4MoEMethod(Mxfp4MoEMethod):
         reject_fused_moe_hot_reload(self)
         if self.moe.has_bias:
             raise NotImplementedError("XCPU MXFP4 expert bias is unsupported")
+        initialize_padded_expert_slots(layer)
         _initialize_dummy_e8m0_scale(layer.w13_weight_scale)
         _initialize_dummy_e8m0_scale(layer.w2_weight_scale)
         fused_moe = torch_xcpu.ops.initialize_fused_moe(

@@ -38,6 +38,24 @@ def use_shared_moe_workspace(moe) -> bool:
     }
 
 
+def initialize_padded_expert_slots(layer) -> None:
+    """Zero padded expert weights and fill padded scales with unit scale."""
+    import torch
+
+    active_local = getattr(layer, "_xcpu_active_local_experts", None)
+    if active_local is None:
+        return
+    for name, param in layer.named_parameters(recurse=False):
+        if param.ndim == 0 or active_local >= param.shape[0]:
+            continue
+        padded = param.data[active_local:]
+        if "scale" in name:
+            # MXFP4 e8m0 scale bias 127 equals 2^(127-127) = 1.0 when stored as uint8.
+            padded.fill_(127 if param.dtype == torch.uint8 else 1.0)
+        else:
+            padded.zero_()
+
+
 def install_fused_moe(
     method,
     layer,

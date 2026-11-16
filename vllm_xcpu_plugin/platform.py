@@ -189,6 +189,28 @@ class McpuPlatform(Platform):
             if model_config.sleep_mode_backend == "cumem":
                 model_config.sleep_mode_backend = BACKEND_NAME
 
+        if (
+            parallel_config.enable_expert_parallel
+            and parallel_config.enable_ep_weight_filter
+        ):
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "enable_ep_weight_filter is unsupported with speculative "
+                    "decoding when draft and target expert counts may differ"
+                )
+            model_cfg = vllm_config.model_config
+            if model_cfg is not None:
+                ep_size = (
+                    parallel_config.data_parallel_size
+                    * parallel_config.tensor_parallel_size
+                )
+                num_experts = model_cfg.get_num_experts()
+                if num_experts % ep_size != 0:
+                    raise ValueError(
+                        f"enable_ep_weight_filter requires num_experts "
+                        f"({num_experts}) to be divisible by ep_size ({ep_size})"
+                    )
+
         # The F service builds its own VllmConfig without vLLM EP; only A ranks
         # need the loader that drops remote expert tensors.
         if envs_xcpu.VLLM_XCPU_ENABLE_AF_EP and parallel_config.enable_expert_parallel:

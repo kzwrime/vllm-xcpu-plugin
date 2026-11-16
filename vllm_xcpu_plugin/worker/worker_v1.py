@@ -305,6 +305,9 @@ class McpuWorker(Worker):
         )
 
         install_fused_shared_experts(self.model_runner.get_model())
+        draft_model = self.model_runner.get_draft_model()
+        if draft_model is not None:
+            install_fused_shared_experts(draft_model)
         if self._af_client is not None:
             config = self.model_config.hf_text_config
             self._af_client.initialize(
