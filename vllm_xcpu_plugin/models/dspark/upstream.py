@@ -24,6 +24,11 @@ MANIFEST = Manifest(
             sha256="97bcfaa655c6d4a5ecdfb17ab87b80547e8216b9d15a91c341798ebbb558f146",
             source=_V031,
         ),
+        WatchedModule(
+            module="vllm.model_executor.models.qwen3_dspark",
+            sha256="7be21c094a49520c41f418aceea71b338d5e15b14b3ddd052e6d6f7b7ac8ae79",
+            source=_V031,
+        ),
     ),
     patches=(
         Patch(
@@ -125,6 +130,95 @@ MANIFEST = Manifest(
                 "usage in _dummy_run."
             ),
             tests=("vllm-xcpu-plugin/tests/plugin_tests/test_dspark_phase1.py",),
+        ),
+        Patch(
+            id="dspark.speculator.markov_fused",
+            source=_V031,
+            downstream=(
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator.__init__",
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator.load_draft_model",
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._resolve_fused_markov_weights",
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._sample_sequential",
+            ),
+            upstream=(
+                UpstreamRef(
+                    target="vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.__init__",
+                    source_hash="cc68f8cebf0b4ceb711575d5431c3eb3d9a4a022a58a5d796e71d4ce24a04183",
+                    signature_hash="becf74c14dc557426e51d96975cf5f312398aa66833b36a97d68f6bde2b09557",
+                ),
+                UpstreamRef(
+                    target="vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.load_draft_model",
+                    source_hash="fba0258d3761aac8f106c565d4aed19683bad55367e7508f79c82b2d991af903",
+                    signature_hash="b2fb736a3e2748f1312cebff1cd412d65460efdd75b4a131b8e92355d1bba995",
+                ),
+                UpstreamRef(
+                    target="vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential",
+                    source_hash="e9d235da1710aefe681bb795931e44a50c9cad59eee0db7fdedf659be896d115",
+                    signature_hash="11e5e039624669e60fcfd3560fa2c371c9c3c3aa60b01650e85302c388b2523e",
+                ),
+                UpstreamRef(
+                    target="vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential_topk",
+                    source_hash="26ad55603495ce275a15a403f96385f061c528c8decd7bf49da36b7ebd60a91b",
+                    signature_hash="11e5e039624669e60fcfd3560fa2c371c9c3c3aa60b01650e85302c388b2523e",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.models.qwen3_dspark:DSparkMarkovHead.embed",
+                    source_hash="f1a528436c57102e5fe77e0d85cd351cf78d238109c06e06f4bd0b960c6dafc7",
+                    signature_hash="306bcdac009bc2a640425e3a14f2b22da2ca1875da6d30b19c92a555b4fa4cc0",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.models.qwen3_dspark:DSparkMarkovHead.bias",
+                    source_hash="262803c56decb02559715da25fad2df1ec394a51a315daa486476e5173c89f1f",
+                    signature_hash="6524747be09014370b50ae76fe4055e61481b91fb154e13dfe39501d51cb41ed",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.markov_embed",
+                    source_hash="3f78c3c31ad74b94bda89a9da70981dc472042344520ee488dc7c9b008a8250a",
+                    signature_hash="306bcdac009bc2a640425e3a14f2b22da2ca1875da6d30b19c92a555b4fa4cc0",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.markov_bias",
+                    source_hash="0dd5d686b65902e61a1f6c3af507b37458858bf9fce21844da8e3a7377b8f96c",
+                    signature_hash="52616eedaafb2cec814beeea2ad3390e83726754310a6373fcd4c68d8a1eb6e2",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.compute_confidence",
+                    source_hash="311cac9ea151f35ccabf7824aacd40b99548521fab4b805ffc906a61e20305d7",
+                    signature_hash="c537a8e67668dcbcfd73b25adbdccaf79c0df42b17a0372014b227f775490f17",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.map_draft_to_target",
+                    source_hash="b1a3f6f90b765fe6a89799285865bf5d926225668e924e342269453db16229b7",
+                    signature_hash="daeeada9a0a858a14f0579903ddc2792eb84299e6adef7635ae3d239c630a657",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.models.qwen3_dspark:Qwen3DSparkForCausalLM.map_draft_to_target",
+                    source_hash="efb09678cd1e6047bdedc14534c6faa361570e6d7af46bf99243af84198a5cfd",
+                    signature_hash="daeeada9a0a858a14f0579903ddc2792eb84299e6adef7635ae3d239c630a657",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.models.qwen3_dspark:Qwen3DSparkForCausalLM.markov_bias",
+                    source_hash="0dd5d686b65902e61a1f6c3af507b37458858bf9fce21844da8e3a7377b8f96c",
+                    signature_hash="52616eedaafb2cec814beeea2ad3390e83726754310a6373fcd4c68d8a1eb6e2",
+                ),
+            ),
+            contract=(
+                "XcpuDSparkSpeculator._sample_sequential fuses the n_spec sequential "
+                "Markov embedding lookup, w2 linear bias, base_logits addition, "
+                "greedy argmax / probabilistic Gumbel sampling, draft_logits cache "
+                "write, and optional d2t offset mapping into "
+                "torch_xcpu.ops.dspark_markov_sample (accepting INTEL_AMX packed "
+                "layout 1, PORTABLE/ACC packed layout 2, and row-major BF16 layout 0), "
+                "falling back to in-place .add_() when reduced-vocab scatter, "
+                "acceptance estimator, watermarker, or logit scaling is active. "
+                "Re-check: DSparkMarkovHead weights/bias, map_draft_to_target offset "
+                "convention, and LogitsProcessor scale/soft_cap."
+            ),
+            impl=("torch_xcpu/torch_xcpu/ops_defs/dspark.py::dspark_markov_sample",),
+            tests=(
+                "torch_xcpu/test/ops/custom_ops/test_dspark_markov_sample.py",
+                "vllm-xcpu-plugin/tests/plugin_tests/test_dspark_phase2.py",
+            ),
         ),
         Patch(
             id="dspark.speculator.sp_aux_combine",

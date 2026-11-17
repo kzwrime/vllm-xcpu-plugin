@@ -44,6 +44,7 @@ from . import _source
 MANIFESTS: dict[str, str] = {
     "deepseek_v41": "vllm_xcpu_plugin.models.deepseek_v41.upstream",
     "dspark": "vllm_xcpu_plugin.models.dspark.upstream",
+    "rejection_sampler": "vllm_xcpu_plugin.models.rejection_sampler.upstream",
     "vision_conv": "vllm_xcpu_plugin.models.vision_conv.upstream",
 }
 
