@@ -9,7 +9,7 @@ only on MCPU, after the upstream contracts (``upstream.py``) are verified.
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -167,6 +167,13 @@ class _XcpuDeepseekV41LayerStack(nn.Module):
         self.__dict__["model"] = model
 
 
+class SpShardedAuxHiddenStates(NamedTuple):
+    """Packed SP-sharded target aux hidden states handed to DSpark."""
+
+    packed_shard: torch.Tensor
+    full_num_tokens: int
+
+
 @support_torch_compile
 class _XcpuDeepseekV41SourceLayers(_XcpuDeepseekV41LayerStack):
     """Layers up to the last KV source; they always see the whole batch."""
@@ -187,21 +194,52 @@ class _XcpuDeepseekV41SourceLayers(_XcpuDeepseekV41LayerStack):
         # vllm/models/deepseek_v41/nvidia/model.py::DeepseekV4Model._run_layers
         model: Any = self.model
         aux: dict[int, torch.Tensor] = {}
-        outputs = DeepseekV4Model._run_layers(
-            model,
-            model.source_layer_ids,
+        if not model._defer_dspark_aux_sp_gather:
+            outputs = DeepseekV4Model._run_layers(
+                model,
+                model.source_layer_ids,
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux,
+                engram_hashes,
+                engram_mask,
+            )
+            return (*outputs, *(aux[i] for i in model.source_aux_layer_ids()))
+
+        mega_gate_metadata = model._mega_gate_metadata(input_ids)
+        for idx in model.source_layer_ids:
+            hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
+                model.layers[idx](
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    engram_hashes,
+                    engram_mask,
+                    capture_previous_aux=idx in model.aux_hidden_state_layers,
+                    mega_gate_metadata=mega_gate_metadata,
+                )
+            )
+            if previous_aux is not None:
+                aux[idx] = previous_aux
+        assert residual is not None and post_mix is not None
+        assert res_mix is not None and pre_mix is not None
+        return (
             hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
+            residual,
             post_mix,
             res_mix,
-            residual,
-            aux,
-            engram_hashes,
-            engram_mask,
+            pre_mix,
+            *(aux[i] for i in model.source_aux_layer_ids()),
         )
-        return (*outputs, *(aux[i] for i in model.source_aux_layer_ids()))
 
 
 @support_torch_compile
@@ -238,6 +276,18 @@ class XcpuDeepseekV41Model(DeepseekV4Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        spec_config = vllm_config.speculative_config
+        parallel_config = vllm_config.parallel_config
+        self._pack_dspark_aux: bool = (
+            spec_config is not None
+            and spec_config.method == "dspark"
+            and parallel_config.pipeline_parallel_size <= 1
+            and parallel_config.prefill_context_parallel_size <= 1
+        )
+        self._defer_dspark_aux_sp_gather: bool = (
+            self._pack_dspark_aux and self.use_sequence_parallel
+        )
+        self._packed_aux_buf: torch.Tensor | None = None
         self.source_layer_ids = range(self.start_layer, self.decoder_replay_start)
         self.source_layers = _XcpuDeepseekV41SourceLayers(
             vllm_config=vllm_config, prefix=f"{prefix}.source_layers", model=self
@@ -316,6 +366,79 @@ class XcpuDeepseekV41Model(DeepseekV4Model):
     def _run_replay_layers(self, *inputs: torch.Tensor | None):
         assert self.replay_layers is not None
         return self.replay_layers(*inputs)
+
+    def _collapse(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        full_num_tokens: int,
+    ) -> torch.Tensor:
+        if not self._defer_dspark_aux_sp_gather:
+            return super()._collapse(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                aux_hidden_by_layer,
+                full_num_tokens,
+            )
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        assert isinstance(hidden_states, torch.Tensor)
+        if self.fuse_mhc_all_reduce:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = nv_model.mhc_post_tilelang(
+            hidden_states, residual, post_mix, res_mix
+        )
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_by_layer[self.end_layer] = hidden_states.mean(dim=1)
+        return hidden_states
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Any,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> Any:
+        out: Any = super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            lookback_token_ids=lookback_token_ids,
+        )
+        if not self._pack_dspark_aux or not isinstance(out, tuple):
+            return out
+        hidden_states, aux_list = out
+        if not aux_list:
+            return out
+        n_rows = aux_list[0].shape[0]
+        total_dim = sum(t.shape[-1] for t in aux_list)
+        if (
+            self._packed_aux_buf is None
+            or self._packed_aux_buf.shape[0] < n_rows
+            or self._packed_aux_buf.shape[1] != total_dim
+            or self._packed_aux_buf.dtype != aux_list[0].dtype
+            or self._packed_aux_buf.device != aux_list[0].device
+        ):
+            self._packed_aux_buf = torch.empty(
+                (n_rows, total_dim),
+                dtype=aux_list[0].dtype,
+                device=aux_list[0].device,
+            )
+        packed = self._packed_aux_buf[:n_rows]
+        torch.cat(aux_list, dim=-1, out=packed)
+        if self._defer_dspark_aux_sp_gather:
+            return hidden_states, SpShardedAuxHiddenStates(
+                packed_shard=packed,
+                full_num_tokens=hidden_states.shape[0],
+            )
+        return hidden_states, packed
 
 
 class XcpuDSparkDeepseekV41Model(DSparkDeepseekV4Model):

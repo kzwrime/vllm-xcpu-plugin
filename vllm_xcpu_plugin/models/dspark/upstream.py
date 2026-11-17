@@ -126,5 +126,34 @@ MANIFEST = Manifest(
             ),
             tests=("vllm-xcpu-plugin/tests/plugin_tests/test_dspark_phase1.py",),
         ),
+        Patch(
+            id="dspark.speculator.sp_aux_combine",
+            source=_V031,
+            downstream=(
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._combine_target_hidden_states",
+            ),
+            upstream=(
+                UpstreamRef(
+                    target="vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator._combine_target_hidden_states",
+                    source_hash="2e27edda0efb6b4eb4e3b9570d763d671fb29753bbb80bb877a6954fb99d9386",
+                    signature_hash="a0e93e80d01bd837f3069ee7939ac87c6d37f16e9e5335a18060a812e34dc58d",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.combine_hidden_states",
+                    source_hash="717f5792ab3b82f953159a3ecb8880f2fcf9b5bb3d0a13e801b1613349e35433",
+                    signature_hash="331c951c98976528ab552b056abf24f28b117d36ef4ead37aa37fed6befb58b9",
+                ),
+            ),
+            contract=(
+                "When target DeepSeek-V4.1 returns "
+                "SpShardedAuxHiddenStates(packed_shard, full_num_tokens), "
+                "XcpuDSparkSpeculator._combine_target_hidden_states runs "
+                "self.model.combine_hidden_states (main_proj + main_norm) on the "
+                "TP shard before performing one all_gather_into_tensor_out_v2 into "
+                "a dedicated _sp_gather_buf (never self.hidden_states). Re-check: "
+                "combine_hidden_states elementwise assumptions under SP."
+            ),
+            tests=("vllm-xcpu-plugin/tests/plugin_tests/test_dspark_sp_aux.py",),
+        ),
     ),
 )

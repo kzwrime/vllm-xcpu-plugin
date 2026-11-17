@@ -402,10 +402,13 @@ MANIFEST = Manifest(
             id="deepseek_v41.model.compiled_layer_stacks",
             source=_V031,
             downstream=(
+                "vllm_xcpu_plugin.models.deepseek_v41.model:SpShardedAuxHiddenStates",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model.__init__",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model.source_aux_layer_ids",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model._run_layers",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model._run_replay_layers",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model._collapse",
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41Model.forward",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:_XcpuDeepseekV41LayerStack.__init__",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:_XcpuDeepseekV41SourceLayers.forward",
                 "vllm_xcpu_plugin.models.deepseek_v41.model:_XcpuDeepseekV41ReplayLayers.forward",
@@ -440,24 +443,37 @@ MANIFEST = Manifest(
                     source_hash="6cf6ec982fb01383048c40012b92d413c353e73886e69f9113fb000a337bbaaa",
                     signature_hash="71a4c3fa1de65d26d5c270c8183ba40181c1f5b3d0f75bd701be1dd6cb425232",
                 ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model._collapse",
+                    source_hash="683aac3775fc3698c444d9ed7dd5cb036e451ace1e7238b5b824951fcd8b6606",
+                    signature_hash="a7e1bff9c30125f9179e26cbc59842cf536015eee811420088379c0986423500",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model._mega_gate_metadata",
+                    source_hash="1cc3ed4de487400425807b4a7b73a5204f956c8c36a178cc1c91d49b56adc638",
+                    signature_hash="a98c0095fa23c28d249e965a743757e6e7bfcde6f46a0c0a2b6ab87395c1e818",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.kernels.mhc.tilelang:mhc_post_tilelang",
+                    source_hash="8397404ba0eb458583e1bab6a6441d9f18338496eb5d1c6e7e8e719d552a6d66",
+                    signature_hash="dad6f030863ab2aee59dfce3eec27ae4a97b40a69caf0f8d6e92c3f78526ab2c",
+                ),
             ),
             contract=(
-                "DeepseekV4Model.forward stays eager (engram hashing, decoder "
-                "replay sub-batch, SP sharding); only the decoder layers are "
-                "traced, as two graphs: layers [start_layer, "
-                "decoder_replay_start) and the replay layers + collapse. Relies "
-                "on _run_layers(layer_ids, hidden, positions, input_ids, pre_mix,"
-                " post_mix, res_mix, residual, aux_hidden_by_layer, "
-                "engram_hashes, engram_mask) returning 5 tensors and filling "
-                "aux_hidden_by_layer with each layer's own post (not the first "
-                "layer's), and on _run_replay_layers(*inputs). Profile/warmup "
-                "runs get dead engram hashes so the engram branch stays in the "
-                "graph. Re-check: argument lists, return arity, aux capture rule,"
-                " attributes set in __init__ (start_layer, decoder_replay_start, "
-                "aux_hidden_state_layers, engram_hash), new eager-only branches "
-                "inside _run_layers."
+                "DeepseekV4Model.forward stays eager for engram hashing, decoder "
+                "replay sub-batch, and SP sharding, while packing aux hidden "
+                "states into a preallocated buffer for DSpark (and deferring SP "
+                "all-gather across aux layers into SpShardedAuxHiddenStates when "
+                "use_sequence_parallel and PP=PCP=1). The decoder layers are "
+                "traced as two graphs: layers [start_layer, decoder_replay_start) "
+                "and replay layers + collapse. Relies on _run_layers(..., "
+                "aux_hidden_by_layer, ...) returning 5 tensors, _collapse(...), "
+                "_mega_gate_metadata, mhc_post_tilelang, and _run_replay_layers. "
+                "Re-check: argument lists, return arity, aux capture rule, "
+                "attributes set in __init__, new eager-only branches in _run_layers."
             ),
             tests=(
+                "vllm-xcpu-plugin/tests/plugin_tests/test_dspark_sp_aux.py",
                 "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
                 "docs/upgrade/12-dsv41-dp2tp2-ep.md (SP, DP-sharded engram)",
             ),
