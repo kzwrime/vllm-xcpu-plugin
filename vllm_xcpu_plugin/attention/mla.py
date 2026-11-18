@@ -2,6 +2,7 @@
 """Sparse-only MLA projections behind the v0.31 pluggable wrapper."""
 
 import os
+from dataclasses import replace
 
 import torch
 from vllm.forward_context import get_forward_context
@@ -18,9 +19,18 @@ class XcpuMLAAttention(MLAAttention):
         # keeps the separate forward_mqa + einsum path for debugging.
         self._fuse_vproj = os.getenv("VLLM_XCPU_FUSED_MLA_VPROJ", "1") != "0"
 
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.kv_cache_dtype == "int8_ds_mla" and spec.state_content_bytes is None:
+            spec = replace(spec, state_content_bytes=656)
+        return spec
+
     def _forward_mqa_vproj(self, q, kv_cache, metadata, output):
         # output: [tokens, heads, v_head_dim] rows.
-        if self._fuse_vproj and self.impl.kv_cache_dtype == "fp8_ds_mla":
+        if self._fuse_vproj and self.impl.kv_cache_dtype in (
+            "fp8_ds_mla",
+            "int8_ds_mla",
+        ):
             self.impl.forward_mqa_vproj(q, kv_cache, metadata, self, output)
             return
         import torch_xcpu

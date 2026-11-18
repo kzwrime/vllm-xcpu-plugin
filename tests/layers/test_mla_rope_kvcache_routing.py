@@ -30,8 +30,10 @@ def make_layer(cache_dtype, tokens):
     layer.layer_name = "test.attn"
     layer.kv_cache_dtype = cache_dtype
     layer.kv_cache = torch.zeros(
-        (1, 64, 656 if cache_dtype == "fp8_ds_mla" else 576),
-        dtype=torch.uint8 if cache_dtype == "fp8_ds_mla" else torch.bfloat16,
+        (1, 64, 656 if cache_dtype in ("fp8_ds_mla", "int8_ds_mla") else 576),
+        dtype=torch.uint8
+        if cache_dtype in ("fp8_ds_mla", "int8_ds_mla")
+        else torch.bfloat16,
         device="mcpu",
     )
     layer._k_scale = torch.ones(1, device="mcpu")
@@ -60,7 +62,7 @@ def make_layer(cache_dtype, tokens):
 
 @pytest.mark.parametrize("fuse_vproj", [False, True])
 @pytest.mark.parametrize("has_prefill", [True, False])
-@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla", "int8_ds_mla"])
 @pytest.mark.parametrize("tokens", [1, 7])
 def test_fused_sparse_mla_matches_separate_cache_and_projection(
     monkeypatch, cache_dtype, tokens, has_prefill, fuse_vproj
@@ -88,8 +90,10 @@ def test_fused_sparse_mla_matches_separate_cache_and_projection(
         seq_lens=torch.tensor([tokens], dtype=torch.int32, device="mcpu"),
         block_table=torch.zeros((1, 1), dtype=torch.int32, device="mcpu"),
     )
-    if cache_dtype == "fp8_ds_mla":
-        metadata.xcpu_backend = torch_xcpu.ops.SparseMlaFp8(8)
+    if cache_dtype in ("fp8_ds_mla", "int8_ds_mla"):
+        metadata.xcpu_backend = torch_xcpu.ops.SparseMlaFp8(
+            8, kv_cache_dtype=cache_dtype
+        )
         metadata.xcpu_schedule = metadata.xcpu_backend.build_metadata(
             starts,
             tokens,
@@ -130,7 +134,36 @@ def test_fused_sparse_mla_matches_separate_cache_and_projection(
 
 def test_fp8_cache_format_is_scoped_to_xcpu_backend():
     from vllm.v1.attention.backend import AttentionBackend
+    from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
 
     assert XcpuMLASparseBackend.canonicalize_kv_cache_dtype("fp8") == "fp8_ds_mla"
+    assert XcpuMLASparseBackend.canonicalize_kv_cache_dtype("int8") == "int8_ds_mla"
     assert AttentionBackend.canonicalize_kv_cache_dtype("fp8") == "fp8"
+    assert AttentionBackend.canonicalize_kv_cache_dtype("int8") == "int8"
     assert XcpuMLASparseBackend.canonicalize_kv_cache_dtype("auto") == "auto"
+
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="int8_ds_mla",
+        kv_quant_mode=KVQuantMode.INT8_DS_MLA,
+    )
+    customized = XcpuMLASparseBackend.customize_spec(spec)
+    assert customized.state_content_bytes == 656
+    assert customized.state_content_size_bytes == 656
+
+    layer = XcpuMLAAttention.__new__(XcpuMLAAttention)
+    layer.head_size = 576
+    layer.kv_cache_dtype = "int8_ds_mla"
+    layer.sliding_window = None
+    layer.indexer = object()
+    layer.non_causal_multi_token_decode = False
+    layer.attn_backend = XcpuMLASparseBackend
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    assert layer.get_kv_cache_spec(cfg).state_content_size_bytes == 656

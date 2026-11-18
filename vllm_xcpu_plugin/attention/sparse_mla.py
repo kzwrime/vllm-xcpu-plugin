@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """XCPU sparse MLA using v0.31 cache specs and metadata ownership."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -22,6 +22,9 @@ from vllm.v1.attention.backend import (
 class XcpuMLASparseMetadata(SparseMLACommonMetadata):
     xcpu_backend: Any = None
     xcpu_schedule: Any = None
+
+
+_DS_MLA_KV_CACHE_DTYPES = ("fp8_ds_mla", "int8_ds_mla")
 
 
 def _xcpu_do_kv_cache_update(
@@ -80,11 +83,11 @@ def _xcpu_forward_mqa(
         assert self.topk_indices_buffer is not None
         logical_topk = self.topk_indices_buffer[: query.shape[0]]
 
-    if self.kv_cache_dtype == "fp8_ds_mla":
+    if self.kv_cache_dtype in _DS_MLA_KV_CACHE_DTYPES:
         backend = attn_metadata.xcpu_backend
         if backend is None or attn_metadata.xcpu_schedule is None:
             raise RuntimeError(
-                "FP8 sparse MLA metadata must be built before layer execution"
+                "DS MLA sparse metadata must be built before layer execution"
             )
         backend.run(
             query,
@@ -97,6 +100,7 @@ def _xcpu_forward_mqa(
             attn_metadata.xcpu_schedule,
             max_query_len=attn_metadata.max_query_len,
             max_seq_len=attn_metadata.max_seq_len,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
     else:
         import torch_xcpu
@@ -135,13 +139,13 @@ def _xcpu_forward_mqa_vproj(
     output is [tokens, heads, v_head_dim] rows. Decode steps issue a single
     launch; other steps keep separate attention and projection launches.
     """
-    assert self.kv_cache_dtype == "fp8_ds_mla"
+    assert self.kv_cache_dtype in _DS_MLA_KV_CACHE_DTYPES
     if isinstance(q, tuple):
         q = torch.cat(q, dim=-1)
     backend = attn_metadata.xcpu_backend
     if backend is None or attn_metadata.xcpu_schedule is None:
         raise RuntimeError(
-            "FP8 sparse MLA metadata must be built before layer execution"
+            "DS MLA sparse metadata must be built before layer execution"
         )
     logical_topk = None
     if self.is_sparse:
@@ -159,6 +163,7 @@ def _xcpu_forward_mqa_vproj(
         attn_metadata.xcpu_schedule,
         max_query_len=attn_metadata.max_query_len,
         max_seq_len=attn_metadata.max_seq_len,
+        kv_cache_dtype=self.kv_cache_dtype,
     )
 
 
@@ -187,11 +192,33 @@ def validate_sparse_config(config):
 
 class XcpuMLASparseBackend(AttentionBackend):
     supported_dtypes = [torch.bfloat16]
-    supported_kv_cache_dtypes = ["auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    supported_kv_cache_dtypes = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+        "int8",
+        "int8_ds_mla",
+    ]
 
     @classmethod
     def canonicalize_kv_cache_dtype(cls, kv_cache_dtype):
-        return "fp8_ds_mla" if kv_cache_dtype in ("fp8", "fp8_e4m3") else kv_cache_dtype
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            return "fp8_ds_mla"
+        if kv_cache_dtype == "int8":
+            return "int8_ds_mla"
+        return kv_cache_dtype
+
+    @classmethod
+    def customize_spec(cls, spec):
+        spec = super().customize_spec(spec)
+        if (
+            getattr(spec, "cache_dtype_str", None) == "int8_ds_mla"
+            and spec.state_content_bytes is None
+        ):
+            return replace(spec, state_content_bytes=656)
+        return spec
 
     @staticmethod
     def get_name():
@@ -232,13 +259,15 @@ class XcpuMLASparseMetadataBuilder(SparseMLACommonMetadataBuilder):
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
         self.supports_draft_decode_metadata_update = False
         self._xcpu_backend = None
-        if vllm_config.cache_config.cache_dtype == "fp8_ds_mla":
+        if vllm_config.cache_config.cache_dtype in _DS_MLA_KV_CACHE_DTYPES:
             import torch_xcpu
 
             heads = self.model_config.get_num_attention_heads(
                 vllm_config.parallel_config
             )
-            self._xcpu_backend = torch_xcpu.ops.SparseMlaFp8(heads)
+            self._xcpu_backend = torch_xcpu.ops.SparseMlaFp8(
+                heads, kv_cache_dtype=vllm_config.cache_config.cache_dtype
+            )
             self._xcpu_buffers = self._xcpu_backend.allocate_metadata(
                 vllm_config.scheduler_config.max_num_batched_tokens, device
             )
@@ -287,7 +316,12 @@ class XcpuMLASparseImpl(SparseMLACommonImpl):
             raise NotImplementedError(
                 "XCPU sparse MLA supports ordinary causal attention only"
             )
-        if kwargs["kv_cache_dtype"] not in ("auto", "bfloat16", "fp8_ds_mla"):
+        if kwargs["kv_cache_dtype"] not in (
+            "auto",
+            "bfloat16",
+            "fp8_ds_mla",
+            "int8_ds_mla",
+        ):
             raise NotImplementedError("Unsupported XCPU MLA cache dtype")
         if (
             kwargs["kv_lora_rank"],

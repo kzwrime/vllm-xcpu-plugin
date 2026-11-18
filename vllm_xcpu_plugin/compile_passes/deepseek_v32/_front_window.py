@@ -258,6 +258,8 @@ class WindowMatch:
 
 def match_window(graph, cache_af: Node) -> WindowMatch:
     """Match the core window rooted at ``cache_af`` (raises _Skip)."""
+    if cache_af.kwargs.get("quant_mode", 0) != 0:
+        raise _Skip("front-window fusion only supports FP8 DS MLA cache")
     kv_norm_af = cache_af.kwargs["key"]
     if not (isinstance(kv_norm_af, Node) and _is_getitem(kv_norm_af)):
         raise _Skip("cache-write key is not an auto_functionalized result")
@@ -272,8 +274,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     q_norm_afs = [
         n
         for n in graph.nodes
-        if _is_af_of(n, _RMS_NORM)
-        and _roots_at(n.kwargs.get("input"), {qkv_base})
+        if _is_af_of(n, _RMS_NORM) and _roots_at(n.kwargs.get("input"), {qkv_base})
     ]
     if len(q_norm_afs) != 2:
         raise _Skip(f"expected 2 qkv rms_norms, found {len(q_norm_afs)}")
@@ -282,11 +283,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     q_norm_af = next(n for n in q_norm_afs if n is not kv_norm_af)
     idx_rms_out = _af_indices(_RMS_NORM)["out"]
     q_norm_out = next(
-        (
-            u
-            for u in q_norm_af.users
-            if _is_getitem(u) and u.args[1] == idx_rms_out
-        ),
+        (u for u in q_norm_af.users if _is_getitem(u) and u.args[1] == idx_rms_out),
         None,
     )
     if q_norm_out is None:
@@ -313,11 +310,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
             continue
         idx_mm_out = _af_indices(_FP8_MM)["out"]
         cand_out = next(
-            (
-                u
-                for u in n.users
-                if _is_getitem(u) and u.args[1] == idx_mm_out
-            ),
+            (u for u in n.users if _is_getitem(u) and u.args[1] == idx_mm_out),
             None,
         )
         if cand_out is None:
@@ -346,9 +339,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     einsum_af = einsum_afs[0]
     idx_einsum_out = _af_indices(_EINSUM)["output"]
     einsum_out = next(
-        u
-        for u in einsum_af.users
-        if _is_getitem(u) and u.args[1] == idx_einsum_out
+        u for u in einsum_af.users if _is_getitem(u) and u.args[1] == idx_einsum_out
     )
 
     rotary_afs = [
@@ -425,9 +416,7 @@ def close_region(graph, seeds: list[Node]) -> set[Node]:
                 continue
             if _is_getitem(a):
                 base = a.args[0]
-                if isinstance(base, Node) and (
-                    base in region or base.target != _AF
-                ):
+                if isinstance(base, Node) and (base in region or base.target != _AF):
                     work.append(a)
             elif a.target in _TRANSPARENT or a.target.namespace == "aten":
                 work.append(a)
@@ -437,9 +426,7 @@ def close_region(graph, seeds: list[Node]) -> set[Node]:
     return region
 
 
-def ensure_no_escape(
-    region: set[Node], redirects: Mapping[Node, Node | None]
-) -> None:
+def ensure_no_escape(region: set[Node], redirects: Mapping[Node, Node | None]) -> None:
     """Redirect reachable set: the producers plus their transparent fan-out
     inside the region; only those may have consumers outside the region."""
     reach = set(redirects)
@@ -509,6 +496,5 @@ def rebase_and_erase(
                 progress = True
     if region:
         raise RuntimeError(
-            "deepseek_v32 pass could not erase "
-            f"{[str(d.target) for d in region]}"
+            f"deepseek_v32 pass could not erase {[str(d.target) for d in region]}"
         )
