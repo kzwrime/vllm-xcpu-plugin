@@ -18,7 +18,10 @@ from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 
 from vllm_xcpu_plugin import sampler_patch
-from vllm_xcpu_plugin.models.dspark.speculator import XcpuDSparkSpeculator
+from vllm_xcpu_plugin.models.dspark.speculator import (
+    XcpuDSparkSpeculator,
+    _quantize_ue8m0_block32,
+)
 from vllm_xcpu_plugin.models.rejection_sampler import patch as rej_patch_mod
 from vllm_xcpu_plugin.models.rejection_sampler.patch import (
     _xcpu_rejection_sampler_verify,
@@ -38,7 +41,7 @@ def _make_fake_speculator(
     pack_backend: Bf16LinearBackend | None = Bf16LinearBackend.INTEL_AMX,
 ) -> tuple[XcpuDSparkSpeculator, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     torch.manual_seed(31)
-    hidden_size = 32
+    hidden_size = max(rank, 32)
     base_logits_3d = (
         torch.randn((num_reqs, n_spec, draft_vocab), dtype=torch.bfloat16) * 0.5
     ).to("mcpu")
@@ -69,6 +72,7 @@ def _make_fake_speculator(
     spec.max_num_reqs = max(num_reqs + 2, 8)
     spec.max_num_tokens = spec.max_num_reqs * n_spec
     spec._draft_topk = None
+    spec.acceptance_estimator = None
     spec.use_acceptance_estimator = False
     spec.draft_watermarker = None
     spec.use_fp64_gumbel = True
@@ -84,6 +88,7 @@ def _make_fake_speculator(
     )
     spec._sp_gather_buf = None
     spec._confidence_markov_embeds = None
+    spec._quant_markov_cache = None
     spec._step_cols = torch.arange(n_spec, dtype=torch.int32, device="mcpu")
     spec._anchor_idx = (
         torch.arange(spec.max_num_reqs, dtype=torch.int64, device="mcpu") * n_spec
@@ -228,6 +233,215 @@ def test_speculator_sample_sequential_fused_and_fallback(
                 rtol=0,
                 atol=0,
             )
+
+
+def _quant_blockwise_bias_bf16(
+    emb: torch.Tensor, q_row: torch.Tensor, scale_u8: torch.Tensor
+) -> torch.Tensor:
+    b, k = emb.shape
+    n = q_row.shape[0]
+    s_i32 = scale_u8.detach().to(device="cpu", dtype=torch.int32)
+    scale_f = torch.ldexp(torch.ones_like(s_i32, dtype=torch.float32), s_i32 - 127)
+    emb_b = emb.detach().cpu().float().view(b, k // 32, 32)
+    q_b = (
+        q_row.detach()
+        .cpu()
+        .float()
+        .view(n // 32, 32, k // 32, 32)
+        .permute(2, 0, 1, 3)
+    )
+    dot = torch.einsum("bkd,kncd->bknc", emb_b, q_b)
+    acc = (dot * scale_f.T[None, :, :, None]).sum(dim=1).reshape(b, n)
+    return acc.bfloat16().to(emb.device)
+
+
+@pytest.mark.parametrize("markov_dtype", ["fp8", "int8"])
+@pytest.mark.parametrize(
+    "pack_backend",
+    [Bf16LinearBackend.INTEL_AMX, Bf16LinearBackend.PORTABLE, None],
+)
+@pytest.mark.parametrize("probabilistic", [False, True])
+@pytest.mark.parametrize("rank,draft_vocab", [(32, 64), (256, 256)])
+def test_speculator_sample_sequential_quant_dtype(
+    monkeypatch,
+    markov_dtype: str,
+    pack_backend: Bf16LinearBackend | None,
+    probabilistic: bool,
+    rank: int,
+    draft_vocab: int,
+) -> None:
+    import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
+
+    monkeypatch.setattr(gumbel_module, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(sampler_patch, "_GUMBEL_SAMPLE_PATCHED", False)
+    monkeypatch.setenv("VLLM_USE_XCPU_GUMBEL_SAMPLE", "1")
+    monkeypatch.setenv("VLLM_XCPU_DSPARK_MARKOV_DTYPE", markov_dtype)
+    sampler_patch.maybe_patch_vllm_gumbel_sample()
+
+    use_d2t = not probabilistic
+    vocab_size = max(128, draft_vocab + 16)
+    spec_q, head_hidden, _, w2 = _make_fake_speculator(
+        vocab_size=vocab_size,
+        draft_vocab=draft_vocab,
+        rank=rank,
+        probabilistic=probabilistic,
+        use_d2t=use_d2t,
+        use_confidence_head=True,
+        pack_backend=pack_backend,
+    )
+    spec_ref, head_hidden_ref, _, w2_ref = _make_fake_speculator(
+        vocab_size=vocab_size,
+        draft_vocab=draft_vocab,
+        rank=rank,
+        probabilistic=probabilistic,
+        use_d2t=use_d2t,
+        use_confidence_head=True,
+        pack_backend=None,
+    )
+    q_row, scale_u8 = _quantize_ue8m0_block32(w2_ref, markov_dtype)
+    spec_ref.use_acceptance_estimator = True
+    spec_ref._maybe_predict_acceptance = lambda *_a, **_k: None
+    spec_ref.model.markov_bias = lambda emb: _quant_blockwise_bias_bf16(
+        emb, q_row, scale_u8
+    )
+
+    prepared = spec_q._maybe_prepare_quant_markov_w2(markov_dtype)
+    assert prepared is not None
+    w2_packed, _, layout = prepared
+    expected_layout = (
+        1
+        if pack_backend == Bf16LinearBackend.INTEL_AMX
+        else (2 if pack_backend == Bf16LinearBackend.PORTABLE else 0)
+    )
+    assert layout == expected_layout
+    expected_dtype = torch.float8_e4m3fn if markov_dtype == "fp8" else torch.int8
+    assert w2_packed.dtype == expected_dtype
+    if pack_backend is not None:
+        assert spec_q.model.model.markov_head.markov_w2._xcpu_bf16_linear is None
+
+    calls: list[str] = []
+    op_name = (
+        "dspark_markov_sample_fp8"
+        if markov_dtype == "fp8"
+        else "dspark_markov_sample_int8"
+    )
+    orig_op = getattr(xcpu_ops, op_name)
+
+    def _spy(*args, **kwargs):
+        calls.append(op_name)
+        return orig_op(*args, **kwargs)
+
+    monkeypatch.setattr(xcpu_ops, op_name, _spy)
+
+    spec_q._sample_sequential(3, head_hidden)
+    assert calls == [op_name]
+
+    spec_ref._sample_sequential(3, head_hidden_ref)
+    torch.testing.assert_close(
+        spec_q.draft_tokens[:3].cpu(),
+        spec_ref.draft_tokens[:3].cpu(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spec_q.draft_token_confidence_probs[:3].cpu(),
+        spec_ref.draft_token_confidence_probs[:3].cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    if probabilistic:
+        assert spec_q.draft_logits is not None and spec_ref.draft_logits is not None
+        torch.testing.assert_close(
+            spec_q.draft_logits[:3].cpu(),
+            spec_ref.draft_logits[:3].cpu(),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("probabilistic", [False, True])
+def test_speculator_markov_fused_disabled_manual_fallback(
+    monkeypatch, probabilistic: bool
+) -> None:
+    import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    monkeypatch.setattr(gumbel_module, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(sampler_patch, "_GUMBEL_SAMPLE_PATCHED", False)
+    monkeypatch.setenv("VLLM_USE_XCPU_GUMBEL_SAMPLE", "1")
+    sampler_patch.maybe_patch_vllm_gumbel_sample()
+
+    monkeypatch.setenv("VLLM_XCPU_DSPARK_MARKOV_FUSED", "0")
+    monkeypatch.setenv("VLLM_XCPU_DSPARK_MARKOV_DTYPE", "fp8")
+
+    spec, head_hidden, _, _ = _make_fake_speculator(
+        probabilistic=probabilistic,
+        use_d2t=not probabilistic,
+        use_confidence_head=True,
+        pack_backend=Bf16LinearBackend.INTEL_AMX,
+    )
+    spec_ref, head_hidden_ref, _, _ = _make_fake_speculator(
+        probabilistic=probabilistic,
+        use_d2t=not probabilistic,
+        use_confidence_head=True,
+        pack_backend=None,
+    )
+    spec_ref.use_acceptance_estimator = True
+    spec_ref._maybe_predict_acceptance = lambda *_a, **_k: None
+
+    # load_draft_model must NOT quantize or clear _xcpu_bf16_linear when unfused.
+    monkeypatch.setattr(
+        DSparkSpeculator,
+        "load_draft_model",
+        lambda self, *_a, **_k: self.model,
+    )
+    spec.load_draft_model(torch.nn.Identity(), set())
+    assert spec._quant_markov_cache is None
+    assert spec.model.model.markov_head.markov_w2._xcpu_bf16_linear is not None
+
+    fused_calls: list[str] = []
+    for name in (
+        "dspark_markov_sample",
+        "dspark_markov_sample_fp8",
+        "dspark_markov_sample_int8",
+    ):
+        monkeypatch.setattr(
+            xcpu_ops,
+            name,
+            lambda *_a, _name=name, **_k: fused_calls.append(_name),
+        )
+
+    spec._sample_sequential(3, head_hidden)
+    assert fused_calls == []
+
+    spec_ref._sample_sequential(3, head_hidden_ref)
+    torch.testing.assert_close(
+        spec.draft_tokens[:3].cpu(),
+        spec_ref.draft_tokens[:3].cpu(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spec.draft_token_confidence_probs[:3].cpu(),
+        spec_ref.draft_token_confidence_probs[:3].cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    if probabilistic:
+        assert spec.draft_logits is not None and spec_ref.draft_logits is not None
+        torch.testing.assert_close(
+            spec.draft_logits[:3].cpu(),
+            spec_ref.draft_logits[:3].cpu(),
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_speculator_markov_fused_invalid_env_raises(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_XCPU_DSPARK_MARKOV_FUSED", "invalid")
+    spec, head_hidden, _, _ = _make_fake_speculator(pack_backend=None)
+    with pytest.raises(ValueError, match="VLLM_XCPU_DSPARK_MARKOV_FUSED"):
+        spec._sample_sequential(3, head_hidden)
 
 
 def _build_fake_sampler(vocab_size: int = 256, max_reqs: int = 8):

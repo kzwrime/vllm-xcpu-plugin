@@ -143,6 +143,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_DUMP_POST_GRAD_GRAPH": lambda: os.getenv(
         "VLLM_XCPU_DUMP_POST_GRAD_GRAPH", ""
     ),
+    # Enable fused sequential Markov sampling in XcpuDSparkSpeculator (default 1).
+    # Set to 0 (or false/off/no) to manually fall back to the unfused loop.
+    "VLLM_XCPU_DSPARK_MARKOV_FUSED": lambda: (
+        os.getenv("VLLM_XCPU_DSPARK_MARKOV_FUSED", "1").strip().lower()
+        in ("1", "true", "on", "yes")
+    ),
+    # Precision mode for XcpuDSparkSpeculator fused Markov w2: bf16, fp8, int8.
+    "VLLM_XCPU_DSPARK_MARKOV_DTYPE": lambda: (
+        os.getenv("VLLM_XCPU_DSPARK_MARKOV_DTYPE", "bf16").strip().lower()
+    ),
 }
 
 # end-env-vars-definition

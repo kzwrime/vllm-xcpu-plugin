@@ -137,6 +137,8 @@ MANIFEST = Manifest(
             downstream=(
                 "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator.__init__",
                 "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator.load_draft_model",
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._maybe_prepare_quant_markov_w2",
+                "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._resolve_quant_markov_weights",
                 "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._resolve_fused_markov_weights",
                 "vllm_xcpu_plugin.models.dspark.speculator:XcpuDSparkSpeculator._sample_sequential",
             ),
@@ -207,14 +209,23 @@ MANIFEST = Manifest(
                 "Markov embedding lookup, w2 linear bias, base_logits addition, "
                 "greedy argmax / probabilistic Gumbel sampling, draft_logits cache "
                 "write, and optional d2t offset mapping into "
-                "torch_xcpu.ops.dspark_markov_sample (accepting INTEL_AMX packed "
-                "layout 1, PORTABLE/ACC packed layout 2, and row-major BF16 layout 0), "
-                "falling back to in-place .add_() when reduced-vocab scatter, "
-                "acceptance estimator, watermarker, or logit scaling is active. "
-                "Re-check: DSparkMarkovHead weights/bias, map_draft_to_target offset "
+                "torch_xcpu.ops.dspark_markov_sample (BF16) or, when "
+                "VLLM_XCPU_DSPARK_MARKOV_DTYPE selects fp8/int8, load-time [32, 32] "
+                "OCP UE8M0 quantized + prepacked weights routed to "
+                "torch_xcpu.ops.dspark_markov_sample_{fp8,int8} (releasing redundant "
+                "_xcpu_bf16_linear packed weights, accepting INTEL_AMX layout 1, "
+                "PORTABLE/ACC layout 2, and row-major layout 0), falling back to "
+                "in-place .add_() when VLLM_XCPU_DSPARK_MARKOV_FUSED=0 or when "
+                "reduced-vocab scatter, acceptance estimator, watermarker, or "
+                "logit scaling is active. Re-check: "
+                "DSparkMarkovHead weights/bias, map_draft_to_target offset "
                 "convention, and LogitsProcessor scale/soft_cap."
             ),
-            impl=("torch_xcpu/torch_xcpu/ops_defs/dspark.py::dspark_markov_sample",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops_defs/dspark.py::dspark_markov_sample",
+                "torch_xcpu/torch_xcpu/ops_defs/dspark.py::dspark_markov_sample_fp8",
+                "torch_xcpu/torch_xcpu/ops_defs/dspark.py::dspark_markov_sample_int8",
+            ),
             tests=(
                 "torch_xcpu/test/ops/custom_ops/test_dspark_markov_sample.py",
                 "vllm-xcpu-plugin/tests/plugin_tests/test_dspark_phase2.py",

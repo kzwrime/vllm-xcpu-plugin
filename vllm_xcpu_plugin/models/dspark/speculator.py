@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """XCPU overrides for the generic DSpark speculator."""
 
+import os
 from typing import Any
 
 import torch
@@ -19,6 +20,99 @@ from vllm_xcpu_plugin.upstream_contracts import rebind
 
 _INSTALLED = False
 
+_MARKOV_FUSED_ENV = "VLLM_XCPU_DSPARK_MARKOV_FUSED"
+_MARKOV_DTYPE_ENV = "VLLM_XCPU_DSPARK_MARKOV_DTYPE"
+_MARKOV_DTYPE_ALIASES = {
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "fp8_e4m3": "fp8",
+    "fp8_e4m3fn": "fp8",
+    "fp8_ue8m0": "fp8",
+    "int8": "int8",
+    "int8_ue8m0": "int8",
+}
+
+
+def _dspark_markov_fused_enabled() -> bool:
+    raw = os.environ.get(_MARKOV_FUSED_ENV, "1").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    raise ValueError(
+        f"Unsupported {_MARKOV_FUSED_ENV}={raw!r}; "
+        "expected one of: 1, 0, true, false, on, off, yes, no"
+    )
+
+
+def _configured_markov_dtype() -> str:
+    raw = os.environ.get(_MARKOV_DTYPE_ENV, "bf16").strip().lower()
+    mode = _MARKOV_DTYPE_ALIASES.get(raw)
+    if mode is None:
+        valid = ", ".join(sorted(_MARKOV_DTYPE_ALIASES))
+        raise ValueError(
+            f"Unsupported {_MARKOV_DTYPE_ENV}={raw!r}; expected one of: {valid}"
+        )
+    return mode
+
+
+def _quantize_ue8m0_block32(
+    weight: torch.Tensor, mode: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D [N, K] weight on CPU float32 with [32, 32] OCP UE8M0 scales."""
+    n, k = weight.shape
+    w_f32 = weight.detach().to(device="cpu", dtype=torch.float32)
+    blocks = w_f32.view(n // 32, 32, k // 32, 32).permute(0, 2, 1, 3).contiguous()
+    amax = blocks.abs().amax(dim=(-2, -1))
+    qmax = 448.0 if mode == "fp8" else 127.0
+    raw_scale = amax / qmax
+    mant, exp = torch.frexp(raw_scale)
+    ceil_exp = torch.where(mant == 0.5, exp - 1, exp)
+    s_int = torch.where(
+        raw_scale > 0.0,
+        (ceil_exp + 127).clamp(0, 254),
+        torch.zeros_like(exp),
+    )
+    inv_scale = torch.ldexp(
+        torch.ones_like(raw_scale), -(s_int.to(torch.int32) - 127)
+    )
+    scaled = blocks * inv_scale.unsqueeze(-1).unsqueeze(-1)
+    if mode == "fp8":
+        q_blocks = scaled.to(torch.float8_e4m3fn)
+    else:
+        q_blocks = torch.round(scaled).clamp(-127, 127).to(torch.int8)
+    q_row_major = q_blocks.permute(0, 2, 1, 3).contiguous().view(n, k)
+    return q_row_major, s_int.to(torch.uint8).contiguous()
+
+
+def _pack_quant_markov_w2(q_row_major: torch.Tensor, layout: int) -> torch.Tensor:
+    """Pack row-major 1-byte quantized [N, K] weights to layout 0, 1, or 2."""
+    n, k = q_row_major.shape
+    if layout == 0:
+        return q_row_major.contiguous()
+    raw = q_row_major.contiguous().view(torch.uint8)
+    if layout == 1:
+        packed = (
+            raw.view(n // 32, 32, k // 2, 2)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(n, k)
+        )
+        return packed.view(q_row_major.dtype)
+    if layout == 2:
+        packed = raw.view(n // 32, 32, k).permute(0, 2, 1).contiguous().view(n, k)
+        return packed.view(q_row_major.dtype)
+    raise ValueError(f"Unsupported weight_layout={layout}")
+
+
+def _layout_from_backend_name(backend_name: str | None) -> int:
+    if backend_name == "INTEL_AMX":
+        return 1
+    if backend_name in ("PORTABLE", "ACC"):
+        return 2
+    return 0
+
 
 class XcpuDSparkSpeculator(DSparkSpeculator):
     """XCPU DSpark speculator with fused Markov sampling, deferred SP aux gather,
@@ -29,6 +123,9 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
         self._d2t_target_ids: torch.Tensor | None = None
         self._sp_gather_buf: torch.Tensor | None = None
         self._confidence_markov_embeds: torch.Tensor | None = None
+        self._quant_markov_cache: (
+            tuple[str, torch.Tensor, torch.Tensor, int] | None
+        ) = None
 
     def load_draft_model(
         self,
@@ -44,6 +141,11 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
             ).contiguous()
         else:
             self._d2t_target_ids = None
+        self._quant_markov_cache = None
+        if _dspark_markov_fused_enabled():
+            mode = _configured_markov_dtype()
+            if mode in ("fp8", "int8"):
+                self._maybe_prepare_quant_markov_w2(mode, model)
         return model
 
     def _combine_target_hidden_states(
@@ -94,6 +196,107 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
             last_hidden_states, aux_hidden_states
         )
 
+    def _maybe_prepare_quant_markov_w2(
+        self, mode: str, model: torch.nn.Module | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        draft_model = model if model is not None else getattr(self, "model", None)
+        inner = getattr(draft_model, "model", None)
+        markov_head = getattr(inner, "markov_head", None)
+        if markov_head is None:
+            return None
+        w2_mod = getattr(markov_head, "markov_w2", None)
+        if w2_mod is None or getattr(w2_mod, "bias", None) is not None:
+            return None
+        w2 = getattr(w2_mod, "weight", None)
+        if not isinstance(w2, torch.Tensor) or w2.dim() != 2:
+            return None
+        vocab_size, rank = w2.shape
+        if vocab_size <= 0 or rank <= 0 or vocab_size % 32 != 0 or rank % 32 != 0:
+            return None
+
+        expected_dtype = torch.float8_e4m3fn if mode == "fp8" else torch.int8
+        xcpu_linear = getattr(w2_mod, "_xcpu_bf16_linear", None)
+
+        if w2.dtype == expected_dtype:
+            scale = getattr(w2_mod, "markov_w2_scale", None)
+            if scale is None:
+                scale = getattr(w2_mod, "weight_scale", None)
+            if (
+                not isinstance(scale, torch.Tensor)
+                or scale.dtype != torch.uint8
+                or tuple(scale.shape) != (vocab_size // 32, rank // 32)
+            ):
+                return None
+            if xcpu_linear is not None:
+                layout = _layout_from_backend_name(xcpu_linear.backend.name)
+            else:
+                from torch_xcpu import ops as xcpu_ops
+
+                layout = _layout_from_backend_name(
+                    xcpu_ops.configured_bf16_linear_backend().name
+                )
+            w2_packed = (
+                w2.contiguous()
+                if layout == 0
+                else _pack_quant_markov_w2(w2.detach().cpu(), layout).to(w2.device)
+            )
+            w2_scale = scale.detach().contiguous().to(w2.device)
+            self._quant_markov_cache = (mode, w2_packed, w2_scale, layout)
+            return w2_packed, w2_scale, layout
+
+        if w2.dtype != torch.bfloat16:
+            return None
+
+        layout = (
+            _layout_from_backend_name(xcpu_linear.backend.name)
+            if xcpu_linear is not None
+            else 0
+        )
+        q_row_major, scale_u8 = _quantize_ue8m0_block32(w2, mode)
+        w2_packed = _pack_quant_markov_w2(q_row_major, layout).to(w2.device)
+        w2_scale = scale_u8.to(w2.device)
+        self._quant_markov_cache = (mode, w2_packed, w2_scale, layout)
+        if hasattr(w2_mod, "_xcpu_bf16_linear"):
+            w2_mod._xcpu_bf16_linear = None
+        if hasattr(w2_mod, "_xcpu_bf16_weight_key"):
+            w2_mod._xcpu_bf16_weight_key = None
+        return w2_packed, w2_scale, layout
+
+    def _resolve_quant_markov_weights(
+        self, vocab_size: int, mode: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+        inner = getattr(self.model, "model", None)
+        markov_head = getattr(inner, "markov_head", None)
+        if markov_head is None:
+            return None
+        w1_mod = getattr(markov_head, "markov_w1", None)
+        if w1_mod is None:
+            return None
+        w1 = getattr(w1_mod, "weight", None)
+        if (
+            not isinstance(w1, torch.Tensor)
+            or w1.dim() != 2
+            or w1.dtype != torch.bfloat16
+            or not w1.is_contiguous()
+        ):
+            return None
+        rank = w1.shape[1]
+        cache = getattr(self, "_quant_markov_cache", None)
+        if cache is not None and cache[0] == mode:
+            _, w2_packed, w2_scale, layout = cache
+        else:
+            prepared = self._maybe_prepare_quant_markov_w2(mode)
+            if prepared is None:
+                return None
+            w2_packed, w2_scale, layout = prepared
+        if (
+            tuple(w2_packed.shape) != (vocab_size, rank)
+            or w2_packed.device != w1.device
+            or w2_scale.device != w1.device
+        ):
+            return None
+        return w1, w2_packed, w2_scale, layout
+
     def _resolve_fused_markov_weights(
         self, vocab_size: int
     ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
@@ -133,6 +336,22 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
             return w1, w2, 0
         return None
 
+    def _alloc_confidence_embeds(
+        self, num_sample: int, rank: int, device: torch.device
+    ) -> torch.Tensor:
+        if (
+            self._confidence_markov_embeds is None
+            or self._confidence_markov_embeds.shape[0] < num_sample
+            or self._confidence_markov_embeds.shape[1] != rank
+            or self._confidence_markov_embeds.device != device
+        ):
+            self._confidence_markov_embeds = torch.empty(
+                (max(num_sample, self.max_num_tokens), rank),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        return self._confidence_markov_embeds[:num_sample]
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -155,55 +374,81 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
         lp_ok = lp is None or (
             getattr(lp, "scale", 1.0) == 1.0 and getattr(lp, "soft_cap", None) is None
         )
+        fused_enabled = _dspark_markov_fused_enabled()
         can_use_fused = (
-            base_logits.device.type in ("mcpu", "privateuseone")
+            fused_enabled
+            and base_logits.device.type in ("mcpu", "privateuseone")
             and base_logits.dtype == torch.bfloat16
             and not self.use_acceptance_estimator
             and self.draft_watermarker is None
             and (self.draft_logits is None or self._d2t_scatter_index is None)
             and lp_ok
         )
-        resolved = (
-            self._resolve_fused_markov_weights(vocab_size) if can_use_fused else None
+        markov_dtype = _configured_markov_dtype() if can_use_fused else "bf16"
+        quant_resolved = (
+            self._resolve_quant_markov_weights(vocab_size, markov_dtype)
+            if (can_use_fused and markov_dtype in ("fp8", "int8"))
+            else None
         )
-        if resolved is not None:
+        bf16_resolved = (
+            self._resolve_fused_markov_weights(vocab_size)
+            if (can_use_fused and quant_resolved is None)
+            else None
+        )
+        if quant_resolved is not None or bf16_resolved is not None:
             from torch_xcpu import ops as xcpu_ops
 
-            w1, w2_tensor, weight_layout = resolved
             probabilistic = self.draft_logits is not None
-            markov_embeds_out: torch.Tensor | None = None
-            if self.use_confidence_head:
-                rank = w1.shape[1]
-                if (
-                    self._confidence_markov_embeds is None
-                    or self._confidence_markov_embeds.shape[0] < num_sample
-                    or self._confidence_markov_embeds.shape[1] != rank
-                    or self._confidence_markov_embeds.device != base_logits.device
-                ):
-                    self._confidence_markov_embeds = torch.empty(
-                        (max(num_sample, self.max_num_tokens), rank),
-                        dtype=torch.bfloat16,
-                        device=base_logits.device,
-                    )
-                markov_embeds_out = self._confidence_markov_embeds[:num_sample]
-
-            xcpu_ops.dspark_markov_sample(
-                self.draft_tokens[:num_reqs],
-                base_logits,
-                prev,
-                w1,
-                w2_tensor,
-                draft_logits=self.draft_logits,
-                markov_embeds_out=markov_embeds_out,
-                d2t=self._d2t_target_ids if not probabilistic else None,
-                idx_map=idx_map if probabilistic else None,
-                sample_pos=sample_pos if probabilistic else None,
-                temperature=self.temperature if probabilistic else None,
-                seeds=self.seeds if probabilistic else None,
-                weight_layout=weight_layout,
-                probabilistic=probabilistic,
-                use_fp64=self.use_fp64_gumbel,
+            rank = (
+                quant_resolved[0].shape[1]
+                if quant_resolved is not None
+                else bf16_resolved[0].shape[1]  # type: ignore[index]
             )
+            markov_embeds_out = (
+                self._alloc_confidence_embeds(num_sample, rank, base_logits.device)
+                if self.use_confidence_head
+                else None
+            )
+            common_kwargs: dict[str, Any] = {
+                "draft_logits": self.draft_logits,
+                "markov_embeds_out": markov_embeds_out,
+                "d2t": self._d2t_target_ids if not probabilistic else None,
+                "idx_map": idx_map if probabilistic else None,
+                "sample_pos": sample_pos if probabilistic else None,
+                "temperature": self.temperature if probabilistic else None,
+                "seeds": self.seeds if probabilistic else None,
+                "probabilistic": probabilistic,
+                "use_fp64": self.use_fp64_gumbel,
+            }
+            if quant_resolved is not None:
+                w1, w2_packed, w2_scale, weight_layout = quant_resolved
+                op = (
+                    xcpu_ops.dspark_markov_sample_fp8
+                    if markov_dtype == "fp8"
+                    else xcpu_ops.dspark_markov_sample_int8
+                )
+                op(
+                    self.draft_tokens[:num_reqs],
+                    base_logits,
+                    prev,
+                    w1,
+                    w2_packed,
+                    w2_scale,
+                    weight_layout=weight_layout,
+                    **common_kwargs,
+                )
+            else:
+                assert bf16_resolved is not None
+                w1, w2_tensor, weight_layout = bf16_resolved
+                xcpu_ops.dspark_markov_sample(
+                    self.draft_tokens[:num_reqs],
+                    base_logits,
+                    prev,
+                    w1,
+                    w2_tensor,
+                    weight_layout=weight_layout,
+                    **common_kwargs,
+                )
             if self.use_confidence_head:
                 assert markov_embeds_out is not None
                 confidence = self.model.compute_confidence(
