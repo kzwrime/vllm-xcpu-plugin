@@ -427,3 +427,101 @@ def test_xcpu_attention_block_sizes_match_runtime_cache_layout():
             backend.get_kv_cache_shape(4, block_size, 2, 64)
     with pytest.raises(ValueError, match="No common block size"):
         select_common_block_size(544, [backend])
+
+
+def test_sparse_mla_indexer_and_dflash_share_128_kernel_block_size(monkeypatch):
+    """GLM5.2 sparse MLA + DSA indexer + DFlash2 must keep kernel_block_size=128."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV4IndexerBackend,
+        DeepseekV32IndexerBackend,
+        DeepseekV32IndexerMetadataBuilder,
+        DeepseekV41IndexerBackend,
+    )
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.worker.utils import select_common_block_size
+
+    from vllm_xcpu_plugin.attention.sparse_attn_indexer import (
+        maybe_patch_vllm_sparse_attn_indexer,
+    )
+    from vllm_xcpu_plugin.attention.sparse_mla import XcpuMLASparseBackend
+    from vllm_xcpu_plugin.attn_backend import XcpuTritonAttentionBackend
+
+    maybe_patch_vllm_sparse_attn_indexer()
+
+    assert DeepseekV32IndexerBackend.get_supported_kernel_block_sizes() == [64, 128]
+    assert DeepseekV4IndexerBackend.get_supported_kernel_block_sizes() == [256]
+    assert DeepseekV41IndexerBackend.get_supported_kernel_block_sizes() in ([64], [128])
+
+    group_backends = [
+        XcpuMLASparseBackend,
+        DeepseekV32IndexerBackend,
+        XcpuTritonAttentionBackend,
+    ]
+    for block_size in (64, 128):
+        assert select_common_block_size(block_size, group_backends) == block_size
+    assert select_common_block_size(256, group_backends) == 128
+
+    import torch_mcpu  # noqa: F401
+    import torch_xcpu
+    from vllm.config import AttentionConfig
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    torch_xcpu.initialize_runtime()
+
+    captured_page_sizes: list[int] = []
+    real_get_meta = torch.ops.torch_xcpu.get_paged_mqa_logits_metadata_out
+
+    def spy_get_meta(seq_lens, block_kv, out):
+        captured_page_sizes.append(block_kv)
+        return real_get_meta(seq_lens, block_kv, out)
+
+    monkeypatch.setattr(
+        torch.ops.torch_xcpu,
+        "get_paged_mqa_logits_metadata_out",
+        spy_get_meta,
+    )
+
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=16),
+        model_config=SimpleNamespace(
+            max_model_len=512,
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(),
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+            num_ubatches=1,
+        ),
+        attention_config=AttentionConfig(),
+        speculative_config=None,
+        num_speculative_tokens=0,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    spec = MLAAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=132, dtype=torch.uint8
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        spec, [], vllm_config, torch.device("mcpu:0"), block_table_width=4
+    )
+    builder.set_kernel_block_size(128)
+    cm = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="mcpu"),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([150], dtype=torch.int32, device="mcpu"),
+        seq_lens_cpu_upper_bound=torch.tensor([150], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=150,
+        block_table_tensor=torch.tensor(
+            [[0, 1, 0, 0]], dtype=torch.int32, device="mcpu"
+        ),
+        slot_mapping=torch.tensor([149], dtype=torch.int64, device="mcpu"),
+        causal=True,
+    )
+    builder.build(0, cm)
+    assert captured_page_sizes == [128]

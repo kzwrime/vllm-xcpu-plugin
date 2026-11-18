@@ -77,8 +77,12 @@ def _publish_runtime_metadata(handles, metadata):
 
 def _install_runtime_metadata_builder():
     from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerBackend,
         DeepseekV32IndexerMetadataBuilder,
     )
+
+    from vllm_xcpu_plugin.attention.sparse_mla import XcpuMLASparseBackend
+    from vllm_xcpu_plugin.upstream_contracts import rebind
 
     original_init = DeepseekV32IndexerMetadataBuilder.__init__
     original_build = DeepseekV32IndexerMetadataBuilder.build
@@ -124,9 +128,14 @@ def _install_runtime_metadata_builder():
                 raise NotImplementedError(
                     "XCPU indexer does not support varlen decode indices"
                 )
+            num_states = (
+                self.kv_cache_spec.get_num_kernel_states(self.kernel_block_size)
+                if self.kernel_block_size is not None
+                else self.kv_cache_spec.num_states
+            )
             torch.ops.torch_xcpu.get_paged_mqa_logits_metadata_out(
                 metadata.decode.seq_lens,
-                self.kv_cache_spec.num_states,
+                num_states,
                 metadata.decode.schedule_metadata,
             )
         layers = self.vllm_config.compilation_config.static_forward_context
@@ -139,6 +148,13 @@ def _install_runtime_metadata_builder():
             _publish_runtime_metadata(handles, metadata)
         return metadata
 
+    # torch_xcpu sparse_indexer dispatches PAGE_KV in {64, 128}, matching XCPU
+    # sparse MLA so mixed GLM5.2 + DFlash2 KV groups do not split 128 -> 64.
+    rebind(
+        DeepseekV32IndexerBackend,
+        "get_supported_kernel_block_sizes",
+        staticmethod(XcpuMLASparseBackend.get_supported_kernel_block_sizes),
+    )
     DeepseekV32IndexerMetadataBuilder.__init__ = initialize
     DeepseekV32IndexerMetadataBuilder.build = build  # type: ignore[method-assign]
 
