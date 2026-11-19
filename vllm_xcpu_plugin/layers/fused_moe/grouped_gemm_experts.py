@@ -83,6 +83,12 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
+        if (
+            weight_key is not None
+            and weight_key.dtype == torch.int8
+            and activation_key is None
+        ):
+            return True
         return (weight_key, activation_key) in (
             (None, None),
             (kFp8Static128BlockSym, kFp8Dynamic128Sym),

@@ -46,6 +46,11 @@ class McpuPlatform(Platform):
         if hasattr(all2all_utils, "register_moe_prepare_finalize_factory"):
             import vllm_xcpu_plugin.layers.fused_moe.prepare_finalize_factory  # noqa: F401
         import vllm_xcpu_plugin.layers.fused_moe.routed_experts  # noqa: F401
+        from vllm_xcpu_plugin.layers.int8_ue8m0 import (
+            register_xcpu_int8_quantization,
+        )
+
+        register_xcpu_int8_quantization()
 
     @classmethod
     def import_ir_kernels(cls) -> None:
@@ -293,10 +298,10 @@ class McpuPlatform(Platform):
             # never runs; XCPU pattern fusions hook in as Inductor's custom
             # post-grad pass instead (auto_functionalized form, pre-reinplace).
             _fuse_add_norm = (
-                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE  # noqa: E501
             )
             _fuse_qnorm = (
-                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE  # noqa: E501
             )
             _fuse_router_gemm = (
                 envs_xcpu.VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM

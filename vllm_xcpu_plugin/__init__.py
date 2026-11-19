@@ -52,6 +52,9 @@ def register_ops():
     from vllm_xcpu_plugin.layers.quark_mxfp4 import (
         register_quark_mxfp4_linear_scheme,
     )
+    from vllm_xcpu_plugin.layers.int8_ue8m0 import (
+        register_xcpu_int8_quantization,
+    )
     from vllm_xcpu_plugin.attention.sparse_attn_indexer import (
         maybe_patch_vllm_sparse_attn_indexer,
     )
@@ -86,6 +89,9 @@ def register_ops():
     install_optional_integration("MXFP8 linear", register_mxfp8_linear_kernel)
     install_optional_integration(
         "Quark MXFP4 W4A16 linear", register_quark_mxfp4_linear_scheme
+    )
+    install_optional_integration(
+        "XCPU INT8 UE8M0 quantization", register_xcpu_int8_quantization
     )
     install_optional_integration(
         "sparse attention indexer", maybe_patch_vllm_sparse_attn_indexer

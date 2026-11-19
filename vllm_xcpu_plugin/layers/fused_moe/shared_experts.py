@@ -34,6 +34,15 @@ def _packed_linear(linear: nn.Module):
             int(params.backend),
             tuple(params.scale_block_size),
         )
+    int8_lin = getattr(linear, "_xcpu_int8_linear", None)
+    if int8_lin is not None:
+        params = int8_lin.params
+        return (
+            params.packed_weight,
+            params.weight_scale,
+            int(params.backend),
+            tuple(params.scale_block_size),
+        )
     for name in ("_xcpu_mxfp4_linear", "_xcpu_quark_mxfp4_linear"):
         mxfp4 = getattr(linear, name, None)
         if mxfp4 is not None:
