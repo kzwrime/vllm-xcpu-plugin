@@ -124,6 +124,34 @@ env_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # INT8 [16, 16] UE8M0 variant of the phase-1 MLA front pass (0/1).
+    # Emits torch_xcpu::fused_mla_qnorm_qb_uk_rope_cache_int8. Compiled graphs only.
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_"
+    "INT8": (
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_"
+                    "QNORM_QB_UK_ROPE_CACHE_INT8",
+                    "0",
+                )
+            )
+        )
+    ),
+    # INT8 [16, 16] UE8M0 variant of the phase-2 MLA front pass (0/1).
+    # Emits torch_xcpu::fused_mla_add_norm_qkva[_wk_wq]_qnorm_qb_uk_rope_cache_int8.
+    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+    "QNORM_QB_UK_ROPE_CACHE_INT8": (
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_"
+                    "QNORM_QB_UK_ROPE_CACHE_INT8",
+                    "0",
+                )
+            )
+        )
+    ),
     # Fusion switch (0/1) for the MoE front segment (post-attention
     # fused_add_rms_norm + FP32 router gate GEMM): 1 replaces eligible pairs
     # with torch_xcpu's fused_add_norm_router_gemm via the post-grad pattern

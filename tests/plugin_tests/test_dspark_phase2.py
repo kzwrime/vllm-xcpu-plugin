@@ -11,6 +11,11 @@ from torch_xcpu.ops_defs.bf16_linear import (
     Bf16LinearBackend,
     initialize_bf16_linear,
 )
+from torch_xcpu.ops_defs.int8_linear import (
+    Int8LinearBackend,
+    initialize_int8_linear,
+    int8_scaled_mm_supported,
+)
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
@@ -18,8 +23,10 @@ from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 
 from vllm_xcpu_plugin import sampler_patch
+from vllm_xcpu_plugin.models.dspark import speculator as dspark_spec_mod
 from vllm_xcpu_plugin.models.dspark.speculator import (
     XcpuDSparkSpeculator,
+    _quantize_ue8m0_block16,
     _quantize_ue8m0_block32,
 )
 from vllm_xcpu_plugin.models.rejection_sampler import patch as rej_patch_mod
@@ -240,14 +247,18 @@ def _quant_blockwise_bias_bf16(
 ) -> torch.Tensor:
     b, k = emb.shape
     n = q_row.shape[0]
-    s_i32 = scale_u8.detach().to(device="cpu", dtype=torch.int32)
+    sn, sk = scale_u8.shape
+    block_n = n // sn
+    block_k = k // sk
+    s_u8 = scale_u8.view(torch.uint8) if scale_u8.dtype != torch.uint8 else scale_u8
+    s_i32 = s_u8.detach().to(device="cpu", dtype=torch.int32)
     scale_f = torch.ldexp(torch.ones_like(s_i32, dtype=torch.float32), s_i32 - 127)
-    emb_b = emb.detach().cpu().float().view(b, k // 32, 32)
+    emb_b = emb.detach().cpu().float().view(b, sk, block_k)
     q_b = (
         q_row.detach()
         .cpu()
         .float()
-        .view(n // 32, 32, k // 32, 32)
+        .view(sn, block_n, sk, block_k)
         .permute(2, 0, 1, 3)
     )
     dot = torch.einsum("bkd,kncd->bknc", emb_b, q_b)
@@ -298,7 +309,12 @@ def test_speculator_sample_sequential_quant_dtype(
         use_confidence_head=True,
         pack_backend=None,
     )
-    q_row, scale_u8 = _quantize_ue8m0_block32(w2_ref, markov_dtype)
+    quant_fn = (
+        _quantize_ue8m0_block16
+        if markov_dtype == "int8"
+        else _quantize_ue8m0_block32
+    )
+    q_row, scale_u8 = quant_fn(w2_ref, markov_dtype)
     spec_ref.use_acceptance_estimator = True
     spec_ref._maybe_predict_acceptance = lambda *_a, **_k: None
     spec_ref.model.markov_bias = lambda emb: _quant_blockwise_bias_bf16(
@@ -307,7 +323,12 @@ def test_speculator_sample_sequential_quant_dtype(
 
     prepared = spec_q._maybe_prepare_quant_markov_w2(markov_dtype)
     assert prepared is not None
-    w2_packed, _, layout = prepared
+    w2_packed, prepared_scale, layout = prepared
+    want_block = 16 if markov_dtype == "int8" else 32
+    assert tuple(prepared_scale.shape) == (
+        draft_vocab // want_block,
+        rank // want_block,
+    )
     expected_layout = (
         1
         if pack_backend == Bf16LinearBackend.INTEL_AMX
@@ -335,6 +356,119 @@ def test_speculator_sample_sequential_quant_dtype(
 
     spec_q._sample_sequential(3, head_hidden)
     assert calls == [op_name]
+
+    spec_ref._sample_sequential(3, head_hidden_ref)
+    torch.testing.assert_close(
+        spec_q.draft_tokens[:3].cpu(),
+        spec_ref.draft_tokens[:3].cpu(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spec_q.draft_token_confidence_probs[:3].cpu(),
+        spec_ref.draft_token_confidence_probs[:3].cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    if probabilistic:
+        assert spec_q.draft_logits is not None and spec_ref.draft_logits is not None
+        torch.testing.assert_close(
+            spec_q.draft_logits[:3].cpu(),
+            spec_ref.draft_logits[:3].cpu(),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "int8_backend",
+    [
+        Int8LinearBackend.INTEL_AMX,
+        Int8LinearBackend.PORTABLE_LUT,
+        Int8LinearBackend.ACC,
+    ],
+)
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
+@pytest.mark.parametrize("probabilistic", [False, True])
+def test_speculator_sample_sequential_int8_reuses_xcpu_int8_linear(
+    monkeypatch,
+    int8_backend: Int8LinearBackend,
+    scale_dtype: torch.dtype,
+    probabilistic: bool,
+) -> None:
+    if not int8_scaled_mm_supported(int8_backend):
+        pytest.skip(f"INT8 backend {int8_backend.name} unavailable")
+    import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
+
+    monkeypatch.setattr(gumbel_module, "gumbel_sample", gumbel_module.gumbel_sample)
+    monkeypatch.setattr(sampler_patch, "_GUMBEL_SAMPLE_PATCHED", False)
+    monkeypatch.setenv("VLLM_USE_XCPU_GUMBEL_SAMPLE", "1")
+    monkeypatch.setenv("VLLM_XCPU_DSPARK_MARKOV_DTYPE", "int8")
+    sampler_patch.maybe_patch_vllm_gumbel_sample()
+
+    draft_vocab, rank, vocab_size = 64, 32, 128
+    use_d2t = not probabilistic
+    spec_q, head_hidden, _, _ = _make_fake_speculator(
+        vocab_size=vocab_size,
+        draft_vocab=draft_vocab,
+        rank=rank,
+        probabilistic=probabilistic,
+        use_d2t=use_d2t,
+        use_confidence_head=True,
+        pack_backend=None,
+    )
+    spec_ref, head_hidden_ref, _, w2_ref = _make_fake_speculator(
+        vocab_size=vocab_size,
+        draft_vocab=draft_vocab,
+        rank=rank,
+        probabilistic=probabilistic,
+        use_d2t=use_d2t,
+        use_confidence_head=True,
+        pack_backend=None,
+    )
+    q_row, scale_u8 = _quantize_ue8m0_block16(w2_ref, "int8")
+    scale_dev = scale_u8.to("mcpu").view(scale_dtype)
+    int8_linear = initialize_int8_linear(
+        q_row.to("mcpu"), scale_dev, (16, 16), backend=int8_backend
+    )
+    w2_mod = spec_q.model.model.markov_head.markov_w2
+    w2_mod.register_parameter(
+        "weight",
+        torch.nn.Parameter(int8_linear.params.packed_weight, requires_grad=False),
+    )
+    w2_mod.register_parameter(
+        "weight_scale_inv",
+        torch.nn.Parameter(int8_linear.params.weight_scale, requires_grad=False),
+    )
+    w2_mod._xcpu_int8_linear = int8_linear
+
+    spec_ref.use_acceptance_estimator = True
+    spec_ref._maybe_predict_acceptance = lambda *_a, **_k: None
+    spec_ref.model.markov_bias = lambda emb: _quant_blockwise_bias_bf16(
+        emb, q_row, scale_u8
+    )
+
+    def _forbid_repack(*_args, **_kwargs):
+        raise AssertionError("_pack_quant_markov_w2 should not be called")
+
+    monkeypatch.setattr(dspark_spec_mod, "_pack_quant_markov_w2", _forbid_repack)
+    prepared = spec_q._maybe_prepare_quant_markov_w2("int8")
+    assert prepared is not None
+    w2_packed, prepared_scale, layout = prepared
+    assert w2_packed.data_ptr() == int8_linear.params.packed_weight.data_ptr()
+    assert prepared_scale.data_ptr() == int8_linear.params.weight_scale.data_ptr()
+    assert layout == (1 if int8_backend == Int8LinearBackend.INTEL_AMX else 2)
+
+    calls: list[str] = []
+    orig_op = xcpu_ops.dspark_markov_sample_int8
+
+    def _spy(*args, **kwargs):
+        calls.append("dspark_markov_sample_int8")
+        return orig_op(*args, **kwargs)
+
+    monkeypatch.setattr(xcpu_ops, "dspark_markov_sample_int8", _spy)
+    spec_q._sample_sequential(3, head_hidden)
+    assert calls == ["dspark_markov_sample_int8"]
 
     spec_ref._sample_sequential(3, head_hidden_ref)
     torch.testing.assert_close(

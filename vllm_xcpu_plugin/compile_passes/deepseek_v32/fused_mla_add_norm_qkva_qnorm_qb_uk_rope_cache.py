@@ -96,12 +96,21 @@ _EMPTY = _fw._EMPTY
 _SKIP = _fw._Skip
 
 _FP8_MM = _fw._FP8_MM
+_INT8_MM = _fw._INT8_MM
 _CACHE_WRITE = _fw._CACHE_WRITE
 _ADD_NORM = torch.ops.torch_xcpu.fused_add_rms_norm_out_bf16.default
 _ALL_GATHER = torch.ops.torch_xcpu.all_gather_into_tensor_out_v2.default
 _FUSED = torch.ops.torch_xcpu.fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache.default
 _FUSED_WKWQ = (
     torch.ops.torch_xcpu.fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache.default
+)
+_FUSED_INT8 = (
+    torch.ops.torch_xcpu.fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_int8.default
+)
+_FUSED_WKWQ_INT8 = (
+    torch.ops.torch_xcpu
+    .fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache_int8
+    .default
 )
 
 _HIDDEN = 6144
@@ -110,10 +119,15 @@ _W_QKVA_SCALE_SHAPE = (
     -(-_fw._QKV_WIDTH // 128),  # ceil: 2624 -> 21 scale rows
     -(-_HIDDEN // 128),  # 6144 -> 48 scale cols
 )
-# indexer.wq_b_proj packs like q_b_proj ([4096, 2048], scales [32, 16]) --
-# the same contract the wk operator enforces statically.
+_W_QKVA_INT8_SCALE_SHAPE = (
+    _fw._QKV_WIDTH // 16,  # 2624 -> 164 scale rows
+    _HIDDEN // 16,  # 6144 -> 384 scale cols
+)
+# indexer.wq_b_proj packs like q_b_proj ([4096, 2048], scales [32, 16] FP8 /
+# [256, 128] INT8) -- the same contract the wk operator enforces statically.
 _W_WQ_SHAPE = _fw._QB_PACKED_SHAPE
 _W_WQ_SCALE_SHAPE = _fw._QB_SCALE_SHAPE
+_W_WQ_INT8_SCALE_SHAPE = _fw._QB_INT8_SCALE_SHAPE
 # indexer.wk_weights_proj: the BF16 linear takeover packed the [160, 6144]
 # checkpoint bf16 into the layer's Bf16LinearParams backend at load time;
 # this is the shape of that packed buffer, viewed as [N, K].
@@ -124,9 +138,7 @@ def _bf16_linear_ops() -> dict:
     from torch_xcpu.ops_defs.bf16_linear import _BACKEND_OP_SUFFIXES
 
     return {
-        getattr(torch.ops.torch_xcpu, f"bf16_linear_{suffix}_out").default: int(
-            backend
-        )
+        getattr(torch.ops.torch_xcpu, f"bf16_linear_{suffix}_out").default: int(backend)
         for backend, suffix in _BACKEND_OP_SUFFIXES.items()
     }
 
@@ -150,75 +162,108 @@ def _is_bf16_linear_af(node: Node) -> bool:
 
 _IDX = _fw._af_indices(_FUSED)
 _IDX_WKWQ = _fw._af_indices(_FUSED_WKWQ)
+_IDX_INT8 = _fw._af_indices(_FUSED_INT8)
+_IDX_WKWQ_INT8 = _fw._af_indices(_FUSED_WKWQ_INT8)
 _IDX_ADD = _fw._af_indices(_ADD_NORM)
 # af result index of the ``out`` clone every single-out linear op in the
-# window has (fp8_scaled_mm_<b>_out, bf16_linear_<b>_out): all are -> ()
+# window has ({fp8,int8}_scaled_mm_<b>_out, bf16_linear_<b>_out): all are -> ()
 # ops whose only mutated arg is ``out``.
 _IDX_LINEAR_OUT = _fw._af_indices(_FP8_MM)["out"]
+_IDX_INT8_OUT = _fw._af_indices(_INT8_MM)["out"]
 _IDX_CACHE_KV = _fw._af_indices(_CACHE_WRITE)["kv_cache"]
 _IDX_AG_OUT = _fw._af_indices(_ALL_GATHER)["output"]
 
 
-def _shared_backend_supported(backend: int) -> bool:
-    """The shared-layer operator's gate for one fp8 backend."""
-    gate = (
+def _shared_gate(is_int8: bool):
+    if is_int8:
+        return (
+            torch.ops.torch_xcpu
+            .fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_int8_backend_supported
+        )
+    return (
         torch.ops.torch_xcpu
         .fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_backend_supported
     )
-    return _fw.backend_supported(gate, backend)
 
 
-def _wkwq_backend_supported(fp8_backend: int, bf16_backend: int) -> bool:
-    """The sparse-indexer operator's gate for one (fp8, bf16) backend pair."""
-    gate = (
+def _wkwq_gate(is_int8: bool):
+    if is_int8:
+        return (
+            torch.ops.torch_xcpu
+            .fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache_int8_backend_supported
+        )
+    return (
         torch.ops.torch_xcpu
         .fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache_backend_supported
     )
-    return bool(gate(int(fp8_backend), int(bf16_backend)))
 
 
-def _backend_supported() -> bool:
+def _shared_backend_supported(backend: int, *, is_int8: bool = False) -> bool:
+    """The shared-layer operator's gate for one quantized linear backend."""
+    if is_int8:
+        return _fw.int8_backend_supported(_shared_gate(True), backend)
+    return _fw.backend_supported(_shared_gate(False), backend)
+
+
+def _wkwq_backend_supported(
+    linear_backend: int, bf16_backend: int, *, is_int8: bool = False
+) -> bool:
+    """The sparse-indexer operator's gate for one (linear, bf16) backend pair."""
+    return bool(_wkwq_gate(is_int8)(int(linear_backend), int(bf16_backend)))
+
+
+def _backend_supported(*, is_int8: bool = False) -> bool:
     """Graph-level early-out: either operator's gate passing is enough to
     enter the per-layer matching; every window re-checks the operator it
-    picks with the fp8 x bf16 backends the graph actually uses. The shared
-    operator's gate takes one fp8 backend, the sparse-indexer one a family
-    -paired (fp8, bf16) pair."""
+    picks with the quantized x bf16 backends the graph actually uses."""
     from torch_xcpu.ops_defs.bf16_linear import Bf16LinearBackend
-    from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend
 
-    shared_gate = (
-        torch.ops.torch_xcpu
-        .fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_backend_supported
-    )
-    wkwq_gate = (
-        torch.ops.torch_xcpu
-        .fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache_backend_supported
-    )
-    for fp8 in Fp8LinearBackend:
-        if bool(shared_gate(int(fp8))):
+    if is_int8:
+        from torch_xcpu.ops_defs.int8_linear import Int8LinearBackend as _LinearBackend
+    else:
+        from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend as _LinearBackend
+
+    shared_gate = _shared_gate(is_int8)
+    wkwq_gate = _wkwq_gate(is_int8)
+    for lb in _LinearBackend:
+        if bool(shared_gate(int(lb))):
             return True
         for bf16 in Bf16LinearBackend:
-            if bool(wkwq_gate(int(fp8), int(bf16))):
+            if bool(wkwq_gate(int(lb), int(bf16))):
                 return True
     return False
 
 
-def _replace_one(graph, cache_af: Node) -> bool:
-    m = _fw.match_window(graph, cache_af)
+def _replace_one(graph, cache_af: Node, *, is_int8: bool) -> bool:
+    quant_kind = "int8" if is_int8 else "fp8"
+    m = _fw.match_window(graph, cache_af, quant_kind=quant_kind)
 
-    # Upstream: the fused_qkv_a FP8 linear the two rms_norms read. Its fp8
-    # mm overload names the backend; the picked operator reads every packed
-    # weight of this window with that one backend's layout.
+    # Upstream: the fused_qkv_a linear the two rms_norms read. Its overload
+    # names the backend; the picked operator reads every packed weight of this
+    # window with that one backend's layout.
     qkva_af = m.qkv_base.args[0]
-    if not _fw._is_fp8_mm_af(qkva_af):
-        raise _SKIP("qkv source is not a fp8_scaled_mm")
-    fp8_backend = _fw._fp8_mm_backend(qkva_af)
-    if qkva_af.kwargs.get("bias") is not None:
-        raise _SKIP("fused_qkv_a linear has a bias")
+    if is_int8:
+        if not _fw._is_int8_mm_af(qkva_af):
+            raise _SKIP("qkv source is not an int8_scaled_mm")
+        if not _fw._is_int8_16x16_nobias(qkva_af):
+            raise _SKIP("fused_qkv_a int8 linear requires 16x16 scales and no bias")
+        linear_backend = _fw._int8_mm_backend(qkva_af)
+        want_qkva_scale = _W_QKVA_INT8_SCALE_SHAPE
+        want_wq_scale = _W_WQ_INT8_SCALE_SHAPE
+        idx_linear_out = _IDX_INT8_OUT
+    else:
+        if not _fw._is_fp8_mm_af(qkva_af):
+            raise _SKIP("qkv source is not a fp8_scaled_mm")
+        if qkva_af.kwargs.get("bias") is not None:
+            raise _SKIP("fused_qkv_a linear has a bias")
+        linear_backend = _fw._fp8_mm_backend(qkva_af)
+        want_qkva_scale = _W_QKVA_SCALE_SHAPE
+        want_wq_scale = _W_WQ_SCALE_SHAPE
+        idx_linear_out = _IDX_LINEAR_OUT
+    if qkva_af.args[0] is not m.q_b_af.args[0]:
+        raise _SKIP("fused_qkv_a backend differs from q_b_proj")
     _fw._check_shape("w_qkva", qkva_af.kwargs["packed_weight"], _W_QKVA_SHAPE)
-    _fw._check_shape(
-        "w_qkva_scale", qkva_af.kwargs["weight_scale"], _W_QKVA_SCALE_SHAPE
-    )
+    _fw._check_shape("w_qkva_scale", qkva_af.kwargs["weight_scale"], want_qkva_scale)
 
     # And its input: the layer's add-norm. The first layer uses a plain
     # rms_norm (no residual add) and stays with the phase-1 pass.
@@ -267,13 +312,18 @@ def _replace_one(graph, cache_af: Node) -> bool:
     # fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache.
     wq_b_af = None
     for n in graph.nodes:
-        if n is m.q_b_af or not _fw._is_fp8_mm_af(n):
+        if n is m.q_b_af:
+            continue
+        if is_int8:
+            if not _fw._is_int8_mm_af(n) or not _fw._is_int8_16x16_nobias(n):
+                continue
+        elif not _fw._is_fp8_mm_af(n):
             continue
         if not _fw._roots_at(n.kwargs.get("input"), {m.q_norm_out}):
             continue
         if (
             _fw._shape(n.kwargs["packed_weight"]) != _W_WQ_SHAPE
-            or _fw._shape(n.kwargs["weight_scale"]) != _W_WQ_SCALE_SHAPE
+            or _fw._shape(n.kwargs["weight_scale"]) != want_wq_scale
         ):
             continue
         if wq_b_af is not None:
@@ -289,7 +339,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
             (
                 u
                 for u in wq_b_af.users
-                if _fw._is_getitem(u) and u.args[1] == _IDX_LINEAR_OUT
+                if _fw._is_getitem(u) and u.args[1] == idx_linear_out
             ),
             None,
         )
@@ -334,15 +384,17 @@ def _replace_one(graph, cache_af: Node) -> bool:
     full = wq_b_af is not None
     # full 与 wk_af 同真同假（上面的 XOR 检查），直接收窄 bf16_backend。
     if full and bf16_backend is not None:
-        if not _wkwq_backend_supported(fp8_backend, bf16_backend):
+        if not _wkwq_backend_supported(linear_backend, bf16_backend, is_int8=is_int8):
             raise _SKIP(
-                f"backend pair {fp8_backend} x {bf16_backend} unsupported by "
-                "fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache"
+                f"backend pair {linear_backend} x {bf16_backend} unsupported by "
+                f"fused_mla_add_norm_qkva_wk_wq_qnorm_qb_uk_rope_cache"
+                f"{'_int8' if is_int8 else ''}"
             )
-    elif not _shared_backend_supported(fp8_backend):
+    elif not _shared_backend_supported(linear_backend, is_int8=is_int8):
         raise _SKIP(
-            f"fp8 backend {fp8_backend} unsupported by "
-            "fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache"
+            f"{quant_kind} backend {linear_backend} unsupported by "
+            f"fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache"
+            f"{'_int8' if is_int8 else ''}"
         )
 
     # Redirect producers: region results consumed outside the region.
@@ -428,7 +480,14 @@ def _replace_one(graph, cache_af: Node) -> bool:
             ag_send = None
             ag_comm = None
             hidden = add_norm_af.kwargs["input"]
-        fused_target = _FUSED_WKWQ if full else _FUSED
+        if is_int8:
+            fused_target = _FUSED_WKWQ_INT8 if full else _FUSED_INT8
+            idx = _IDX_WKWQ_INT8 if full else _IDX_INT8
+            backend_kw = "int8_backend"
+        else:
+            fused_target = _FUSED_WKWQ if full else _FUSED
+            idx = _IDX_WKWQ if full else _IDX
+            backend_kw = "fp8_backend"
         fused_kwargs = dict(
             hidden=hidden,
             residual=add_norm_af.kwargs["residual"],
@@ -442,7 +501,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
             kv_a_eps=m.kv_norm_af.kwargs["epsilon"],
             w_qb=m.q_b_af.kwargs["packed_weight"],
             w_qb_scale=m.q_b_af.kwargs["weight_scale"],
-            fp8_backend=fp8_backend,
+            **{backend_kw: linear_backend},
             w_uk_t=m.einsum_af.kwargs["weight"],
             positions=m.rotary_af.kwargs["positions"],
             cos_sin=m.rotary_af.kwargs["cos_sin_cache"],
@@ -457,6 +516,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
             kv_c_norm=m.kv_c_out,
             q=m.q_ws,
             out_q=out_q,
+            quant_mode=m.quant_mode,
         )
         if full and wq_b_af is not None and wk_af is not None:
             # The wk_wq operator's five indexer arguments are required -- it
@@ -472,10 +532,7 @@ def _replace_one(graph, cache_af: Node) -> bool:
                 indexer_q=wq_b_af.kwargs["out"],
                 indexer_kw=wk_af.kwargs["out"],
             )
-        fused = graph.create_node(
-            "call_function", _AF, (fused_target,), fused_kwargs
-        )
-        idx = _IDX_WKWQ if full else _IDX
+        fused = graph.create_node("call_function", _AF, (fused_target,), fused_kwargs)
         hidden_out = graph.create_node(
             "call_function", _GETITEM, (fused, idx["hidden"])
         )
@@ -515,11 +572,13 @@ def _replace_one(graph, cache_af: Node) -> bool:
     return True
 
 
-def replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(graph) -> int:
-    if not _backend_supported():
+def _replace_all(graph, *, is_int8: bool) -> int:
+    suffix = "_int8" if is_int8 else ""
+    if not _backend_supported(is_int8=is_int8):
         logger.info(
             "deepseek_v32 pass: fused_mla_add_norm_qkva[_wk_wq]_qnorm_qb_uk"
-            "_rope_cache backend unsupported on this build, graph left unfused"
+            "_rope_cache%s backend unsupported on this build, graph left unfused",
+            suffix,
         )
         return 0
     cache_afs = [n for n in list(graph.nodes) if _fw._is_af_of(n, _CACHE_WRITE)]
@@ -528,11 +587,20 @@ def replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(graph) -> int:
     replaced = 0
     for cache_af in cache_afs:
         try:
-            replaced += bool(_replace_one(graph, cache_af))
+            replaced += bool(_replace_one(graph, cache_af, is_int8=is_int8))
         except _SKIP as reason:
             logger.info(
                 "deepseek_v32 fused_mla_add_norm[_wk_wq]_qnorm_qb_uk_rope"
-                "_cache pass: layer skipped (%s)",
+                "_cache%s pass: layer skipped (%s)",
+                suffix,
                 reason,
             )
     return replaced
+
+
+def replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache(graph) -> int:
+    return _replace_all(graph, is_int8=False)
+
+
+def replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_int8(graph) -> int:
+    return _replace_all(graph, is_int8=True)

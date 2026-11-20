@@ -57,13 +57,17 @@ def _configured_markov_dtype() -> str:
     return mode
 
 
-def _quantize_ue8m0_block32(
-    weight: torch.Tensor, mode: str
+def _quantize_ue8m0(
+    weight: torch.Tensor, mode: str, block_n: int = 32, block_k: int = 32
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2D [N, K] weight on CPU float32 with [32, 32] OCP UE8M0 scales."""
+    """Quantize a 2D [N, K] weight on CPU f32 with [block_n, block_k] UE8M0 scales."""
     n, k = weight.shape
     w_f32 = weight.detach().to(device="cpu", dtype=torch.float32)
-    blocks = w_f32.view(n // 32, 32, k // 32, 32).permute(0, 2, 1, 3).contiguous()
+    blocks = (
+        w_f32.view(n // block_n, block_n, k // block_k, block_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
     amax = blocks.abs().amax(dim=(-2, -1))
     qmax = 448.0 if mode == "fp8" else 127.0
     raw_scale = amax / qmax
@@ -74,9 +78,7 @@ def _quantize_ue8m0_block32(
         (ceil_exp + 127).clamp(0, 254),
         torch.zeros_like(exp),
     )
-    inv_scale = torch.ldexp(
-        torch.ones_like(raw_scale), -(s_int.to(torch.int32) - 127)
-    )
+    inv_scale = torch.ldexp(torch.ones_like(raw_scale), -(s_int.to(torch.int32) - 127))
     scaled = blocks * inv_scale.unsqueeze(-1).unsqueeze(-1)
     if mode == "fp8":
         q_blocks = scaled.to(torch.float8_e4m3fn)
@@ -84,6 +86,18 @@ def _quantize_ue8m0_block32(
         q_blocks = torch.round(scaled).clamp(-127, 127).to(torch.int8)
     q_row_major = q_blocks.permute(0, 2, 1, 3).contiguous().view(n, k)
     return q_row_major, s_int.to(torch.uint8).contiguous()
+
+
+def _quantize_ue8m0_block32(
+    weight: torch.Tensor, mode: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _quantize_ue8m0(weight, mode, block_n=32, block_k=32)
+
+
+def _quantize_ue8m0_block16(
+    weight: torch.Tensor, mode: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _quantize_ue8m0(weight, mode, block_n=16, block_k=16)
 
 
 def _pack_quant_markov_w2(q_row_major: torch.Tensor, layout: int) -> torch.Tensor:
@@ -94,10 +108,7 @@ def _pack_quant_markov_w2(q_row_major: torch.Tensor, layout: int) -> torch.Tenso
     raw = q_row_major.contiguous().view(torch.uint8)
     if layout == 1:
         packed = (
-            raw.view(n // 32, 32, k // 2, 2)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .view(n, k)
+            raw.view(n // 32, 32, k // 2, 2).permute(0, 2, 1, 3).contiguous().view(n, k)
         )
         return packed.view(q_row_major.dtype)
     if layout == 2:
@@ -109,7 +120,7 @@ def _pack_quant_markov_w2(q_row_major: torch.Tensor, layout: int) -> torch.Tenso
 def _layout_from_backend_name(backend_name: str | None) -> int:
     if backend_name == "INTEL_AMX":
         return 1
-    if backend_name in ("PORTABLE", "ACC"):
+    if backend_name in ("PORTABLE", "PORTABLE_LUT", "ACC"):
         return 2
     return 0
 
@@ -123,9 +134,9 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
         self._d2t_target_ids: torch.Tensor | None = None
         self._sp_gather_buf: torch.Tensor | None = None
         self._confidence_markov_embeds: torch.Tensor | None = None
-        self._quant_markov_cache: (
-            tuple[str, torch.Tensor, torch.Tensor, int] | None
-        ) = None
+        self._quant_markov_cache: tuple[str, torch.Tensor, torch.Tensor, int] | None = (
+            None
+        )
 
     def load_draft_model(
         self,
@@ -211,30 +222,73 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
         if not isinstance(w2, torch.Tensor) or w2.dim() != 2:
             return None
         vocab_size, rank = w2.shape
-        if vocab_size <= 0 or rank <= 0 or vocab_size % 32 != 0 or rank % 32 != 0:
+        if vocab_size <= 0 or rank <= 0:
             return None
+
+        if mode == "int8":
+            int8_linear = getattr(w2_mod, "_xcpu_int8_linear", None)
+            if int8_linear is not None:
+                params = int8_linear.params
+                if params.bias is not None or tuple(params.scale_block_size) not in (
+                    (16, 16),
+                    (32, 32),
+                ):
+                    return None
+                layout = _layout_from_backend_name(params.backend.name)
+                if layout != 0 and (vocab_size % 32 != 0 or rank % 32 != 0):
+                    return None
+                w2_packed = params.packed_weight.detach()
+                w2_scale = params.weight_scale.detach()
+                self._quant_markov_cache = (mode, w2_packed, w2_scale, layout)
+                return w2_packed, w2_scale, layout
 
         expected_dtype = torch.float8_e4m3fn if mode == "fp8" else torch.int8
         xcpu_linear = getattr(w2_mod, "_xcpu_bf16_linear", None)
 
         if w2.dtype == expected_dtype:
-            scale = getattr(w2_mod, "markov_w2_scale", None)
-            if scale is None:
-                scale = getattr(w2_mod, "weight_scale", None)
-            if (
-                not isinstance(scale, torch.Tensor)
-                or scale.dtype != torch.uint8
-                or tuple(scale.shape) != (vocab_size // 32, rank // 32)
+            scale = None
+            for attr in ("markov_w2_scale", "weight_scale", "weight_scale_inv"):
+                cand = getattr(w2_mod, attr, None)
+                if cand is not None:
+                    scale = cand
+                    break
+            if not isinstance(scale, torch.Tensor) or scale.dtype not in (
+                torch.uint8,
+                torch.float8_e8m0fnu,
             ):
                 return None
-            if xcpu_linear is not None:
+            valid_block = False
+            if mode == "fp8":
+                valid_block = (
+                    vocab_size % 32 == 0
+                    and rank % 32 == 0
+                    and tuple(scale.shape) == (vocab_size // 32, rank // 32)
+                )
+            else:
+                valid_block = (
+                    vocab_size % 16 == 0
+                    and rank % 16 == 0
+                    and tuple(scale.shape) == (vocab_size // 16, rank // 16)
+                ) or (
+                    vocab_size % 32 == 0
+                    and rank % 32 == 0
+                    and tuple(scale.shape) == (vocab_size // 32, rank // 32)
+                )
+            if not valid_block:
+                return None
+            if vocab_size % 32 != 0 or rank % 32 != 0:
+                layout = 0
+            elif xcpu_linear is not None:
                 layout = _layout_from_backend_name(xcpu_linear.backend.name)
             else:
                 from torch_xcpu import ops as xcpu_ops
 
-                layout = _layout_from_backend_name(
-                    xcpu_ops.configured_bf16_linear_backend().name
+                backend_cfg = (
+                    xcpu_ops.configured_int8_linear_backend()
+                    if mode == "int8"
+                    else xcpu_ops.configured_bf16_linear_backend()
                 )
+                layout = _layout_from_backend_name(backend_cfg.name)
             w2_packed = (
                 w2.contiguous()
                 if layout == 0
@@ -247,12 +301,21 @@ class XcpuDSparkSpeculator(DSparkSpeculator):
         if w2.dtype != torch.bfloat16:
             return None
 
+        if mode == "fp8":
+            if vocab_size % 32 != 0 or rank % 32 != 0:
+                return None
+            q_row_major, scale_u8 = _quantize_ue8m0_block32(w2, "fp8")
+        else:
+            if vocab_size % 16 != 0 or rank % 16 != 0:
+                return None
+            q_row_major, scale_u8 = _quantize_ue8m0_block16(w2, "int8")
         layout = (
             _layout_from_backend_name(xcpu_linear.backend.name)
             if xcpu_linear is not None
             else 0
         )
-        q_row_major, scale_u8 = _quantize_ue8m0_block32(w2, mode)
+        if vocab_size % 32 != 0 or rank % 32 != 0:
+            layout = 0
         w2_packed = _pack_quant_markov_w2(q_row_major, layout).to(w2.device)
         w2_scale = scale_u8.to(w2.device)
         self._quant_markov_cache = (mode, w2_packed, w2_scale, layout)

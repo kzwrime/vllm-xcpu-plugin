@@ -31,13 +31,19 @@ logger = logging.getLogger(__name__)
 _dump_counter = itertools.count()
 
 
-def _active_pass_flags() -> tuple[bool, bool, bool]:
+def _active_pass_flags() -> tuple[bool, bool, bool, bool, bool]:
     return (
         bool(
             envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE
         ),
         bool(
             envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE
+        ),
+        bool(
+            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE_INT8
+        ),
+        bool(
+            envs.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_INT8
         ),
         bool(envs.VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM),
     )
@@ -71,8 +77,20 @@ def _dump_graph(tag: str, graph) -> None:
 
 class XcpuPostGradPass(CustomGraphPass):
     def __call__(self, graph) -> None:
-        fuse_add_norm, fuse_qnorm, fuse_router_gemm = _active_pass_flags()
-        if not (fuse_add_norm or fuse_qnorm or fuse_router_gemm):
+        (
+            fuse_add_norm,
+            fuse_qnorm,
+            fuse_add_norm_int8,
+            fuse_qnorm_int8,
+            fuse_router_gemm,
+        ) = _active_pass_flags()
+        if not (
+            fuse_add_norm
+            or fuse_qnorm
+            or fuse_add_norm_int8
+            or fuse_qnorm_int8
+            or fuse_router_gemm
+        ):
             return
 
         _dump_graph("pre", graph)
@@ -90,6 +108,16 @@ class XcpuPostGradPass(CustomGraphPass):
                     graph
                 )
             )
+        if fuse_add_norm_int8:
+            from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
+                fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache as add_norm_pass,
+            )
+
+            mla_replaced += (
+                add_norm_pass.replace_with_fused_mla_add_norm_qkva_qnorm_qb_uk_rope_cache_int8(  # noqa: E501
+                    graph
+                )
+            )
         if fuse_qnorm:
             from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
                 fused_mla_qnorm_qb_uk_rope_cache as qnorm_pass,
@@ -97,6 +125,14 @@ class XcpuPostGradPass(CustomGraphPass):
 
             mla_replaced += (
                 qnorm_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache(graph)
+            )
+        if fuse_qnorm_int8:
+            from vllm_xcpu_plugin.compile_passes.deepseek_v32 import (
+                fused_mla_qnorm_qb_uk_rope_cache as qnorm_pass,
+            )
+
+            mla_replaced += (
+                qnorm_pass.replace_with_fused_mla_qnorm_qb_uk_rope_cache_int8(graph)
             )
         if mla_replaced:
             logger.info(

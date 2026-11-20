@@ -37,10 +37,11 @@ logger = logging.getLogger(__name__)
 _ATEN = torch.ops.aten
 _AF = torch.ops.higher_order.auto_functionalized
 _RMS_NORM = torch.ops.torch_xcpu.rms_norm_bf16.default
-# The linear backends each register their own fp8_scaled_mm_<suffix>_out
+# The linear backends each register their own {fp8,int8}_scaled_mm_<suffix>_out
 # overload with an identical schema; matching accepts all of them and the
-# backend int is read back off the matched op (``_fp8_mm_backend``).
+# backend int is read back off the matched op.
 _FP8_MM = torch.ops.torch_xcpu.fp8_scaled_mm_intel_amx_out.default
+_INT8_MM = torch.ops.torch_xcpu.int8_scaled_mm_intel_amx_out.default
 _ROTARY = torch.ops.torch_xcpu.rotary_embedding_bf16.default
 _EINSUM = torch.ops.torch_xcpu.einsum_mhk_hkn_to_mhn.default
 _CACHE_WRITE = torch.ops.torch_xcpu.reshape_and_cache_mla_fp8_ds.default
@@ -70,18 +71,27 @@ _GETITEM = operator.getitem
 _EMPTY = _ATEN.empty.memory_format
 
 
-def _fp8_mm_ops() -> dict:
-    from torch_xcpu.ops_defs.fp8_linear import _BACKEND_OP_SUFFIXES
-
+def _scaled_mm_ops(backend_op_suffixes: Mapping, op_prefix: str) -> dict:
     return {
-        getattr(torch.ops.torch_xcpu, f"fp8_scaled_mm_{suffix}_out").default: int(
-            backend
-        )
-        for backend, suffix in _BACKEND_OP_SUFFIXES.items()
+        getattr(torch.ops.torch_xcpu, f"{op_prefix}_{suffix}_out").default: int(backend)
+        for backend, suffix in backend_op_suffixes.items()
     }
 
 
+def _fp8_mm_ops() -> dict:
+    from torch_xcpu.ops_defs.fp8_linear import _BACKEND_OP_SUFFIXES
+
+    return _scaled_mm_ops(_BACKEND_OP_SUFFIXES, "fp8_scaled_mm")
+
+
+def _int8_mm_ops() -> dict:
+    from torch_xcpu.ops_defs.int8_linear import _BACKEND_OP_SUFFIXES
+
+    return _scaled_mm_ops(_BACKEND_OP_SUFFIXES, "int8_scaled_mm")
+
+
 _FP8_MM_OPS = _fp8_mm_ops()
+_INT8_MM_OPS = _int8_mm_ops()
 
 _QKV_WIDTH = 2048 + 512 + 64
 _HEADS_PER_RANK = 16
@@ -93,6 +103,7 @@ _OUT_HEAD_DIM = _KV_LORA + _ROPE_DIM
 _W_UK_SHAPE = (_HEADS_PER_RANK, _NOPE_DIM, _KV_LORA)
 _QB_PACKED_SHAPE = (_HEADS_PER_RANK * (_NOPE_DIM + _ROPE_DIM), 2048)
 _QB_SCALE_SHAPE = (_QB_PACKED_SHAPE[0] // 128, 2048 // 128)
+_QB_INT8_SCALE_SHAPE = (_QB_PACKED_SHAPE[0] // 16, 2048 // 16)
 
 
 def _af_indices(op) -> dict[str, int]:
@@ -126,14 +137,47 @@ def _fp8_mm_backend(node: Node) -> int:
     return _FP8_MM_OPS[node.args[0]]
 
 
-def backend_supported(supported_op, backend: int | None = None) -> bool:
+def _is_int8_mm_af(node: object) -> TypeGuard[Node]:
+    """auto_functionalized call of any int8_scaled_mm_<backend>_out overload."""
+    return (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target == _AF
+        and node.args[0] in _INT8_MM_OPS
+    )
+
+
+def _int8_mm_backend(node: Node) -> int:
+    """The Int8LinearBackend int of a matched int8 mm (see _is_int8_mm_af)."""
+    return _INT8_MM_OPS[node.args[0]]
+
+
+def _is_int8_16x16_nobias(node: Node) -> bool:
+    return (
+        node.kwargs.get("scale_block_n") == 16
+        and node.kwargs.get("scale_block_k") == 16
+        and node.kwargs.get("bias") is None
+    )
+
+
+def _any_backend_supported(
+    supported_op, backend_enum, backend: int | None = None
+) -> bool:
     if backend is not None:
         return bool(supported_op(backend))
-    # Early-out before any graph is seen: any fp8 backend will do here, the
-    # per-layer gate re-checks the backend the graph actually uses.
+    return any(bool(supported_op(int(b))) for b in backend_enum)
+
+
+def backend_supported(supported_op, backend: int | None = None) -> bool:
     from torch_xcpu.ops_defs.fp8_linear import Fp8LinearBackend
 
-    return any(bool(supported_op(int(b))) for b in Fp8LinearBackend)
+    return _any_backend_supported(supported_op, Fp8LinearBackend, backend)
+
+
+def int8_backend_supported(supported_op, backend: int | None = None) -> bool:
+    from torch_xcpu.ops_defs.int8_linear import Int8LinearBackend
+
+    return _any_backend_supported(supported_op, Int8LinearBackend, backend)
 
 
 def _shape(node: object) -> tuple | None:
@@ -254,12 +298,19 @@ class WindowMatch:
     q_c_out: Node  # q_norm's out buffer, reused by the fused operator
     kv_c_out: Node  # kv_norm's out buffer
     q_ws: Node  # q_b_proj's out buffer
+    quant_mode: int  # 0=fp8_ds_mla, 1=int8_ds_mla
 
 
-def match_window(graph, cache_af: Node) -> WindowMatch:
+def match_window(graph, cache_af: Node, *, quant_kind: str = "fp8") -> WindowMatch:
     """Match the core window rooted at ``cache_af`` (raises _Skip)."""
-    if cache_af.kwargs.get("quant_mode", 0) != 0:
-        raise _Skip("front-window fusion only supports FP8 DS MLA cache")
+    if quant_kind not in ("fp8", "int8"):
+        raise ValueError(f"Unsupported quant_kind={quant_kind!r}")
+    quant_mode = int(cache_af.kwargs.get("quant_mode", 0))
+    if quant_mode not in (0, 1):
+        raise _Skip(
+            "front-window fusion only supports fp8/int8_ds_mla cache "
+            f"(got quant_mode={quant_mode})"
+        )
     kv_norm_af = cache_af.kwargs["key"]
     if not (isinstance(kv_norm_af, Node) and _is_getitem(kv_norm_af)):
         raise _Skip("cache-write key is not an auto_functionalized result")
@@ -289,9 +340,13 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     if q_norm_out is None:
         raise _Skip("q_norm result missing")
 
-    # q_b_proj: the FP8 linear reading q_norm whose result feeds the layer's
+    # q_b_proj: the quantized linear reading q_norm whose result feeds the layer's
     # W_UK einsum. Shape alone cannot pick it: on TP4 the indexer wq_b linear
     # has the same [4096, 2048] packed weights as q_b_proj and reads q_norm.
+    is_int8 = quant_kind == "int8"
+    mm_pred = _is_int8_mm_af if is_int8 else _is_fp8_mm_af
+    want_scale_shape = _QB_INT8_SCALE_SHAPE if is_int8 else _QB_SCALE_SHAPE
+    idx_mm_out = _af_indices(_INT8_MM if is_int8 else _FP8_MM)["out"]
     einsum_afs = [
         n
         for n in graph.nodes
@@ -300,15 +355,19 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
     q_b_af = None
     q_b_out = None
     for n in graph.nodes:
-        if not _is_fp8_mm_af(n):
+        if not mm_pred(n):
+            continue
+        if is_int8:
+            if not _is_int8_16x16_nobias(n):
+                continue
+        elif n.kwargs.get("bias") is not None:
             continue
         if not _roots_at(n.kwargs.get("input"), {q_norm_out}):
             continue
         if _shape(n.kwargs["packed_weight"]) != _QB_PACKED_SHAPE or (
-            _shape(n.kwargs["weight_scale"]) != _QB_SCALE_SHAPE
+            _shape(n.kwargs["weight_scale"]) != want_scale_shape
         ):
             continue
-        idx_mm_out = _af_indices(_FP8_MM)["out"]
         cand_out = next(
             (u for u in n.users if _is_getitem(u) and u.args[1] == idx_mm_out),
             None,
@@ -323,7 +382,8 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
         q_b_out = cand_out
     if q_b_af is None or q_b_out is None:
         raise _Skip(
-            f"no q_b_proj with FP8 weights {_QB_PACKED_SHAPE} feeding W_UK "
+            f"no q_b_proj with {quant_kind.upper()} weights {_QB_PACKED_SHAPE} "
+            f"and scale {want_scale_shape} feeding W_UK "
             f"(heads per rank != {_HEADS_PER_RANK}?)"
         )
 
@@ -393,6 +453,7 @@ def match_window(graph, cache_af: Node) -> WindowMatch:
         q_c_out=q_c_out,
         kv_c_out=kv_c_out,
         q_ws=q_ws,
+        quant_mode=quant_mode,
     )
 
 

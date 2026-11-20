@@ -303,10 +303,22 @@ class McpuPlatform(Platform):
             _fuse_qnorm = (
                 envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE  # noqa: E501
             )
+            _fuse_add_norm_int8 = (
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_ADD_NORM_QKVA_QNORM_QB_UK_ROPE_CACHE_INT8  # noqa: E501
+            )
+            _fuse_qnorm_int8 = (
+                envs_xcpu.VLLM_XCPU_COMPILE_PASS_DEEPSEEK_V32_FUSED_MLA_QNORM_QB_UK_ROPE_CACHE_INT8  # noqa: E501
+            )
             _fuse_router_gemm = (
                 envs_xcpu.VLLM_XCPU_COMPILE_PASS_FUSED_ADD_NORM_ROUTER_GEMM
             )
-            if _fuse_add_norm or _fuse_qnorm or _fuse_router_gemm:
+            if (
+                _fuse_add_norm
+                or _fuse_qnorm
+                or _fuse_add_norm_int8
+                or _fuse_qnorm_int8
+                or _fuse_router_gemm
+            ):
                 from vllm_xcpu_plugin.compile_passes import XcpuPostGradPass
 
                 compilation_config.inductor_compile_config[
@@ -314,9 +326,13 @@ class McpuPlatform(Platform):
                 ] = XcpuPostGradPass()
                 logger.info(
                     "XCPU post-grad pattern pass installed "
-                    "(ADD_NORM_QKVA=%s, QNORM_QB_UK=%s, ROUTER_GEMM=%s)",
+                    "(ADD_NORM_QKVA=%s, QNORM_QB_UK=%s, "
+                    "ADD_NORM_QKVA_INT8=%s, QNORM_QB_UK_INT8=%s, "
+                    "ROUTER_GEMM=%s)",
                     _fuse_add_norm,
                     _fuse_qnorm,
+                    _fuse_add_norm_int8,
+                    _fuse_qnorm_int8,
                     _fuse_router_gemm,
                 )
 
