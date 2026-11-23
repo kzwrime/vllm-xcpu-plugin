@@ -14,7 +14,7 @@ from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
-from vllm_xcpu_plugin.models.deepseek_v41.model import SpShardedAuxHiddenStates
+from vllm_xcpu_plugin.models.deepseek_v41.sp_aux import SpShardedAuxHiddenStates
 from vllm_xcpu_plugin.upstream_compatibility import verify_upstream_compatibility
 from vllm_xcpu_plugin.upstream_contracts import rebind
 

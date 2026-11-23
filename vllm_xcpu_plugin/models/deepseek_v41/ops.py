@@ -8,7 +8,10 @@ site (the operators' torch references and tests live in torch_xcpu,
 
 CUDA path                                         XCPU entry
 fused wo_a / fp8_einsum                           grouped_wo_a
+mhc_pre_delayed_tilelang                          mhc_pre_delayed
+mhc_post_tilelang                                 mhc_post
 mhc_shifted_post_pre                              mhc_shifted_post_pre
+hc_collapse_triton                                hc_collapse
 fused_save_compress_norm                          fused_save_compress_norm
 rope_quant_insert                                 rope_quant_insert
 _custom_ops.topk_hash_softplus_sqrt               topk_hash_softplus_sqrt
@@ -19,6 +22,60 @@ this plugin too.
 """
 
 import torch
+
+
+def mhc_pre_delayed(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None = None,
+    x: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Lazy wrapper around ``torch_xcpu.ops.deepseek_v41_mhc_pre_delayed``."""
+    import torch_xcpu
+
+    return torch_xcpu.ops.deepseek_v41_mhc_pre_delayed(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        pre_mix=pre_mix,
+        x=x,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+
+def mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Lazy wrapper around ``torch_xcpu.ops.deepseek_v4_mhc_post``."""
+    import torch_xcpu
+
+    return torch_xcpu.ops.deepseek_v4_mhc_post(x, residual, post_mix, comb_mix)
+
+
+def hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    """Lazy wrapper around ``torch_xcpu.ops.deepseek_v41_hc_collapse``."""
+    import torch_xcpu
+
+    return torch_xcpu.ops.deepseek_v41_hc_collapse(x, pre_mix)
 
 
 def grouped_wo_a(

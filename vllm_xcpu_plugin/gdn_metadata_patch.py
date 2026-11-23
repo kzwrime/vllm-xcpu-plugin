@@ -16,10 +16,21 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 _ORIGINAL_GDN_METADATA_BUILD: Callable[..., GDNAttentionMetadata] | None = None
-# Resolved once in maybe_patch_gdn_metadata(), off the per-step path.
+# Resolved lazily on first mcpu build, off the per-step path and out of
+# API-server / EngineCore plugin registration.
 _BUILD_GDN_METADATA: Callable[..., tuple] | None = None
 _GDN_CORE_TENSORS: Callable[[list], list] | None = None
 _FLA_CHUNK_SIZE = 0
+
+
+def _ensure_gdn_metadata_ops() -> None:
+    global _BUILD_GDN_METADATA, _GDN_CORE_TENSORS
+    if _BUILD_GDN_METADATA is not None and _GDN_CORE_TENSORS is not None:
+        return
+    import torch_xcpu
+
+    _BUILD_GDN_METADATA = torch_xcpu._C.build_gdn_metadata
+    _GDN_CORE_TENSORS = torch_xcpu._C.gdn_core_tensors
 
 
 @dataclass
@@ -34,6 +45,8 @@ class XcpuGDNAttentionMetadata(GDNAttentionMetadata):
     xcpu_core_tensors: tuple[torch.Tensor, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
+        if _GDN_CORE_TENSORS is None:
+            _ensure_gdn_metadata_ops()
         assert _GDN_CORE_TENSORS is not None
         self.xcpu_core_tensors = tuple(
             _GDN_CORE_TENSORS([
@@ -92,6 +105,8 @@ def _xcpu_gdn_metadata_build(
 
     # One host call covers every batch shape (prefill, decode, spec decode and
     # their mixes); see torch_xcpu/csrc/gdn_metadata.cpp for the result order.
+    if _BUILD_GDN_METADATA is None:
+        _ensure_gdn_metadata_ops()
     assert _BUILD_GDN_METADATA is not None
     tensors, counts, request_rows = _BUILD_GDN_METADATA(
         query_start_loc,
@@ -267,13 +282,11 @@ def _xcpu_gdn_metadata_build(
 
 
 def maybe_patch_gdn_metadata() -> None:
-    global _ORIGINAL_GDN_METADATA_BUILD, _BUILD_GDN_METADATA, _FLA_CHUNK_SIZE
-    global _GDN_CORE_TENSORS
+    global _ORIGINAL_GDN_METADATA_BUILD, _FLA_CHUNK_SIZE
 
     if _ORIGINAL_GDN_METADATA_BUILD is not None:
         return
 
-    import torch_xcpu
     from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 
     from vllm_xcpu_plugin.upstream_compatibility import (
@@ -281,8 +294,6 @@ def maybe_patch_gdn_metadata() -> None:
     )
 
     verify_upstream_compatibility(("gdn_metadata",))
-    _BUILD_GDN_METADATA = torch_xcpu._C.build_gdn_metadata
-    _GDN_CORE_TENSORS = torch_xcpu._C.gdn_core_tensors
     _FLA_CHUNK_SIZE = FLA_CHUNK_SIZE
     _ORIGINAL_GDN_METADATA_BUILD = GDNAttentionMetadataBuilder.build
     GDNAttentionMetadataBuilder.build = wraps(_ORIGINAL_GDN_METADATA_BUILD)(  # type: ignore[method-assign]

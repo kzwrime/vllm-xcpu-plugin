@@ -63,7 +63,7 @@ class XcpuSleepModeBackend(SleepModeBackend):
     def is_supported(cls) -> bool:
         try:
             import torch_xcpu
-        except ImportError:
+        except (ImportError, OSError):
             return False
         return hasattr(torch_xcpu, "device_runtime_sleep") and hasattr(
             torch_xcpu, "device_runtime_wake_up"

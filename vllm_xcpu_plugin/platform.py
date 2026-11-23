@@ -339,9 +339,12 @@ class McpuPlatform(Platform):
     def is_sleep_mode_available(self) -> bool:
         # /sleep and /wake_up release and reacquire the device compute runtime
         # through torch_xcpu while device memory stays mapped; see sleep_mode.py.
-        from vllm_xcpu_plugin.sleep_mode import XcpuSleepModeBackend
-
-        return XcpuSleepModeBackend.is_supported()
+        # Do not import torch_xcpu here: ModelConfig checks this in API-server
+        # and EngineCore processes, while importing torch_xcpu initializes the
+        # NPU runtime (and x86 head-only nodes do not carry NPU libraries).
+        # SleepModeBackendFactory.create_backend() still verifies
+        # XcpuSleepModeBackend.is_supported() inside the worker process.
+        return True
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

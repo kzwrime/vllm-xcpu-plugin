@@ -3,6 +3,7 @@
 import torch
 
 _LIBRARY: torch.library.Library | None = None
+_LAZY_LIBRARY: torch.library.Library | None = None
 _REGISTERED = False
 
 
@@ -84,15 +85,46 @@ def _rms_norm(
         out.copy_(result.reshape(input.shape))
 
 
+def _lazy_rms_norm(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    epsilon: float,
+) -> None:
+    register_rms_norm_kernel()
+    torch.ops._C.rms_norm(out, input, weight, epsilon)
+
+
+def register_lazy_rms_norm_kernel() -> None:
+    """Defer importing ``torch_xcpu`` until PrivateUse1 execution or worker init.
+
+    General plugins run in API-server and EngineCore processes as well, while
+    importing ``torch_xcpu`` initializes NPU runtime libraries that must only
+    be loaded in worker processes.
+    """
+    global _LAZY_LIBRARY
+    if _REGISTERED or _LAZY_LIBRARY is not None:
+        return
+    import vllm._custom_ops  # noqa: F401
+
+    library = torch.library.Library("_C", "IMPL", "PrivateUse1")
+    library.impl("rms_norm", _lazy_rms_norm)
+    _LAZY_LIBRARY = library
+
+
 def register_rms_norm_kernel() -> None:
     """Keep the upstream schema and route PrivateUse1 to native grouped RMS."""
-    global _LIBRARY, _REGISTERED
+    global _LIBRARY, _LAZY_LIBRARY, _REGISTERED
     if _REGISTERED:
         return
     # Import loads the upstream _C schema before registering its implementation.
     import torch_xcpu
     import torch_xcpu.debug
     import vllm._custom_ops  # noqa: F401
+
+    if _LAZY_LIBRARY is not None:
+        _LAZY_LIBRARY._destroy()
+        _LAZY_LIBRARY = None
 
     if torch_xcpu.debug._get_enable_input_print():
         library = torch.library.Library("_C", "IMPL", "PrivateUse1")

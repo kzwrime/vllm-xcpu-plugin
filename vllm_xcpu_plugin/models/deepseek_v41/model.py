@@ -9,7 +9,7 @@ only on MCPU, after the upstream contracts (``upstream.py``) are verified.
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +40,7 @@ from vllm_xcpu_plugin.upstream_contracts import rebind
 from . import ops
 from .attention import XcpuDeepseekV41Attention
 from .backends import XcpuDeepseekV41IndexerCache
+from .sp_aux import SpShardedAuxHiddenStates
 from .triton_adapters import register_deepseek_v41_kernels
 
 logger = init_logger(__name__)
@@ -165,13 +166,6 @@ class _XcpuDeepseekV41LayerStack(nn.Module):
         super().__init__()
         self.layers = model.layers
         self.__dict__["model"] = model
-
-
-class SpShardedAuxHiddenStates(NamedTuple):
-    """Packed SP-sharded target aux hidden states handed to DSpark."""
-
-    packed_shard: torch.Tensor
-    full_num_tokens: int
 
 
 @support_torch_compile
@@ -583,27 +577,22 @@ def install_deepseek_v41() -> None:
     global _INSTALLED
     if _INSTALLED or current_platform.device_name != "mcpu":
         return
-    import torch_xcpu
 
     verify_upstream_compatibility(("deepseek_v41",))
     register_deepseek_v41_kernels()
     rebind(vllm_ops, "topk_hash_softplus_sqrt", ops.topk_hash_softplus_sqrt)
     rebind(nv_model, "_select_dsv4_attn_cls", _select_attn_cls)
-    rebind(
-        nv_model,
-        "mhc_pre_delayed_tilelang",
-        torch_xcpu.ops.deepseek_v41_mhc_pre_delayed,
-    )
-    rebind(nv_model, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
+    rebind(nv_model, "mhc_pre_delayed_tilelang", ops.mhc_pre_delayed)
+    rebind(nv_model, "mhc_post_tilelang", ops.mhc_post)
     rebind(nv_model, "mhc_shifted_post_pre", ops.mhc_shifted_post_pre)
-    rebind(nv_model, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
+    rebind(nv_model, "hc_collapse_triton", ops.hc_collapse)
     rebind(nv_model.DeepseekV41LLMForCausalLM, "model_cls", XcpuDeepseekV41Model)
     rebind(nv_model, "sp_reduce_scatter", _sp_reduce_scatter)
     rebind(nv_model, "gather_engram_hashes", _gather_engram_hashes)
     rebind(nv_model, "get_engram_dp_size", _get_engram_dp_size)
     rebind(nv_dspark, "DSparkDeepseekV4Model", XcpuDSparkDeepseekV41Model)
-    rebind(nv_dspark, "mhc_post_tilelang", torch_xcpu.ops.deepseek_v4_mhc_post)
-    rebind(nv_dspark, "hc_collapse_triton", torch_xcpu.ops.deepseek_v41_hc_collapse)
+    rebind(nv_dspark, "mhc_post_tilelang", ops.mhc_post)
+    rebind(nv_dspark, "hc_collapse_triton", ops.hc_collapse)
     rebind(nv_dspark, "_insert_context_kv", _insert_context_kv)
     rebind(v41_attention, "dsa_indexer_uses_fp4", _indexer_uses_fp4)
     rebind(v41_attention, "_use_v41_mxfp8_kv_record", _use_v41_mxfp8_kv_record)

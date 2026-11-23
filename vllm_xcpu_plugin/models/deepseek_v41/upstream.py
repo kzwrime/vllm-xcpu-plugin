@@ -251,8 +251,8 @@ MANIFEST = Manifest(
             id="deepseek_v41.model.mhc",
             source=_V031,
             downstream=(
-                "torch_xcpu.ops:deepseek_v41_mhc_pre_delayed",
-                "torch_xcpu.ops:deepseek_v4_mhc_post",
+                "vllm_xcpu_plugin.models.deepseek_v41.ops:mhc_pre_delayed",
+                "vllm_xcpu_plugin.models.deepseek_v41.ops:mhc_post",
                 "vllm_xcpu_plugin.models.deepseek_v41.ops:mhc_shifted_post_pre",
             ),
             upstream=(
@@ -321,7 +321,7 @@ MANIFEST = Manifest(
         Patch(
             id="deepseek_v41.model.hc_collapse",
             source=_V031,
-            downstream=("torch_xcpu.ops:deepseek_v41_hc_collapse",),
+            downstream=("vllm_xcpu_plugin.models.deepseek_v41.ops:hc_collapse",),
             upstream=(
                 UpstreamRef(
                     target="vllm.models.deepseek_v41.nvidia.model:hc_collapse_triton",

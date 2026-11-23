@@ -239,7 +239,10 @@ class McpuWorker(Worker):
         import torch_mcpu  # noqa
         import torch_xcpu
 
+        from vllm_xcpu_plugin.rms_norm_dispatch import register_rms_norm_kernel
+
         num_pes = torch_xcpu.initialize_runtime()
+        register_rms_norm_kernel()
         num_compute_units = current_platform.num_compute_units(self.device.index)
         logger.info(
             "Initialized torch_xcpu runtime with %d xthd PEs; "
