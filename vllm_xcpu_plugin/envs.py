@@ -181,6 +181,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_DSPARK_MARKOV_DTYPE": lambda: (
         os.getenv("VLLM_XCPU_DSPARK_MARKOV_DTYPE", "bf16").strip().lower()
     ),
+    # Enable fused XCPU rejection verification/resampling (default 1).
+    # Set to 0 (or false/off/no) to fall back to the unfused rejection_sample() path.
+    "VLLM_XCPU_REJECTION_SAMPLE_FUSED": lambda: (
+        os.getenv("VLLM_XCPU_REJECTION_SAMPLE_FUSED", "1").strip().lower()
+        in ("1", "true", "on", "yes")
+    ),
+    # Synchronous token-range diagnostic checks in spec-decode / rejection ops
+    # (default 0).
+    "VLLM_XCPU_CHECK_TOKEN_RANGE": lambda: (
+        os.getenv("VLLM_XCPU_CHECK_TOKEN_RANGE", "0").strip().lower()
+        in ("1", "true", "on", "yes")
+    ),
 }
 
 # end-env-vars-definition

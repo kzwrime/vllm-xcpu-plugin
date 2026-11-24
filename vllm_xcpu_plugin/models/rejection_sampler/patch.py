@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
@@ -21,6 +23,95 @@ from vllm_xcpu_plugin.upstream_contracts import rebind
 _INSTALLED = False
 
 _SUPPORTED_LOGITS_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+_REJECTION_FUSED_ENV = "VLLM_XCPU_REJECTION_SAMPLE_FUSED"
+_CHECK_TOKEN_RANGE_ENV = "VLLM_XCPU_CHECK_TOKEN_RANGE"
+
+
+def _parse_bool_env(name: str, default: str) -> bool:
+    raw = os.environ.get(name, default).strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    raise ValueError(
+        f"Unsupported {name}={raw!r}; "
+        "expected one of: 1, 0, true, false, on, off, yes, no"
+    )
+
+
+def _rejection_sample_fused_enabled() -> bool:
+    return _parse_bool_env(_REJECTION_FUSED_ENV, "1")
+
+
+def _single_op_rejection_override_active() -> bool:
+    """Respect single-op A0/B0 switches unless fused impl is explicitly pinned."""
+    if os.environ.get("TORCH_XCPU_VLLM_REJECTION_SAMPLE_FUSED_IMPL", "").strip():
+        return False
+    return bool(
+        os.environ.get(
+            "TORCH_XCPU_VLLM_REJECTION_COMPUTE_LOCAL_LOGITS_STATS_IMPL", ""
+        ).strip()
+        or os.environ.get("TORCH_XCPU_VLLM_REJECTION_RESAMPLE_IMPL", "").strip()
+    )
+
+
+def _sync_device_for_diag(tensor: torch.Tensor) -> None:
+    if tensor.device.type == "mcpu" and hasattr(torch, "mcpu"):
+        torch.mcpu.synchronize()
+    elif tensor.device.type == "privateuseone" and hasattr(torch, "accelerator"):
+        torch.accelerator.synchronize()
+
+
+def _check_draft_sampled_range(
+    verify_draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    _sync_device_for_diag(verify_draft_sampled)
+    cu_cpu = cu_num_logits.detach().cpu()
+    active_logits = int(cu_cpu[-1].item()) if cu_cpu.numel() > 0 else 0
+    if active_logits <= 0:
+        return
+    ds_cpu = verify_draft_sampled[:active_logits].detach().cpu()
+    invalid = (ds_cpu < -1) | (ds_cpu >= vocab_size)
+    if bool(invalid.any().item()):
+        bad_idx = int(invalid.nonzero(as_tuple=False)[0].item())
+        bad_val = int(ds_cpu[bad_idx].item())
+        raise RuntimeError(
+            f"{_CHECK_TOKEN_RANGE_ENV}=1 violation at verify_entry.draft_sampled: "
+            f"idx={bad_idx} val={bad_val} outside [-1, {vocab_size})"
+        )
+
+
+def _check_sampled_outputs_range(
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    _sync_device_for_diag(sampled)
+    sampled_cpu = sampled.detach().cpu()
+    ns_cpu = num_sampled.detach().cpu()
+    num_reqs = sampled_cpu.shape[0]
+    width = sampled_cpu.shape[1]
+    for r in range(num_reqs):
+        n = int(ns_cpu[r].item())
+        if n < 0 or n > width:
+            raise RuntimeError(
+                f"{_CHECK_TOKEN_RANGE_ENV}=1 violation at verify_exit.num_sampled: "
+                f"req={r} num_sampled={n} outside [0, {width}]"
+            )
+        if n == 0:
+            continue
+        row = sampled_cpu[r, :n]
+        invalid = (row < 0) | (row >= vocab_size)
+        if bool(invalid.any().item()):
+            col = int(invalid.nonzero(as_tuple=False)[0].item())
+            bad_val = int(row[col].item())
+            raise RuntimeError(
+                f"{_CHECK_TOKEN_RANGE_ENV}=1 violation at verify_exit.sampled: "
+                f"req={r} col={col} val={bad_val} outside [0, {vocab_size}), "
+                f"row={row.tolist()}"
+            )
 
 
 def _can_fuse_target_temperature(sampler: Sampler, idx_mapping_np: np.ndarray) -> bool:
@@ -75,8 +166,25 @@ def _xcpu_rejection_sampler_verify(
     seq_lens_upper_bound_np: np.ndarray,
     verify_draft_sampled: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fused_enabled = _rejection_sample_fused_enabled()
+    check_token_range = _parse_bool_env(_CHECK_TOKEN_RANGE_ENV, "0")
+    fused_impl_pinned = bool(
+        os.environ.get("TORCH_XCPU_VLLM_REJECTION_SAMPLE_FUSED_IMPL", "").strip()
+    )
+
+    vocab_size = (
+        min(logits.shape[1], draft_logits.shape[-1])
+        if draft_logits is not None
+        else logits.shape[1]
+    )
+    if check_token_range:
+        _check_draft_sampled_range(verify_draft_sampled, cu_num_logits, vocab_size)
+
     fused_eligible = (
-        logits.device.type in ("mcpu", "privateuseone")
+        fused_enabled
+        and not _single_op_rejection_override_active()
+        and (not check_token_range or fused_impl_pinned)
+        and logits.device.type in ("mcpu", "privateuseone")
         and logits.ndim == 2
         and logits.stride(-1) == 1
         and logits.dtype in _SUPPORTED_LOGITS_DTYPES
@@ -122,6 +230,8 @@ def _xcpu_rejection_sampler_verify(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
         )
+        if check_token_range:
+            _check_sampled_outputs_range(sampled, num_sampled, vocab_size)
         return processed_logits, sampled, num_sampled
 
     if not np.any(self.sampler.needs_logits_processing[idx_mapping_np]):
@@ -146,11 +256,6 @@ def _xcpu_rejection_sampler_verify(
     from torch_xcpu import ops as xcpu_ops
 
     num_reqs = cu_num_logits.shape[0] - 1
-    vocab_size = (
-        min(processed_logits.shape[1], draft_logits.shape[-1])
-        if draft_logits is not None
-        else processed_logits.shape[1]
-    )
     sampled = verify_draft_sampled.new_empty(
         num_reqs, self.num_speculative_steps + 1, dtype=torch.int64
     )
@@ -170,6 +275,8 @@ def _xcpu_rejection_sampler_verify(
         self.sampler.use_fp64_gumbel,
         apply_target_temperature,
     )
+    if check_token_range:
+        _check_sampled_outputs_range(sampled, num_sampled, vocab_size)
     return processed_logits, sampled, num_sampled
 
 

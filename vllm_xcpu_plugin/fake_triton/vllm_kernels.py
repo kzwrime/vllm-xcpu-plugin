@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import logging
 import math
+import os
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -27,6 +28,22 @@ logger = logging.getLogger(__name__)
 def _expect(condition: bool, message: str) -> None:
     if not condition:
         raise InvalidLaunchError(message)
+
+
+def _token_range_check_enabled() -> bool:
+    return os.environ.get("VLLM_XCPU_CHECK_TOKEN_RANGE", "0").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def _sync_for_token_range(tensor: torch.Tensor) -> None:
+    if tensor.device.type == "mcpu" and hasattr(torch, "mcpu"):
+        torch.mcpu.synchronize()
+    elif tensor.device.type == "privateuseone" and hasattr(torch, "accelerator"):
+        torch.accelerator.synchronize()
 
 
 def _expect_grid(launch: KernelLaunch, expected: tuple[int, ...]) -> None:
@@ -1059,6 +1076,23 @@ def _rejection_compute_local_logits_stats(launch: KernelLaunch) -> None:
         args["num_speculative_steps"],
         block_size,
     )
+    if _token_range_check_enabled():
+        _sync_for_token_range(args["target_local_argmax_ptr"])
+        map_cpu = args["expanded_idx_mapping_ptr"].detach().cpu()
+        lpos_cpu = args["expanded_local_pos_ptr"].detach().cpu()
+        temp_cpu = args["temp_ptr"].detach().cpu()
+        greedy_rows = (
+            (map_cpu >= 0)
+            & (lpos_cpu < args["num_speculative_steps"])
+            & (temp_cpu[map_cpu.long().clamp_min(0)] == 0.0)
+        )
+        if bool(greedy_rows.any().item()):
+            arg_cpu = args["target_local_argmax_ptr"].detach().cpu()[greedy_rows]
+            if bool(((arg_cpu < 0) | (arg_cpu >= vocab_size)).any().item()):
+                raise RuntimeError(
+                    "VLLM_XCPU_CHECK_TOKEN_RANGE=1 violation at "
+                    "rejection_stats.target_local_argmax"
+                )
 
 
 def _rejection_cumulative_log_p(launch: KernelLaunch) -> None:
@@ -1170,6 +1204,20 @@ def _rejection_v2(launch: KernelLaunch) -> None:
     vocab_size = args["target_logits_ptr"].shape[1]
     if args["HAS_DRAFT_LOGITS"]:
         vocab_size = min(vocab_size, draft_logits.shape[-1])
+    if _token_range_check_enabled():
+        _sync_for_token_range(args["draft_sampled_ptr"])
+        cu_cpu = args["cu_num_logits_ptr"].detach().cpu()
+        active_logits = int(cu_cpu[-1].item()) if cu_cpu.numel() > 0 else 0
+        if active_logits > 0:
+            ds_cpu = args["draft_sampled_ptr"][:active_logits].detach().cpu()
+            invalid = (ds_cpu < -1) | (ds_cpu >= vocab_size)
+            if bool(invalid.any().item()):
+                bad_idx = int(invalid.nonzero(as_tuple=False)[0].item())
+                raise RuntimeError(
+                    "VLLM_XCPU_CHECK_TOKEN_RANGE=1 violation at "
+                    f"rejection_v2.draft_sampled idx={bad_idx} "
+                    f"val={int(ds_cpu[bad_idx].item())} vocab_size={vocab_size}"
+                )
     torch.ops.mcpu.vllm_rejection(
         args["sampled_ptr"],
         args["rejected_steps_ptr"],
@@ -1253,6 +1301,30 @@ def _rejection_resample(launch: KernelLaunch) -> None:
         args["USE_FP64"],
         args["USE_BLOCK_VERIFICATION"],
     )
+    if _token_range_check_enabled():
+        _sync_for_token_range(args["resampled_local_argmax_ptr"])
+        rs_cpu = args["rejected_step_ptr"].detach().cpu()
+        cu_cpu = args["cu_num_logits_ptr"].detach().cpu()
+        map_cpu = args["expanded_idx_mapping_ptr"].detach().cpu()
+        temp_cpu = args["temp_ptr"].detach().cpu()
+        res_arg_cpu = args["resampled_local_argmax_ptr"].detach().cpu()
+        for r in range(num_reqs):
+            st = int(cu_cpu[r].item())
+            en = int(cu_cpu[r + 1].item())
+            tidx = st + int(rs_cpu[r].item())
+            if tidx < st or tidx >= en:
+                continue
+            is_bonus = tidx == en - 1
+            rs_state = int(map_cpu[tidx].item())
+            tval = float(temp_cpu[rs_state].item())
+            if tval == 0.0 and not is_bonus:
+                continue
+            row = res_arg_cpu[r]
+            if bool(((row < 0) | (row >= vocab_size)).any().item()):
+                raise RuntimeError(
+                    "VLLM_XCPU_CHECK_TOKEN_RANGE=1 violation at "
+                    f"rejection_resample.local_argmax req={r}: {row.tolist()}"
+                )
 
 
 def _rejection_insert(launch: KernelLaunch) -> None:
@@ -1315,6 +1387,26 @@ def _dflash2_selector_walk(launch: KernelLaunch) -> None:
         args["SAMPLE_PROBABILISTIC"],
         args["USE_FP64"],
     )
+    if _token_range_check_enabled():
+        _sync_for_token_range(args["tokens_ptr"])
+        cand_cpu = candidates.detach().cpu()
+        tok_cpu = args["tokens_ptr"][:num_reqs].detach().cpu()
+        state_cpu = args["req_state_ptr"][: num_reqs * num_steps].detach().cpu()
+        for r in range(num_reqs):
+            if int(state_cpu[r * num_steps].item()) < 0:
+                continue
+            if bool((cand_cpu[r] < 0).any().item()):
+                raise RuntimeError(
+                    "VLLM_XCPU_CHECK_TOKEN_RANGE=1 violation at "
+                    f"dflash2_walk.candidates req={r}"
+                )
+            for s in range(num_steps):
+                t = int(tok_cpu[r, s].item())
+                if t not in cand_cpu[r, s].tolist():
+                    raise RuntimeError(
+                        "VLLM_XCPU_CHECK_TOKEN_RANGE=1 violation at "
+                        f"dflash2_walk.tokens req={r} step={s} tok={t}"
+                    )
 
 
 def _dflash2_cache_draft_logits(launch: KernelLaunch) -> None:

@@ -782,3 +782,191 @@ def test_rejection_sampler_verify_watermark_fallback(monkeypatch) -> None:
     )
     assert apply_calls == [1]
     assert fallback_called == [True]
+
+
+def test_rejection_sampler_fused_disabled_manual_fallback(monkeypatch) -> None:
+    vocab_size = 128
+    num_reqs = 2
+    n_spec = 3
+    sampler, _ = _build_fake_sampler(vocab_size=vocab_size)
+    sampler.sampling_states.temperature.np[:num_reqs] = [0.0, 0.7]
+    sampler.sampling_states.temperature.gpu = torch.tensor(
+        sampler.sampling_states.temperature.np, dtype=torch.float32, device="mcpu"
+    )
+    sampler.needs_logits_processing[:num_reqs] = True
+    rs = SimpleNamespace(
+        sampler=sampler,
+        num_speculative_steps=n_spec,
+        use_block_verification=False,
+        synthetic_conditional_rates=None,
+        watermark_key=None,
+        _watermarking_kwargs=lambda *_a, **_k: {},
+    )
+    torch.manual_seed(17)
+    logits = (
+        (torch.randn((num_reqs * (n_spec + 1), vocab_size)) * 1.5)
+        .bfloat16()
+        .to("mcpu")
+    )
+    draft_logits = (torch.randn((8, n_spec, vocab_size)) * 1.5).bfloat16().to("mcpu")
+    draft_sampled = torch.randint(
+        0, vocab_size, (logits.shape[0],), dtype=torch.int32, device="mcpu"
+    )
+    pos = torch.arange(logits.shape[0], dtype=torch.int64, device="mcpu")
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32, device="mcpu")
+    idx_m = torch.tensor([0, 1], dtype=torch.int32, device="mcpu")
+    idx_np = np.array([0, 1], dtype=np.int64)
+    exp_m = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32, device="mcpu")
+    exp_lp = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32, device="mcpu")
+    seq_ub = np.array([10, 10], dtype=np.int32)
+
+    _, fused_sampled, fused_num = _xcpu_rejection_sampler_verify(
+        rs,
+        logits,
+        draft_logits,
+        draft_sampled,
+        pos,
+        cu,
+        idx_m,
+        idx_np,
+        exp_m,
+        exp_lp,
+        seq_ub,
+        draft_sampled,
+    )
+
+    monkeypatch.setenv("VLLM_XCPU_REJECTION_SAMPLE_FUSED", "0")
+    fused_spy = []
+    monkeypatch.setattr(
+        xcpu_ops,
+        "vllm_rejection_sample_fused",
+        lambda *_a, **_k: fused_spy.append(True),
+    )
+    unfused_spy = []
+    monkeypatch.setattr(
+        rej_patch_mod,
+        "rejection_sample",
+        lambda *_a, **_k: (
+            unfused_spy.append(True)
+            or (
+                torch.tensor(
+                    [[1, 2, 3, -1], [4, 5, -1, -1]],
+                    dtype=torch.int64,
+                    device="mcpu",
+                ),
+                torch.tensor([3, 2], dtype=torch.int32, device="mcpu"),
+            )
+        ),
+    )
+    _, fb_sampled, fb_num = _xcpu_rejection_sampler_verify(
+        rs,
+        logits,
+        draft_logits,
+        draft_sampled,
+        pos,
+        cu,
+        idx_m,
+        idx_np,
+        exp_m,
+        exp_lp,
+        seq_ub,
+        draft_sampled,
+    )
+    assert fused_spy == []
+    assert unfused_spy == [True]
+    assert fb_num.cpu().tolist() == [3, 2]
+
+    # Single-op IMPL override must also bypass fused path.
+    monkeypatch.delenv("VLLM_XCPU_REJECTION_SAMPLE_FUSED", raising=False)
+    monkeypatch.setenv("TORCH_XCPU_VLLM_REJECTION_RESAMPLE_IMPL", "A0")
+    _xcpu_rejection_sampler_verify(
+        rs,
+        logits,
+        draft_logits,
+        draft_sampled,
+        pos,
+        cu,
+        idx_m,
+        idx_np,
+        exp_m,
+        exp_lp,
+        seq_ub,
+        draft_sampled,
+    )
+    assert fused_spy == []
+    assert unfused_spy == [True, True]
+    assert fused_sampled.shape == fb_sampled.shape
+    assert fused_num.numel() == 2
+
+
+def test_rejection_sampler_fused_invalid_env_raises(monkeypatch) -> None:
+    sampler, _ = _build_fake_sampler(vocab_size=64)
+    rs = SimpleNamespace(
+        sampler=sampler,
+        num_speculative_steps=2,
+        use_block_verification=False,
+        synthetic_conditional_rates=None,
+        watermark_key=None,
+        _watermarking_kwargs=lambda *_a, **_k: {},
+    )
+    monkeypatch.setenv("VLLM_XCPU_REJECTION_SAMPLE_FUSED", "invalid")
+    logits = torch.zeros((3, 64), dtype=torch.float32, device="mcpu")
+    ds = torch.zeros((3,), dtype=torch.int32, device="mcpu")
+    pos = torch.arange(3, dtype=torch.int64, device="mcpu")
+    cu = torch.tensor([0, 3], dtype=torch.int32, device="mcpu")
+    idx_m = torch.tensor([0], dtype=torch.int32, device="mcpu")
+    idx_np = np.array([0], dtype=np.int64)
+    exp_m = torch.zeros((3,), dtype=torch.int32, device="mcpu")
+    exp_lp = torch.tensor([0, 1, 2], dtype=torch.int32, device="mcpu")
+    with pytest.raises(ValueError, match="VLLM_XCPU_REJECTION_SAMPLE_FUSED"):
+        _xcpu_rejection_sampler_verify(
+            rs,
+            logits,
+            None,
+            ds,
+            pos,
+            cu,
+            idx_m,
+            idx_np,
+            exp_m,
+            exp_lp,
+            np.array([5]),
+            ds,
+        )
+
+
+def test_rejection_sampler_check_token_range_catches_oob(monkeypatch) -> None:
+    vocab_size = 64
+    sampler, _ = _build_fake_sampler(vocab_size=vocab_size)
+    rs = SimpleNamespace(
+        sampler=sampler,
+        num_speculative_steps=2,
+        use_block_verification=False,
+        synthetic_conditional_rates=None,
+        watermark_key=None,
+        _watermarking_kwargs=lambda *_a, **_k: {},
+    )
+    monkeypatch.setenv("VLLM_XCPU_CHECK_TOKEN_RANGE", "1")
+    logits = torch.zeros((3, vocab_size), dtype=torch.float32, device="mcpu")
+    ds_oob = torch.tensor([0, vocab_size + 3, 1], dtype=torch.int32, device="mcpu")
+    pos = torch.arange(3, dtype=torch.int64, device="mcpu")
+    cu = torch.tensor([0, 3], dtype=torch.int32, device="mcpu")
+    idx_m = torch.tensor([0], dtype=torch.int32, device="mcpu")
+    idx_np = np.array([0], dtype=np.int64)
+    exp_m = torch.zeros((3,), dtype=torch.int32, device="mcpu")
+    exp_lp = torch.tensor([0, 1, 2], dtype=torch.int32, device="mcpu")
+    with pytest.raises(RuntimeError, match="VLLM_XCPU_CHECK_TOKEN_RANGE=1"):
+        _xcpu_rejection_sampler_verify(
+            rs,
+            logits,
+            None,
+            ds_oob,
+            pos,
+            cu,
+            idx_m,
+            idx_np,
+            exp_m,
+            exp_lp,
+            np.array([5]),
+            ds_oob,
+        )
