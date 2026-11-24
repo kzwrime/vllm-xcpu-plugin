@@ -51,17 +51,32 @@ def configure_attention_model_loader(load_config: LoadConfig) -> None:
     load_config.load_format = _FORMAT_PREFIX + base_format
 
 
-def shards_with_engram_tables(hf_folder: str, index_file: str) -> set[str]:
-    """Shard file names that hold an Engram table, from the safetensors index."""
-    index_path = os.path.join(hf_folder, index_file)
-    if not os.path.isfile(index_path):
-        raise ValueError(
-            f"Engram disaggregation needs the safetensors index {index_path} to "
-            "locate the Engram tables"
-        )
-    with open(index_path) as handle:
-        weight_map = json.load(handle)["weight_map"]
-    return {file for name, file in weight_map.items() if is_engram_table(name)}
+def shards_with_engram_tables(
+    hf_folder: str,
+    index_file: str,
+    hf_weights_files: list[str] | None = None,
+    mode_name: str = "Engram disaggregation",
+) -> set[str]:
+    """Shard file names that hold an Engram table, from index or single file."""
+    index_path = os.path.join(hf_folder, index_file) if index_file else ""
+    if index_path and os.path.isfile(index_path):
+        with open(index_path) as handle:
+            weight_map = json.load(handle)["weight_map"]
+        return {
+            os.path.basename(file)
+            for name, file in weight_map.items()
+            if is_engram_table(name)
+        }
+    if hf_weights_files is not None and len(hf_weights_files) == 1:
+        single_file = hf_weights_files[0]
+        with safe_open(single_file, framework="pt") as handle:
+            if any(is_engram_table(name) for name in handle.keys()):  # noqa: SIM118
+                return {os.path.basename(single_file)}
+        return set()
+    raise ValueError(
+        f"{mode_name} needs the safetensors index {index_path} to locate the "
+        "Engram tables"
+    )
 
 
 def skip_engram_tables_iterator(

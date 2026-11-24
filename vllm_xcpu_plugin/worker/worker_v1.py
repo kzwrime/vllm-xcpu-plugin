@@ -139,20 +139,45 @@ class McpuWorker(Worker):
                     mpi_world.global_rank,
                     world_rank_across_dp,
                 )
+            if (
+                envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_DISAGG
+                and envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL
+            ):
+                raise ValueError(
+                    "VLLM_XCPU_ENABLE_ENGRAM_DISAGG and "
+                    "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL cannot both be enabled"
+                )
             if envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_DISAGG:
                 from vllm_xcpu_plugin.engram_disagg.attn.bootstrap import (
                     bootstrap_engram_client,
                 )
 
-                self._engram_client = bootstrap_engram_client(
+                disagg_client = bootstrap_engram_client(
                     mpi_world=mpi_world, vllm_config=self.vllm_config
                 )
+                self._engram_client = disagg_client
                 logger.info(
                     "Engram disaggregation client registered: world_rank=%d "
                     "attention_ranks=%d engram_ranks=%d",
                     mpi_world.global_rank,
-                    self._engram_client.session.num_attention_ranks,
-                    self._engram_client.session.num_engram_ranks,
+                    disagg_client.session.num_attention_ranks,
+                    disagg_client.session.num_engram_ranks,
+                )
+            elif envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL:
+                from vllm_xcpu_plugin.engram_parallel.bootstrap import (
+                    bootstrap_engram_parallel_client,
+                )
+
+                self._engram_client = bootstrap_engram_parallel_client(
+                    mpi_world=mpi_world,
+                    vllm_config=self.vllm_config,
+                    world_rank=world_rank_across_dp,
+                    world_size=world_size_across_dp,
+                )
+                logger.info(
+                    "EngramParallel client registered: world_rank=%d world_size=%d",
+                    world_rank_across_dp,
+                    world_size_across_dp,
                 )
             self.mpi_world_comm = mpi_world.cluster_comm
 
@@ -203,6 +228,10 @@ class McpuWorker(Worker):
         elif envs.VLLM_EPLB_COMM_BACKEND == "mpi":
             raise RuntimeError(
                 "VLLM_EPLB_COMM_BACKEND=mpi requires VLLM_CPU_USE_MPI=1."
+            )
+        elif envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL:
+            raise RuntimeError(
+                "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL requires VLLM_CPU_USE_MPI=1."
             )
 
         # device = self.device_config.device
@@ -319,8 +348,6 @@ class McpuWorker(Worker):
         if self._engram_client is not None:
             from vllm.models.deepseek_v41.nvidia.model import DeepseekV4Model
 
-            from vllm_xcpu_plugin.engram_disagg.common import EngramShardLayout
-
             layouts = [
                 module.engram_layout
                 for module in self.model_runner.get_model().modules()
@@ -328,13 +355,9 @@ class McpuWorker(Worker):
             ]
             if len(layouts) != 1 or layouts[0] is None:
                 raise RuntimeError(
-                    "Engram disaggregation needs one DeepseekV4Model with engram layers"
+                    "Engram client needs one DeepseekV4Model with engram layers"
                 )
-            self._engram_client.initialize(
-                EngramShardLayout.from_engram_layout(
-                    layouts[0], self._engram_client.session.num_engram_ranks
-                )
-            )
+            self._engram_client.initialize_from_engram_layout(layouts[0])
 
     def determine_available_memory(self) -> int:
         from vllm_xcpu_plugin import shared_kv_cache

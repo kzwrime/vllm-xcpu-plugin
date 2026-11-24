@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from vllm.logger import init_logger
 
@@ -57,7 +59,33 @@ class RemoteEngramClient:
     def session(self) -> EngramSession:
         return self._session
 
-    def bind_layer(self, use_sequence_parallel: bool, layer_hash_index: int) -> None:
+    def prepare_embedding(
+        self, layout: Any, layer_hash_index: int
+    ) -> tuple[int, int] | None:
+        del layout, layer_hash_index
+        return None
+
+    def consume_embedding_slice(
+        self, num_embeddings: int, head_sizes: tuple[int, ...]
+    ) -> tuple[int, int] | None:
+        del num_embeddings, head_sizes
+        return None
+
+    def initialize_from_engram_layout(self, layout: Any) -> None:
+        self.initialize(
+            EngramShardLayout.from_engram_layout(
+                layout, self._session.num_engram_ranks
+            )
+        )
+
+    def bind_layer(
+        self,
+        use_sequence_parallel: bool,
+        layer_hash_index: int,
+        weight: torch.Tensor | None = None,
+        scale: torch.Tensor | None = None,
+    ) -> None:
+        del weight, scale
         if self._slots is not None:
             raise RuntimeError("engram layers must bind before the client initializes")
         if (

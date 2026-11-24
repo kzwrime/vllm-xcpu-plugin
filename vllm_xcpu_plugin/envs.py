@@ -76,6 +76,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XCPU_ENABLE_ENGRAM_DISAGG": lambda: bool(
         int(os.getenv("VLLM_XCPU_ENABLE_ENGRAM_DISAGG", "0"))
     ),
+    # Enable DeepSeek-V4.1 EngramParallel: shard Engram tables in 2D across
+    # all DP x TP (= EP) worker ranks with no dedicated Engram ranks.
+    "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL": lambda: bool(
+        int(os.getenv("VLLM_XCPU_ENABLE_ENGRAM_PARALLEL", "0"))
+    ),
     # Optional global diagnostic barrier at every full A/F model pass entry.
     "VLLM_XCPU_AF_FORWARD_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_XCPU_AF_FORWARD_ALLREDUCE", "0"))

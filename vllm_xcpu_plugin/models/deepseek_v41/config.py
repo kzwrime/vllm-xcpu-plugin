@@ -27,8 +27,18 @@ def update_deepseek_v41_config(vllm_config: VllmConfig) -> None:
 
     model_config = vllm_config.model_config
     model_type = getattr(getattr(model_config, "hf_config", None), "model_type", "")
+    if (
+        envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_DISAGG
+        and envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL
+    ):
+        raise ValueError(
+            "VLLM_XCPU_ENABLE_ENGRAM_DISAGG and VLLM_XCPU_ENABLE_ENGRAM_PARALLEL "
+            "cannot both be enabled"
+        )
     if envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_DISAGG:
         _update_engram_disagg_config(vllm_config, engram_config, str(model_type))
+    elif envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL:
+        _update_engram_parallel_config(vllm_config, engram_config, str(model_type))
     if not str(model_type).startswith("deepseek_v41"):
         return
     attention_config = vllm_config.attention_config
@@ -50,27 +60,33 @@ def update_deepseek_v41_config(vllm_config: VllmConfig) -> None:
         )
 
 
-def _update_engram_disagg_config(
-    vllm_config: VllmConfig, engram_config, model_type: str
+def _update_distributed_engram_config(
+    vllm_config: VllmConfig,
+    engram_config,
+    model_type: str,
+    *,
+    mode_name: str,
+    env_flag: str,
+    world_desc: str,
+    table_location: str,
+    configure_loader,
 ) -> None:
-    """Engram disaggregation: the attention rank keeps no table."""
+    """Shared validation and knob overrides for distributed Engram modes."""
     if not model_type.startswith("deepseek_v41") or engram_config is None:
         raise ValueError(
-            "VLLM_XCPU_ENABLE_ENGRAM_DISAGG needs a DeepSeek-V4.1 model with engram "
+            f"{env_flag} needs a DeepSeek-V4.1 model with engram "
             f"layers, got model_type={model_type!r}"
         )
     if not envs_xcpu.VLLM_CPU_USE_MPI:
         raise ValueError(
-            "VLLM_XCPU_ENABLE_ENGRAM_DISAGG requires the MPI launcher "
-            "(VLLM_CPU_USE_MPI=1): the Engram ranks join the MPMD world"
+            f"{env_flag} requires the MPI launcher "
+            f"(VLLM_CPU_USE_MPI=1): {world_desc}"
         )
     if engram_config.embedding_across_dp:
         raise ValueError(
-            "engram_config.embedding_across_dp is not supported with Engram "
-            "disaggregation; the Engram ranks shard the tables"
+            f"engram_config.embedding_across_dp is not supported with {mode_name}; "
+            f"{table_location}"
         )
-    # The tables live on the Engram ranks whatever the host-memory settings
-    # say; log the discarded knobs instead of silently flipping them.
     overridden = [
         name
         for name in ("cpu_offload", "dp_shared_memory", "use_thp")
@@ -78,20 +94,59 @@ def _update_engram_disagg_config(
     ]
     if overridden:
         logger.info(
-            "Engram disaggregation: the tables live on the Engram ranks; "
-            "ignoring engram_config %s.",
+            "%s: %s; ignoring engram_config %s.",
+            mode_name,
+            table_location,
             ", ".join(overridden),
         )
     engram_config.cpu_offload = False
     engram_config.dp_shared_memory = False
     engram_config.use_thp = False
 
+    configure_loader(vllm_config.load_config)
+    logger.info(
+        "%s: %s (load format %s).",
+        mode_name,
+        table_location,
+        vllm_config.load_config.load_format,
+    )
+
+
+def _update_engram_disagg_config(
+    vllm_config: VllmConfig, engram_config, model_type: str
+) -> None:
+    """Engram disaggregation: the attention rank keeps no table."""
     from vllm_xcpu_plugin.engram_disagg.attn.model_loader import (
         configure_attention_model_loader,
     )
 
-    configure_attention_model_loader(vllm_config.load_config)
-    logger.info(
-        "Engram disaggregation: tables served by the Engram ranks (load format %s).",
-        vllm_config.load_config.load_format,
+    _update_distributed_engram_config(
+        vllm_config,
+        engram_config,
+        model_type,
+        mode_name="Engram disaggregation",
+        env_flag="VLLM_XCPU_ENABLE_ENGRAM_DISAGG",
+        world_desc="the Engram ranks join the MPMD world",
+        table_location="the tables live on the Engram ranks",
+        configure_loader=configure_attention_model_loader,
+    )
+
+
+def _update_engram_parallel_config(
+    vllm_config: VllmConfig, engram_config, model_type: str
+) -> None:
+    """EngramParallel: all DP x TP ranks shard the tables in 2D."""
+    from vllm_xcpu_plugin.engram_parallel.model_loader import (
+        configure_engram_parallel_model_loader,
+    )
+
+    _update_distributed_engram_config(
+        vllm_config,
+        engram_config,
+        model_type,
+        mode_name="EngramParallel",
+        env_flag="VLLM_XCPU_ENABLE_ENGRAM_PARALLEL",
+        world_desc="EngramParallel communicates across the MPI worker world",
+        table_location="the tables are 2D-sharded across all worker ranks",
+        configure_loader=configure_engram_parallel_model_loader,
     )

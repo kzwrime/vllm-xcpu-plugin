@@ -26,7 +26,8 @@ class ClientRegistry(Generic[T]):
     def register(self, client: T) -> None:
         """Register one worker's client before constructing its model layers."""
         if self._client is not None:
-            raise RuntimeError(f"a {self._what} client is already registered")
+            article = "an" if self._what[:1].lower() in "aeiou" else "a"
+            raise RuntimeError(f"{article} {self._what} client is already registered")
         self._client = client
 
     def unregister(self, client: T) -> None:

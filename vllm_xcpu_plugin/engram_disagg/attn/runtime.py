@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vllm_xcpu_plugin.disagg import ClientRegistry
 
 if TYPE_CHECKING:
     import torch
-
-    from ..common import EngramSession, EngramShardLayout
 
 
 class EngramClient(Protocol):
@@ -21,36 +19,53 @@ class EngramClient(Protocol):
     layer in layer order.
     """
 
-    # The transport session (worker bootstrap logging, shard rank counts).
     @property
-    def session(self) -> EngramSession: ...
+    def session(self) -> Any: ...
 
-    def bind_layer(self, use_sequence_parallel: bool, layer_hash_index: int) -> None:
-        """Register one engram layer's token sharding before initialize."""
+    def prepare_embedding(
+        self, layout: Any, layer_hash_index: int
+    ) -> tuple[int, int] | None:
+        """Stage a layer before ``ParallelEngramEmbedding`` construction."""
         ...
 
-    def initialize(self, shard: EngramShardLayout) -> None:
-        """Negotiate the exchange after the weights are loaded."""
+    def consume_embedding_slice(
+        self, num_embeddings: int, head_sizes: tuple[int, ...]
+    ) -> tuple[int, int] | None:
+        """Return ``(lo, hi)`` rows owned locally, or ``None`` if remote."""
+        ...
+
+    def bind_layer(
+        self,
+        use_sequence_parallel: bool,
+        layer_hash_index: int,
+        weight: torch.Tensor | None = None,
+        scale: torch.Tensor | None = None,
+    ) -> None:
+        """Register one engram layer's token sharding (and optional local slice)
+        before initialize."""
+        ...
+
+    def initialize_from_engram_layout(self, layout: Any) -> None:
+        """Negotiate the exchange from ``EngramLayout`` after weights load."""
         ...
 
     def request(self, engram_hashes: torch.Tensor) -> None:
-        """Post this rank's tokens' hash ids ``[T, layers, cols]`` to the
-        Engram ranks and the receive of their reply."""
+        """Post this rank's tokens' hash ids ``[T, layers, cols]``."""
         ...
 
     def fill_rows(self, layer_hash_index: int, rows: torch.Tensor) -> None:
         """Write layer ``layer_hash_index``'s rows into ``rows`` [tokens, cols, dim]
-        (layer 0 waits for the reply first)."""
+        (layer 0 collects the reply first)."""
         ...
 
     def stop(self) -> None:
-        """Tell the Engram ranks to exit (every attention rank must call it)."""
+        """Tear down exchange state and communicator."""
         ...
 
 
 # vLLM's layer factory cannot receive a worker argument. This bridge supplies
 # the worker's client during model construction and forward.
-REGISTRY: ClientRegistry[EngramClient] = ClientRegistry("Engram disaggregation")
+REGISTRY: ClientRegistry[EngramClient] = ClientRegistry("Engram")
 
 
 def get_engram_client() -> EngramClient | None:

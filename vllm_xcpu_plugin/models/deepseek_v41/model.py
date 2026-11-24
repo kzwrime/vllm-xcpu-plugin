@@ -329,19 +329,23 @@ class XcpuDeepseekV41Model(DeepseekV4Model):
         if (
             engram_hashes is None
             and self.engram_hash is not None
-            and not self.source_layers.do_not_compile
+            and (
+                not self.source_layers.do_not_compile
+                or get_engram_client() is not None
+            )
         ):
             # Profile and warmup runs hash nothing; the graph keeps the engram
-            # layers anyway, fed dead n-grams whose gate is shut.
-            engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
-            client = get_engram_client()
-            if client is not None:
-                # The Engram ranks still expect this forward's request.
-                client.request(engram_hashes)
+            # layers anyway, fed dead n-grams whose gate is shut. ``positions``
+            # holds the pre-``sp_shard`` token count (``input_ids`` is already
+            # SP-sharded, or None when ``inputs_embeds`` is passed).
+            engram_hashes, engram_mask = self.engram_hash.dummy_hashes(positions)
+            gathered_hashes = _gather_engram_hashes(
+                engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
             for layer in islice(self.layers, self.start_layer, self.end_layer):
                 if layer.engram is not None:
                     layer.engram.prepare_embeddings(
-                        engram_hashes[:, layer.engram.layer_hash_index]
+                        gathered_hashes[:, layer.engram.layer_hash_index]
                     )
         outputs = self.source_layers(
             hidden_states,

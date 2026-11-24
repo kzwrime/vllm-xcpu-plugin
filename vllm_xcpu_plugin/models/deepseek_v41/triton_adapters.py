@@ -234,7 +234,10 @@ def _engram_select_rows(launch: KernelLaunch) -> None:
     num_tokens, token_start = args["num_tokens"], args["token_start"]
     local_width, width = args["LOCAL_WIDTH"], args["WIDTH"]
     _expect(args["num_elements"] == output.numel(), "engram select size mismatch")
-    _expect(width % local_width == 0, "engram width is not a multiple of local width")
+    _expect(
+        local_width > 0 and width > 0 and args["num_elements"] % width == 0,
+        "engram select width mismatch",
+    )
     rows = output.numel() // width
     if rows == 0:
         return

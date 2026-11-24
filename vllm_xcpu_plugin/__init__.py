@@ -33,6 +33,7 @@ def register_ops():
     logger.info("register_ops")
     import vllm_xcpu_plugin.af_ep.attn.model_loader  # noqa: F401
     import vllm_xcpu_plugin.engram_disagg.attn.model_loader  # noqa: F401
+    import vllm_xcpu_plugin.engram_parallel.model_loader  # noqa: F401
     from vllm_xcpu_plugin.fake_triton.vllm_kernels import register_vllm_kernels
 
     register_vllm_kernels()

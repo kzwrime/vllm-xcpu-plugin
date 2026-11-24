@@ -1427,12 +1427,16 @@ MANIFEST = Manifest(
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding.__init__",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding._get_shard_info",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuParallelEngramEmbedding._allocate_weights",
+                "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._create_embedding",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._init_staging",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram.prepare_embeddings",
                 "vllm_xcpu_plugin.models.deepseek_v41.engram:XcpuEngram._fill_rows",
                 "vllm_xcpu_plugin.engram_disagg.attn.client:RemoteEngramClient",
                 "vllm_xcpu_plugin.engram_disagg.attn.model_loader:EngramAttentionModelLoader",
                 "vllm_xcpu_plugin.engram_disagg.common:EngramShardLayout",
+                "vllm_xcpu_plugin.engram_parallel.client:EngramParallelClient",
+                "vllm_xcpu_plugin.engram_parallel.model_loader:EngramParallelModelLoader",
+                "vllm_xcpu_plugin.engram_parallel.layout:EngramParallelLayout",
             ),
             upstream=(
                 UpstreamRef(
@@ -1484,6 +1488,11 @@ MANIFEST = Manifest(
                     signature_hash="fd6c9bba29099ca63b82093ca293fa3c8c722c07558dc26338c4cba98672d28a",
                 ),
                 UpstreamRef(
+                    target="vllm.models.deepseek_v41.common.engram:Engram._create_embedding",
+                    source_hash="eac41d3628e73a2ab298961cba28fb6eb8ed3bb0a242ecfb6178f293729bda09",
+                    signature_hash="d2c60c3cf954f6a1545bdf4930a29adfe6e711073892317a7bfe6913b8c797fd",
+                ),
+                UpstreamRef(
                     target="vllm.models.deepseek_v41.common.engram:Engram._init_staging",
                     source_hash="b29bfb924a88e9f9ca7f8ff30ba9be0f6e92f176151e02efdf5b7df53189ce4e",
                     signature_hash="dee731e4e979a7dc14376ee36e25d2a6a70b255c48f98a15dc018902e5a17ac7",
@@ -1502,6 +1511,11 @@ MANIFEST = Manifest(
                     target="vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model.forward",
                     source_hash="24aa409a437ae7c6da1e219af1c6c0ab7d36a8da32e9ccefd97eb5b022a6e1dc",
                     signature_hash="7c73aeee0e17a617b3d6038ae156bf93af563da7931df94603f79ffab05c87c3",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.model_loader.default_loader:DefaultModelLoader.get_all_weights",
+                    source_hash="4047d24ba68dd2e0e4779319f87ee1e2ce25899f014246c9d8759a4b4fb662e0",
+                    signature_hash="925a6be0c5912b150b2cd6e47bd5655c93c556411127b369bec5a122e3d1cc05",
                 ),
                 UpstreamRef(
                     target="vllm.model_executor.model_loader.default_loader:DefaultModelLoader._get_weights_iterator",
@@ -1525,16 +1539,19 @@ MANIFEST = Manifest(
                 ),
             ),
             contract=(
-                "Engram disaggregation (VLLM_XCPU_ENABLE_ENGRAM_DISAGG): the tables "
-                "live on dedicated Engram MPI ranks; the attention rank's "
-                "ParallelEngramEmbedding holds zero-row parameters and sees all "
-                "hash columns (shard info (1, 0)), the loader never yields "
-                "engram.embed.{weight,scale} (same shard files also carry wkv/q/k "
-                "and possibly expert tensors, so it skips the table names by "
-                "itself and applies should_skip_weight — the same expert filter "
-                "as safetensors_weights_iterator, which never drops scale "
-                "tensors — to the table shards' other tensors), "
-                "Engram._init_staging/prepare_embeddings are no-ops. "
+                "Engram distributed sharding (VLLM_XCPU_ENABLE_ENGRAM_DISAGG or "
+                "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL): under disaggregation the tables "
+                "live on dedicated Engram MPI ranks and the attention rank's "
+                "ParallelEngramEmbedding holds zero-row parameters; under "
+                "EngramParallel the tables are 2D-sharded across all DP x TP ranks "
+                "and each rank holds its [lo, hi) row slice per layer, loaded via "
+                "EngramParallelModelLoader (safe_open slice). Per-step "
+                "MPI_Ialltoallv requests size each peer slot dynamically from "
+                "ForwardContext.dp_metadata.num_tokens_across_dp_cpu when "
+                "data_parallel_size > 1 (rejecting skip_dp_coordination). Both "
+                "modes bypass "
+                "upstream column sharding (shard info (1, 0)) and keep "
+                "Engram._init_staging/prepare_embeddings as no-ops. "
                 "Exactly one request per forward: DeepseekV4Model.forward hashes "
                 "the full token stream before sp_shard and calls "
                 "gather_engram_hashes once, also for forwards without attention "
@@ -1544,7 +1561,7 @@ MANIFEST = Manifest(
                 "then fills [ceil(T/tp) if SP else T, n_hash_cols, dim] rows for "
                 "the tokens of Engram._local_kv_tokens, layer index 0 collecting "
                 "the reply first. Relies on EngramLayout.primes order for the "
-                "column -> Engram rank mapping and on dummy_hashes using DEAD ids "
+                "column -> rank mapping and on dummy_hashes using DEAD ids "
                 "(zero rows). Re-check: the forward's hash/gather/prepare order "
                 "and its dummy branch condition, _local_kv_tokens' shard formula, "
                 "ParallelEngramEmbedding.__init__'s use of _get_shard_info / "
@@ -1556,12 +1573,20 @@ MANIFEST = Manifest(
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_remote_request",
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_remote_decode",
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_serve",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_parallel_request",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_parallel_collect",
+                "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_engram_parallel_decode",
             ),
             tests=(
                 "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_engram_remote_decode.py",
                 "torch_xcpu/test/mpi_custom_ops/test_engram_remote_roundtrip_mpi.py",
+                "torch_xcpu/test/ops/custom_ops/deepseek_v41/test_engram_parallel.py",
+                "torch_xcpu/test/mpi_custom_ops/test_engram_parallel_roundtrip_mpi.py",
                 "vllm-xcpu-plugin/tests/engram_disagg",
+                "vllm-xcpu-plugin/tests/engram_parallel",
+                "vllm-xcpu-plugin/tests/mpi/engram_parallel_model_mpi.py",
                 "docs/upgrade/13-dsv41-engram-disagg.md",
+                "docs/upgrade/14-dsv41-engram-parallel.md",
             ),
         ),
         Patch(
@@ -1569,6 +1594,7 @@ MANIFEST = Manifest(
             source=_ENGRAM,
             downstream=(
                 "vllm_xcpu_plugin.models.deepseek_v41.config:update_deepseek_v41_config",
+                "vllm_xcpu_plugin.models.deepseek_v41.config:_update_engram_parallel_config",
             ),
             upstream=(
                 UpstreamRef(

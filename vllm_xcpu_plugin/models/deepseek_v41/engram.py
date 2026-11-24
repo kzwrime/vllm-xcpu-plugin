@@ -24,6 +24,7 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
     Engram,
+    EngramLayout,
     NgramHashState,
     ParallelEngramEmbedding,
 )
@@ -113,27 +114,85 @@ def _reject_remote_engram_table(
     )
 
 
+def _engram_parallel_weight_loader(
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    """Load this rank's 2D row slice from either a pre-sliced or full tensor."""
+    if loaded_weight.dtype == torch.float8_e8m0fnu:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    if loaded_weight.shape == param.shape:
+        param.data.copy_(loaded_weight)
+        return
+    part_rows = param.shape[0]
+    vocab_start = getattr(param, "engram_vocab_start", None)
+    if vocab_start is None:
+        raise ValueError(
+            "engram parallel parameter is missing engram_vocab_start attribute"
+        )
+    start = int(vocab_start)
+    if (
+        loaded_weight.dim() != param.dim()
+        or loaded_weight.shape[1:] != param.shape[1:]
+        or start < 0
+        or start + part_rows > loaded_weight.shape[0]
+    ):
+        raise ValueError(
+            f"engram parallel shard [{start}:{start + part_rows}, "
+            f"{tuple(loaded_weight.shape[1:])}] from {tuple(loaded_weight.shape)} "
+            f"does not fit param {tuple(param.shape)}"
+        )
+    shard = loaded_weight.narrow(0, start, part_rows)
+    param.data.copy_(shard)
+
+
 @ParallelEngramEmbedding.register_oot
 class XcpuParallelEngramEmbedding(ParallelEngramEmbedding):
-    def __init__(self, *args, **kwargs) -> None:
-        if get_engram_client() is not None:
-            # No table on this rank: zero-row parameters, and a loader that
-            # refuses the checkpoint tensor should it ever reach the model.
-            self._weight_loader = _reject_remote_engram_table
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        head_sizes: tuple[int, ...],
+        *args,
+        **kwargs,
+    ) -> None:
+        client = get_engram_client()
+        self._parallel_slice: tuple[int, int] | None = None
+        if client is not None:
+            self._parallel_slice = client.consume_embedding_slice(
+                num_embeddings, head_sizes
+            )
+            if self._parallel_slice is not None:
+                self._weight_loader = _engram_parallel_weight_loader
+            else:
+                # No table on this rank: zero-row parameters, and a loader that
+                # refuses the checkpoint tensor should it ever reach the model.
+                self._weight_loader = _reject_remote_engram_table
+        super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
+        if self._parallel_slice is not None:
+            lo, hi = self._parallel_slice
+            self.vocab_start_idx = lo
+            self.vocab_end_idx = hi
+            self.part_num_embeddings = hi - lo
+            for param in (self.weight, self.weight_scale_inv):
+                param.engram_vocab_start = lo  # type: ignore[attr-defined]
 
     def _get_shard_info(self) -> tuple[int, int]:
         if get_engram_client() is not None:
-            # The Engram ranks shard the columns; this rank sees all of them.
+            # Disaggregated / EngramParallel: bypass upstream column sharding.
             return 1, 0
         return super()._get_shard_info()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if get_engram_client() is None:
             return super()._allocate_weights()
+        rows = (
+            0
+            if self._parallel_slice is None
+            else self._parallel_slice[1] - self._parallel_slice[0]
+        )
         return (
-            torch.empty(0, self.dim, dtype=torch.float8_e4m3fn),
-            torch.empty(0, self.dim // self.block_size, dtype=torch.uint8),
+            torch.empty(rows, self.dim, dtype=torch.float8_e4m3fn),
+            torch.empty(rows, self.dim // self.block_size, dtype=torch.uint8),
         )
 
     def lookup(
@@ -169,7 +228,20 @@ class XcpuEngram(Engram):
         compilation_config.static_forward_context[prefix] = self
         client = get_engram_client()
         if client is not None:
-            client.bind_layer(self.use_sequence_parallel, self.layer_hash_index)
+            client.bind_layer(
+                self.use_sequence_parallel,
+                self.layer_hash_index,
+                self.embed_tokens.weight,
+                self.embed_tokens.weight_scale_inv,
+            )
+
+    def _create_embedding(
+        self, layout: EngramLayout, layer_hash_index: int
+    ) -> ParallelEngramEmbedding:
+        client = get_engram_client()
+        if client is not None:
+            client.prepare_embedding(layout, layer_hash_index)
+        return super()._create_embedding(layout, layer_hash_index)
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         if get_engram_client() is None:

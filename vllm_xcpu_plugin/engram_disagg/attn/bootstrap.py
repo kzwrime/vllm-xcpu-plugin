@@ -8,7 +8,7 @@ from vllm_xcpu_plugin.distributed.mpi_world import ClusterType, MpiWorld
 
 from ..common import EngramSession
 from .client import RemoteEngramClient
-from .runtime import EngramClient, get_engram_client, register_engram_client
+from .runtime import get_engram_client, register_engram_client
 
 _SUPPORTED_BASE_LOAD_FORMATS = ("auto", "safetensors", "dummy")
 
@@ -63,7 +63,9 @@ def validate_attention_config(vllm_config: Any, num_engram_ranks: int) -> None:
         )
 
 
-def bootstrap_engram_client(*, mpi_world: MpiWorld, vllm_config: Any) -> EngramClient:
+def bootstrap_engram_client(
+    *, mpi_world: MpiWorld, vllm_config: Any
+) -> RemoteEngramClient:
     """Validate the worker and register its client before model construction."""
     if get_engram_client() is not None:
         raise RuntimeError("an Engram disaggregation client is already registered")
