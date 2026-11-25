@@ -320,6 +320,36 @@ def main() -> None:
         _make_synthetic_checkpoint(ckpt_dir, hf_text_config)
     comm.Barrier()
 
+    presplit_ckpt_dir = (
+        tempfile.mkdtemp(prefix="engram_par_presplit_") if rank == 0 else None
+    )
+    presplit_ckpt_dir = comm.bcast(presplit_ckpt_dir, root=0)
+    assert isinstance(presplit_ckpt_dir, str)
+    if rank == 0:
+        import importlib.util
+        from pathlib import Path
+
+        reshard_path = (
+            Path(__file__).resolve().parents[3] / "tools" / "reshard_hf_safetensors.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "reshard_hf_safetensors", reshard_path
+        )
+        assert spec is not None and spec.loader is not None
+        reshard_mod = importlib.util.module_from_spec(spec)
+        import sys as _sys
+
+        _sys.modules[spec.name] = reshard_mod
+        spec.loader.exec_module(reshard_mod)
+        # Split each table into multiple small row-slice shards.
+        reshard_mod.reshard(
+            Path(ckpt_dir),
+            Path(presplit_ckpt_dir),
+            target_shard_size=1024 * 1024,
+            engram_shard_size=64 * 1024,
+        )
+    comm.Barrier()
+
     full_tensors: dict[str, torch.Tensor] = {}
     for fname in (
         "model-00001-of-00003.safetensors",
@@ -416,8 +446,25 @@ def main() -> None:
             assert isinstance(loader, EngramParallelModelLoader)
 
             mapper = _make_deepseek_v4_weights_mapper("fp4")
+            unsplit_weights = dict(
+                loader.get_all_weights(
+                    SimpleNamespace(model=ckpt_dir, revision=None), model
+                )
+            )
+            presplit_weights = dict(
+                loader.get_all_weights(
+                    SimpleNamespace(model=presplit_ckpt_dir, revision=None), model
+                )
+            )
+            assert set(presplit_weights.keys()) == set(unsplit_weights.keys())
+            for w_name, w_val in unsplit_weights.items():
+                assert torch.equal(
+                    presplit_weights[w_name].view(torch.uint8),
+                    w_val.view(torch.uint8),
+                ), f"rank {rank} presplit mismatch for {w_name}"
+
             raw_weights = loader.get_all_weights(
-                SimpleNamespace(model=ckpt_dir, revision=None), model
+                SimpleNamespace(model=presplit_ckpt_dir, revision=None), model
             )
             params = dict(model.named_parameters())
             loaded_names: set[str] = set()
@@ -536,8 +583,11 @@ def main() -> None:
         destroy_model_parallel()
         destroy_distributed_environment()
         comm.Barrier()
-        if rank == 0 and ckpt_dir is not None:
-            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        if rank == 0:
+            if ckpt_dir is not None:
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
+            if presplit_ckpt_dir is not None:
+                shutil.rmtree(presplit_ckpt_dir, ignore_errors=True)
         MPI.Finalize()
 
 

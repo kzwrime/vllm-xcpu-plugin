@@ -612,7 +612,35 @@ install_deepseek_v41()
 
 
 class XcpuDeepseekV41ForCausalLM(DeepseekV41ForCausalLM):
-    pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Stream ``language_model.*`` weights directly to the child loader
+        instead of materializing and sorting all checkpoint tensors in memory."""
+        # Reference: vLLM
+        # vllm/models/deepseek_v41/nvidia/vl_model.py::DeepseekV41ForCausalLM.load_weights  # noqa: E501
+        from vllm.model_executor.models.utils import (
+            AutoWeightsLoader,
+            StageMissingLayer,
+        )
+
+        child_modules = dict(self.named_children())
+
+        def _grouped_stream() -> Iterable[tuple[str, torch.Tensor]]:
+            deferred_non_lm: list[tuple[str, torch.Tensor]] = []
+            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name, tensor
+                else:
+                    top_prefix = name.split(".", 1)[0]
+                    if isinstance(child_modules.get(top_prefix), StageMissingLayer):
+                        continue
+                    deferred_non_lm.append((name, tensor.clone()))
+            deferred_non_lm.sort(key=lambda x: x[0])
+            yield from deferred_non_lm
+
+        loader = AutoWeightsLoader(self)
+        loaded_params = loader.load_weights(_grouped_stream())
+        self._weights_finalized = True
+        return loaded_params
 
 
 class XcpuDSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):

@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors import safe_open as _real_safe_open
 from safetensors.torch import save_file
 from vllm.config.load import LoadConfig
 
@@ -21,6 +24,17 @@ from vllm_xcpu_plugin.engram_parallel.model_loader import (
     slice_engram_tables_iterator,
 )
 from vllm_xcpu_plugin.models.deepseek_v41.engram import _engram_parallel_weight_loader
+
+
+def _load_reshard_module():
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "tools" / "reshard_hf_safetensors.py"
+    spec = importlib.util.spec_from_file_location("reshard_hf_safetensors", script)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _column_ranges(head_sizes: tuple[int, ...]) -> list[tuple[int, int]]:
@@ -525,3 +539,609 @@ def test_engram_parallel_end_to_end_model_mpi() -> None:
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "engram_parallel_model_mpi step 2" in proc.stdout, proc.stderr
+
+
+def _make_presplit_fixture_checkpoint(
+    tmp_path: Path,
+    *,
+    engram_shard_size: int = 8192,
+    target_shard_size: int = 4096,
+):
+    layer_ids = (1, 14)
+    head_sizes = (
+        tuple(19 + 2 * c for c in range(24)),
+        tuple(23 + 2 * c for c in range(24)),
+    )
+    num_embeddings = (sum(head_sizes[0]) + 7, sum(head_sizes[1]) + 9)
+    dim = 64
+
+    w1 = (
+        (torch.arange(num_embeddings[0] * dim, dtype=torch.int32) % 241)
+        .to(torch.uint8)
+        .reshape(num_embeddings[0], dim)
+        .view(torch.float8_e4m3fn)
+    )
+    s1 = (
+        (torch.arange(num_embeddings[0] * (dim // 32), dtype=torch.int32) % 256)
+        .to(torch.uint8)
+        .reshape(num_embeddings[0], dim // 32)
+        .view(torch.float8_e8m0fnu)
+    )
+    s1[0, 0] = torch.tensor(0, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    s1[-1, -1] = torch.tensor(255, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+    w14 = (
+        (torch.arange(num_embeddings[1] * dim, dtype=torch.int32) % 233)
+        .to(torch.uint8)
+        .reshape(num_embeddings[1], dim)
+        .view(torch.float8_e4m3fn)
+    )
+    s14 = (
+        (torch.arange(num_embeddings[1] * (dim // 32), dtype=torch.int32) % 256)
+        .to(torch.uint8)
+        .reshape(num_embeddings[1], dim // 32)
+        .view(torch.float8_e8m0fnu)
+    )
+    s14[1, 0] = torch.tensor(0, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    s14[-2, -1] = torch.tensor(255, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+    wkv1 = torch.ones(8, dim, dtype=torch.bfloat16)
+    q1 = torch.full((4, 16), 2.0, dtype=torch.bfloat16)
+    k14 = torch.full((4, 16), 3.0, dtype=torch.bfloat16)
+    tok = torch.arange(32, dtype=torch.bfloat16).reshape(2, 16)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    save_file(
+        {
+            "layers.1.engram.embed.weight": w1,
+            "layers.1.engram.embed.scale": s1,
+            "layers.1.engram.wkv.weight": wkv1,
+        },
+        str(src / "model-00001-of-00003.safetensors"),
+    )
+    save_file(
+        {
+            "layers.14.engram.embed.weight": w14,
+            "layers.14.engram.embed.scale": s14,
+            "layers.14.engram.k_weight": k14,
+        },
+        str(src / "model-00002-of-00003.safetensors"),
+    )
+    save_file(
+        {
+            "layers.1.engram.q_weight": q1,
+            "embed_tokens.weight": tok,
+        },
+        str(src / "model-00003-of-00003.safetensors"),
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "weight_map": {
+                "layers.1.engram.embed.weight": "model-00001-of-00003.safetensors",
+                "layers.1.engram.embed.scale": "model-00001-of-00003.safetensors",
+                "layers.1.engram.wkv.weight": "model-00001-of-00003.safetensors",
+                "layers.14.engram.embed.weight": "model-00002-of-00003.safetensors",
+                "layers.14.engram.embed.scale": "model-00002-of-00003.safetensors",
+                "layers.14.engram.k_weight": "model-00002-of-00003.safetensors",
+                "layers.1.engram.q_weight": "model-00003-of-00003.safetensors",
+                "embed_tokens.weight": "model-00003-of-00003.safetensors",
+            }
+        })
+    )
+
+    dst = tmp_path / "presplit"
+    reshard_mod = _load_reshard_module()
+    reshard_mod.reshard(
+        src,
+        dst,
+        target_shard_size=target_shard_size,
+        engram_shard_size=engram_shard_size,
+    )
+    orig = {
+        "layers.1.engram.embed.weight": w1,
+        "layers.1.engram.embed.scale": s1,
+        "layers.14.engram.embed.weight": w14,
+        "layers.14.engram.embed.scale": s14,
+        "layers.1.engram.wkv.weight": wkv1,
+        "layers.1.engram.q_weight": q1,
+        "layers.14.engram.k_weight": k14,
+        "embed_tokens.weight": tok,
+    }
+    return dst, layer_ids, num_embeddings, head_sizes, orig
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 4, 48])
+def test_presplit_reshard_and_loader_across_world_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, world_size: int
+) -> None:
+    dst, layer_ids, num_embeddings, head_sizes, orig = (
+        _make_presplit_fixture_checkpoint(
+            tmp_path, engram_shard_size=8192, target_shard_size=4096
+        )
+    )
+    layout = EngramParallelLayout.from_sizes(
+        layer_ids=layer_ids,
+        num_embeddings=num_embeddings,
+        head_sizes=head_sizes,
+        world_size=world_size,
+    )
+    loader = EngramParallelModelLoader(
+        LoadConfig(load_format="xcpu_engram_parallel_auto")
+    )
+    source = EngramParallelModelLoader.Source(
+        model_or_path=str(dst), revision=None, prefix="", fall_back_to_pt=False
+    )
+
+    reconstructed = {
+        "w1": [],
+        "s1": [],
+        "w14": [],
+        "s14": [],
+    }
+    for rank in range(world_size):
+        fake_client = SimpleNamespace(
+            layout=layout, session=SimpleNamespace(world_rank=rank)
+        )
+        monkeypatch.setattr(
+            "vllm_xcpu_plugin.engram_parallel.model_loader.get_engram_client",
+            lambda c=fake_client: c,
+        )
+        loaded = dict(loader._get_weights_iterator(source))
+        assert torch.equal(
+            loaded["layers.1.engram.wkv.weight"], orig["layers.1.engram.wkv.weight"]
+        )
+        assert torch.equal(
+            loaded["layers.1.engram.q_weight"], orig["layers.1.engram.q_weight"]
+        )
+        assert torch.equal(
+            loaded["layers.14.engram.k_weight"], orig["layers.14.engram.k_weight"]
+        )
+        assert torch.equal(loaded["embed_tokens.weight"], orig["embed_tokens.weight"])
+
+        lo1, hi1, _ = layout.layer_slice_by_id(1, rank)
+        lo14, hi14, _ = layout.layer_slice_by_id(14, rank)
+        assert loaded["layers.1.engram.embed.weight"].shape == (hi1 - lo1, 64)
+        assert loaded["layers.1.engram.embed.scale"].shape == (hi1 - lo1, 2)
+        assert loaded["layers.14.engram.embed.weight"].shape == (hi14 - lo14, 64)
+        assert loaded["layers.14.engram.embed.scale"].shape == (hi14 - lo14, 2)
+
+        reconstructed["w1"].append(
+            loaded["layers.1.engram.embed.weight"].view(torch.uint8)
+        )
+        reconstructed["s1"].append(
+            loaded["layers.1.engram.embed.scale"].view(torch.uint8)
+        )
+        reconstructed["w14"].append(
+            loaded["layers.14.engram.embed.weight"].view(torch.uint8)
+        )
+        reconstructed["s14"].append(
+            loaded["layers.14.engram.embed.scale"].view(torch.uint8)
+        )
+
+    assert torch.equal(
+        torch.cat(reconstructed["w1"], dim=0),
+        orig["layers.1.engram.embed.weight"][: layout.active_rows[0]].view(torch.uint8),
+    )
+    assert torch.equal(
+        torch.cat(reconstructed["s1"], dim=0),
+        orig["layers.1.engram.embed.scale"][: layout.active_rows[0]].view(torch.uint8),
+    )
+    assert torch.equal(
+        torch.cat(reconstructed["w14"], dim=0),
+        orig["layers.14.engram.embed.weight"][: layout.active_rows[1]].view(
+            torch.uint8
+        ),
+    )
+    assert torch.equal(
+        torch.cat(reconstructed["s14"], dim=0),
+        orig["layers.14.engram.embed.scale"][: layout.active_rows[1]].view(torch.uint8),
+    )
+
+
+def test_presplit_loader_only_opens_overlapping_shards_and_unmaps_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
+
+    dst, layer_ids, num_embeddings, head_sizes, _ = _make_presplit_fixture_checkpoint(
+        tmp_path, engram_shard_size=4096, target_shard_size=4096
+    )
+    index = json.loads((dst / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    engram_shards = {
+        fname for key, fname in weight_map.items() if ".row_slice." in key
+    }
+
+    def _mapped_presplit_files() -> set[str]:
+        mapped: set[str] = set()
+        dst_prefix = str(dst.resolve()) + "/"
+        with open("/proc/self/maps", encoding="utf-8") as proc_maps:
+            for line in proc_maps:
+                if dst_prefix in line:
+                    path = line.strip().split()[-1]
+                    mapped.add(os.path.basename(path))
+        return mapped
+
+    opened_files: list[str] = []
+    max_concurrent_engram_maps = 0
+
+    class _TrackedSafeOpen:
+        def __init__(self, filename: str, *args, **kwargs):
+            self._basename = os.path.basename(filename)
+            opened_files.append(self._basename)
+            self._inner = _real_safe_open(filename, *args, **kwargs)
+
+        def __enter__(self):
+            nonlocal max_concurrent_engram_maps
+            handle = self._inner.__enter__()
+            active = len(_mapped_presplit_files() & engram_shards)
+            max_concurrent_engram_maps = max(max_concurrent_engram_maps, active)
+            return handle
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._inner.__exit__(exc_type, exc, tb)
+
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.engram_parallel.model_loader.safe_open",
+        _TrackedSafeOpen,
+    )
+
+    class _TargetModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            mod = object.__new__(ParallelEngramEmbedding)
+            torch.nn.Module.__init__(mod)
+            self.engram = mod
+
+    class _DraftModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+
+    loader = EngramParallelModelLoader(
+        LoadConfig(load_format="xcpu_engram_parallel_auto")
+    )
+    model_cfg = SimpleNamespace(model=str(dst), revision=None)
+
+    # Check W=48 (each rank owns rows in only one layer; the other is 0:0).
+    layout48 = EngramParallelLayout.from_sizes(
+        layer_ids=layer_ids,
+        num_embeddings=num_embeddings,
+        head_sizes=head_sizes,
+        world_size=48,
+    )
+    for rank in (0, 24, 47):
+        opened_files.clear()
+        max_concurrent_engram_maps = 0
+        fake_client = SimpleNamespace(
+            layout=layout48, session=SimpleNamespace(world_rank=rank)
+        )
+        monkeypatch.setattr(
+            "vllm_xcpu_plugin.engram_parallel.model_loader.get_engram_client",
+            lambda c=fake_client: c,
+        )
+        loaded = {}
+        for k, t in loader.get_all_weights(model_cfg, _TargetModel()):
+            loaded[k] = t
+            # After each yielded tensor, no Engram shard may remain mapped.
+            assert (_mapped_presplit_files() & engram_shards) == set()
+        assert (_mapped_presplit_files() & engram_shards) == set()
+        assert max_concurrent_engram_maps <= 1
+
+        # Compute exact expected overlapping Engram shards for this rank.
+        expected_engram_shards: set[str] = set()
+        for l_id in layer_ids:
+            lo, hi, _ = layout48.layer_slice_by_id(l_id, rank)
+            if lo == hi:
+                continue
+            for key, fname in weight_map.items():
+                if f"layers.{l_id}.engram.embed." not in key:
+                    continue
+                s_lo, s_hi = map(int, key.rsplit(".row_slice.", 1)[1].split("_"))
+                if s_hi > lo and s_lo < hi:
+                    expected_engram_shards.add(fname)
+
+        opened_engram_shards = set(opened_files) & engram_shards
+        assert opened_engram_shards == expected_engram_shards
+        assert len(opened_engram_shards) < len(engram_shards)
+        # Empty-slice layer (0:0) with metadata opens 0 shards of that layer.
+        for l_id in layer_ids:
+            lo, hi, _ = layout48.layer_slice_by_id(l_id, rank)
+            if lo == hi:
+                layer_shards = {
+                    fname
+                    for k, fname in weight_map.items()
+                    if f"layers.{l_id}.engram.embed." in k
+                }
+                assert (opened_engram_shards & layer_shards) == set()
+
+    # Draft model skips all pure Engram shards with 0 safe_open calls on them.
+    opened_files.clear()
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.engram_parallel.model_loader.get_engram_client",
+        lambda: None,
+    )
+    draft_loaded = dict(loader.get_all_weights(model_cfg, _DraftModel()))
+    assert "layers.1.engram.embed.weight" not in draft_loaded
+    assert "layers.1.engram.wkv.weight" in draft_loaded
+    assert (set(opened_files) & engram_shards) == set()
+
+
+def test_presplit_loader_without_metadata_empty_slice_and_slice_iterator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dst, layer_ids, num_embeddings, head_sizes, orig = (
+        _make_presplit_fixture_checkpoint(
+            tmp_path, engram_shard_size=4096, target_shard_size=4096
+        )
+    )
+    index_path = dst / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["metadata"].pop("engram_row_slices", None)
+    index_path.write_text(json.dumps(index, indent=2))
+
+    layout48 = EngramParallelLayout.from_sizes(
+        layer_ids=layer_ids,
+        num_embeddings=num_embeddings,
+        head_sizes=head_sizes,
+        world_size=48,
+    )
+    fake_client = SimpleNamespace(
+        layout=layout48, session=SimpleNamespace(world_rank=0)
+    )
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.engram_parallel.model_loader.get_engram_client",
+        lambda: fake_client,
+    )
+    loader = EngramParallelModelLoader(
+        LoadConfig(load_format="xcpu_engram_parallel_auto")
+    )
+    source = EngramParallelModelLoader.Source(
+        model_or_path=str(dst), revision=None, prefix="", fall_back_to_pt=False
+    )
+    loaded = dict(loader._get_weights_iterator(source))
+    assert loaded["layers.14.engram.embed.weight"].shape == (0, 64)
+    assert loaded["layers.14.engram.embed.scale"].shape == (0, 2)
+
+    # Direct slice_engram_tables_iterator call on pre-split shard files.
+    all_files = sorted(str(p) for p in dst.glob("*.safetensors"))
+    layer_slices = {
+        1: (5, 45, num_embeddings[0]),
+        14: (0, 30, num_embeddings[1]),
+    }
+    direct = dict(slice_engram_tables_iterator(all_files, layer_slices))
+    assert torch.equal(
+        direct["layers.1.engram.embed.weight"].view(torch.uint8),
+        orig["layers.1.engram.embed.weight"][5:45].view(torch.uint8),
+    )
+    assert torch.equal(
+        direct["layers.14.engram.embed.scale"].view(torch.uint8),
+        orig["layers.14.engram.embed.scale"][0:30].view(torch.uint8),
+    )
+
+
+def test_presplit_validation_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
+
+    class _TargetModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            mod = object.__new__(ParallelEngramEmbedding)
+            torch.nn.Module.__init__(mod)
+            self.engram = mod
+
+    layout = EngramParallelLayout.from_sizes(
+        layer_ids=(1,), num_embeddings=(10,), head_sizes=((4, 4),), world_size=2
+    )
+    fake_client = SimpleNamespace(layout=layout, session=SimpleNamespace(world_rank=0))
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.engram_parallel.model_loader.get_engram_client",
+        lambda: fake_client,
+    )
+    loader = EngramParallelModelLoader(
+        LoadConfig(load_format="xcpu_engram_parallel_auto")
+    )
+
+    w_part = torch.zeros(5, 16, dtype=torch.float8_e4m3fn)
+    s_part = torch.zeros(5, 1, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    w_full = torch.zeros(10, 16, dtype=torch.float8_e4m3fn)
+    s_full = torch.zeros(10, 1, dtype=torch.uint8)
+    w_6 = torch.zeros(6, 16, dtype=torch.float8_e4m3fn)
+    w_4 = torch.zeros(4, 16, dtype=torch.float8_e4m3fn)
+    w_8 = torch.zeros(8, 16, dtype=torch.float8_e4m3fn)
+
+    def _run_case(name: str, files_spec: dict[str, dict[str, torch.Tensor]], err: str):
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        weight_map = {}
+        for fname, tensors in files_spec.items():
+            save_file(
+                {k: v.clone() for k, v in tensors.items()},
+                str(case_dir / fname),
+            )
+            for k in tensors:
+                weight_map[k] = fname
+        (case_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+        cfg = SimpleNamespace(model=str(case_dir), revision=None)
+        with pytest.raises(ValueError, match=err):
+            list(loader.get_all_weights(cfg, _TargetModel()))
+
+    # 1. Start != 0
+    _run_case(
+        "nonzero_start",
+        {
+            "s1.safetensors": {"layers.1.engram.embed.weight.row_slice.5_10": w_part},
+            "s2.safetensors": {
+                "layers.1.engram.embed.scale.row_slice.0_5": s_part,
+                "layers.1.engram.embed.scale.row_slice.5_10": s_part,
+            },
+        },
+        "start at 5, expected 0",
+    )
+    # 2. Gap
+    _run_case(
+        "gap",
+        {
+            "s1.safetensors": {
+                "layers.1.engram.embed.weight.row_slice.0_4": w_part[:4],
+                "layers.1.engram.embed.weight.row_slice.6_10": w_part[:4],
+            },
+            "s2.safetensors": {"layers.1.engram.embed.scale.row_slice.0_10": s_full},
+        },
+        "have a gap",
+    )
+    # 3. Overlap
+    _run_case(
+        "overlap",
+        {
+            "s1.safetensors": {
+                "layers.1.engram.embed.weight.row_slice.0_6": w_6,
+                "layers.1.engram.embed.weight.row_slice.4_10": w_6,
+            },
+            "s2.safetensors": {"layers.1.engram.embed.scale.row_slice.0_10": s_full},
+        },
+        "overlap",
+    )
+    # 4. Total rows mismatch
+    _run_case(
+        "total_mismatch",
+        {
+            "s1.safetensors": {"layers.1.engram.embed.weight.row_slice.0_8": w_8},
+            "s2.safetensors": {"layers.1.engram.embed.scale.row_slice.0_10": s_full},
+        },
+        "has 8 rows, expected 10",
+    )
+    # 5. Mixed split + unsplit
+    _run_case(
+        "mixed",
+        {
+            "s1.safetensors": {"layers.1.engram.embed.weight": w_full},
+            "s2.safetensors": {"layers.1.engram.embed.weight.row_slice.0_10": w_full},
+        },
+        "mix split and unsplit",
+    )
+    # 6. Chunk shape mismatch against key range
+    _run_case(
+        "chunk_rows_mismatch",
+        {
+            "s1.safetensors": {
+                "layers.1.engram.embed.weight.row_slice.0_5": w_4,
+                "layers.1.engram.embed.weight.row_slice.5_10": w_part,
+            },
+            "s2.safetensors": {"layers.1.engram.embed.scale.row_slice.0_10": s_full},
+        },
+        "has shape .* expected \\(5,",
+    )
+    # 7. Invalid suffix
+    _run_case(
+        "bad_suffix",
+        {"s1.safetensors": {"layers.1.engram.embed.weight.bad": w_part}},
+        "unexpected Engram table tensor name",
+    )
+
+
+def test_vl_model_streaming_load_weights() -> None:
+    from vllm.model_executor.models.utils import StageMissingLayer, WeightsMapper
+    from vllm.models.deepseek_v41.nvidia.vl_model import (
+        _make_deepseek_v4_vl_weights_mapper,
+    )
+
+    from vllm_xcpu_plugin.models.deepseek_v41.model import XcpuDeepseekV41ForCausalLM
+
+    class _DummyChild(torch.nn.Module):
+        def __init__(self, expected_param: str, consume_log: list[str]) -> None:
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.empty(2, 2), requires_grad=False)
+            self._expected_param = expected_param
+            self._consume_log = consume_log
+
+        def load_weights(self, weights):
+            loaded = set()
+            for name, tensor in weights:
+                self._consume_log.append(f"lm:{name}")
+                if name == self._expected_param:
+                    self.w.data.copy_(tensor)
+                    loaded.add("w")
+            return loaded
+
+    class _DummyTower(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = torch.nn.Parameter(torch.empty(2, 2), requires_grad=False)
+
+    def _build_stub(limit_mm_zero: bool, consume_log: list[str]):
+        model = object.__new__(XcpuDeepseekV41ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
+            "fp4", "weight_scale"
+        )
+        model.language_model = _DummyChild("w", consume_log)
+        model.language_model.hf_to_vllm_mapper = WeightsMapper()
+        model.image_start = torch.nn.Parameter(torch.empty(4), requires_grad=False)
+        model.image_end = torch.nn.Parameter(torch.empty(4), requires_grad=False)
+        model.image_newline = torch.nn.Parameter(torch.empty(4), requires_grad=False)
+        if limit_mm_zero:
+            model.vision = StageMissingLayer("vision_tower", _DummyTower())
+            model.aligner = StageMissingLayer("vision_tower", _DummyTower())
+        else:
+            model.vision = _DummyTower()
+            model.aligner = _DummyTower()
+        return model
+
+    # Case 1: vision/aligner replaced by StageMissingLayer, image_* kept, streaming.
+    events: list[str] = []
+    stub_zero = _build_stub(limit_mm_zero=True, consume_log=events)
+    stub_zero.language_model._expected_param = "model.norm.weight"
+
+    def _gen_valid():
+        events.clear()
+        events.append("yield:vision")
+        yield ("vision.proj", torch.full((2, 2), 9.0))
+        events.append("yield:norm")
+        yield ("norm.weight", torch.full((2, 2), 4.0))
+        assert "lm:model.norm.weight" in events
+        events.append("yield:image_start")
+        yield ("image_start", torch.full((4,), 5.0))
+        events.append("yield:image_end")
+        yield ("image_end", torch.full((4,), 6.0))
+        events.append("yield:image_newline")
+        yield ("image_newline", torch.full((4,), 7.0))
+        events.append("yield:aligner")
+        yield ("aligner.proj", torch.full((2, 2), 8.0))
+
+    loaded_zero = stub_zero.load_weights(_gen_valid())
+    assert stub_zero._weights_finalized is True
+    assert loaded_zero == {
+        "language_model.w",
+        "image_start",
+        "image_end",
+        "image_newline",
+    }
+    assert torch.equal(stub_zero.language_model.w, torch.full((2, 2), 4.0))
+    assert torch.equal(stub_zero.image_start, torch.full((4,), 5.0))
+
+    # Case 2: active vision/aligner towers also load cleanly after language_model.
+    events2: list[str] = []
+    stub_mm = _build_stub(limit_mm_zero=False, consume_log=events2)
+    stub_mm.language_model._expected_param = "model.norm.weight"
+
+    def _gen_mm():
+        yield ("vision.proj", torch.full((2, 2), 9.0))
+        yield ("norm.weight", torch.full((2, 2), 4.0))
+        yield ("aligner.proj", torch.full((2, 2), 8.0))
+        yield ("image_start", torch.full((4,), 5.0))
+
+    loaded_mm = stub_mm.load_weights(_gen_mm())
+    assert loaded_mm == {
+        "language_model.w",
+        "vision.proj",
+        "aligner.proj",
+        "image_start",
+    }
+    assert torch.equal(stub_mm.vision.proj, torch.full((2, 2), 9.0))
+    assert torch.equal(stub_mm.aligner.proj, torch.full((2, 2), 8.0))

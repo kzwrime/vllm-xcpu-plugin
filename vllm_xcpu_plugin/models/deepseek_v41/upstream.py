@@ -1858,5 +1858,52 @@ MANIFEST = Manifest(
                 "docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",
             ),
         ),
+        Patch(
+            id="deepseek_v41.vl_model.streaming_load_weights",
+            source=_V031,
+            downstream=(
+                "vllm_xcpu_plugin.models.deepseek_v41.model:XcpuDeepseekV41ForCausalLM.load_weights",
+            ),
+            upstream=(
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.__init__",
+                    source_hash="eee102dcf160a9a21e93fe6bbc857920e4d5c79276dfb46fc7bb34d995ad8ce1",
+                    signature_hash="41e09ea153ede580447e3e22bd8e67225987f82aa5682a96a2ac3bb3d3bdba35",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.load_weights",
+                    source_hash="996e63ebdf9e37f48163ebb32ee51fdcfb16acacc2b433ad7e058f86bb926057",
+                    signature_hash="24bcf75dc8091fd46a88cb78817a9f1f45d8eff388d0d84c185e4f7f2c4424da",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.load_weights",
+                    source_hash="bc3a6bdc6bbc5cc77e88340c25413b8d8c55ff77dc397bffb18ee5e7d047f7ee",
+                    signature_hash="24bcf75dc8091fd46a88cb78817a9f1f45d8eff388d0d84c185e4f7f2c4424da",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV4Model.load_weights",
+                    source_hash="cc15fc0ddec18dd1d58abbf2980aa46e4b2d0af9232bb17cd82d7fed7d0fb31f",
+                    signature_hash="24bcf75dc8091fd46a88cb78817a9f1f45d8eff388d0d84c185e4f7f2c4424da",
+                ),
+                UpstreamRef(
+                    target="vllm.model_executor.models.utils:AutoWeightsLoader._load_module",
+                    source_hash="783af64185df51d18546a46666189a7ee740744fd9047c9bb2cb6c629fa5b3e9",
+                    signature_hash="53c04ff398a6fb3ce7ae410166e52ed12f0d653b8a08a844eb5247a3de0e698a",
+                ),
+            ),
+            contract=(
+                "DeepseekV41ForCausalLM.load_weights upstream materializes and "
+                "sorts all mapped weights in memory so language_model.* forms "
+                "one contiguous block for AutoWeightsLoader._load_module (calling"
+                " DeepseekV41LLMForCausalLM.load_weights once). XCPU streams "
+                "language_model.* directly without sorting/buffering, drops "
+                "StageMissingLayer tower tensors, and clones+sorts only the "
+                "small non-language_model tensors at the end, setting "
+                "_weights_finalized=True. Re-check: new top-level modules or "
+                "non-idempotent rules in hf_to_vllm_mapper, post-load "
+                "finalization order in DeepseekV41LLMForCausalLM.load_weights."
+            ),
+            tests=("vllm-xcpu-plugin/tests/engram_parallel/test_layout_and_loader.py",),
+        ),
     ),
 )
