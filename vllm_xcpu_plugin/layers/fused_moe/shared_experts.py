@@ -55,6 +55,14 @@ def _packed_linear(linear: nn.Module):
                 _MXFP4_SCALE_BLOCK_SIZE,
             )
     if isinstance(getattr(linear, "quant_method", None), UnquantizedLinearMethod):
+        # Packed BF16 / weight-removed unquantized linears replace linear.weight
+        # with an empty 1D placeholder; keep the unfused path rather than passing
+        # it to fused_ep_moe_v5.
+        if (
+            getattr(linear, "_xcpu_bf16_linear", None) is not None
+            or linear.weight.ndim != 2
+        ):
+            return None
         return linear.weight, None, -1, (0, 0)
     return None
 

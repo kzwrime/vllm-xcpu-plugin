@@ -77,14 +77,6 @@ class McpuWorker(Worker):
                 activities=["CPU", "PrivateUse1"],
             )
 
-            def _eplb_on_profiler_stop() -> None:
-                eplb = getattr(getattr(self, "model_runner", None), "eplb_state", None)
-                if eplb is not None:
-                    logger.info("Profiler stopped, dumping EPLB statistics window.")
-                    eplb.log_all_statistics(is_profiler_stop=True)
-
-            self.profiler.add_stop_callback(_eplb_on_profiler_stop)
-
     def _maybe_get_memory_pool_context(self, tag: str):
         del tag
         return nullcontext()
@@ -209,7 +201,10 @@ class McpuWorker(Worker):
                 host_ip,
                 MPI.Is_initialized(),
             )
-            if envs.VLLM_EPLB_COMM_BACKEND == "mpi":
+            if (
+                self.parallel_config.enable_eplb
+                and self.parallel_config.eplb_config.communicator == "mpi"
+            ):
                 mpi_rank = self.mpi_world_comm.Get_rank()
                 mpi_size = self.mpi_world_comm.Get_size()
                 assert mpi_rank == world_rank_across_dp, (
@@ -225,14 +220,18 @@ class McpuWorker(Worker):
                     mpi_rank,
                     mpi_size,
                 )
-        elif envs.VLLM_EPLB_COMM_BACKEND == "mpi":
-            raise RuntimeError(
-                "VLLM_EPLB_COMM_BACKEND=mpi requires VLLM_CPU_USE_MPI=1."
-            )
-        elif envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL:
-            raise RuntimeError(
-                "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL requires VLLM_CPU_USE_MPI=1."
-            )
+        else:
+            if (
+                self.parallel_config.enable_eplb
+                and self.parallel_config.eplb_config.communicator == "mpi"
+            ):
+                raise RuntimeError(
+                    "EPLB communicator 'mpi' requires VLLM_CPU_USE_MPI=1."
+                )
+            if envs_xcpu.VLLM_XCPU_ENABLE_ENGRAM_PARALLEL:
+                raise RuntimeError(
+                    "VLLM_XCPU_ENABLE_ENGRAM_PARALLEL requires VLLM_CPU_USE_MPI=1."
+                )
 
         # device = self.device_config.device
         self.device = torch.device("mcpu:0")

@@ -35,13 +35,18 @@ from .torch_all_to_all_single_prepare_finalize import (
 logger = init_logger(__name__)
 
 
+_EPLB_SUPPORTED_BACKENDS = frozenset({"mpi_alltoallv_v5", "mpi_alltoallv_v6"})
+
+
 def _validate_custom_backend(
     moe: FusedMoEConfig,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     backend: str,
 ) -> None:
     parallel = moe.moe_parallel_config
-    if parallel.enable_eplb or routing_tables is not None:
+    if routing_tables is not None or (
+        parallel.enable_eplb and backend not in _EPLB_SUPPORTED_BACKENDS
+    ):
         raise NotImplementedError(
             f"XCPU MoE backend {backend!r} requires linear placement without EPLB"
         )

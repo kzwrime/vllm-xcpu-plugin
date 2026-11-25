@@ -31,7 +31,7 @@ class XcpuUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     @property
     def supports_eplb(self) -> bool:
-        return False
+        return True
 
     def _setup_xcpu_kernel(
         self,

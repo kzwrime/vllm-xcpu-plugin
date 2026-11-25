@@ -587,3 +587,45 @@ def test_custom_backend_rejects_dbo_before_group_init(monkeypatch):
             eep_stage=False,
             all2all_manager=object(),
         )
+
+
+@pytest.mark.parametrize(
+    "factory_cls",
+    [
+        pf_factory.MpiAlltoallvV5PrepareFinalizeFactory,
+        pf_factory.MpiAlltoallvV6PrepareFinalizeFactory,
+    ],
+)
+def test_v5_v6_accept_eplb_and_reject_routing_tables(monkeypatch, factory_cls):
+    created = {}
+
+    class DummyImpl:
+        def __init__(self, **kwargs):
+            created["kwargs"] = kwargs
+
+    monkeypatch.setattr(factory_cls, "implementation", DummyImpl)
+    ep_group = SimpleNamespace(device_group=object())
+    monkeypatch.setattr(pf_factory, "get_ep_group", lambda: ep_group)
+
+    pf = factory_cls.create(
+        moe=_moe(enable_eplb=True),
+        quant_config=None,
+        routing_tables=None,
+        allow_new_interface=True,
+        use_monolithic=False,
+        eep_stage=False,
+        all2all_manager=SimpleNamespace(world_size=2, rank=1, cpu_group=object()),
+    )
+    assert isinstance(pf, DummyImpl)
+    assert created["kwargs"]["num_experts"] == 4
+
+    with pytest.raises(NotImplementedError, match="linear placement without EPLB"):
+        factory_cls.create(
+            moe=_moe(enable_eplb=True),
+            quant_config=None,
+            routing_tables=(object(), object(), object()),
+            allow_new_interface=True,
+            use_monolithic=False,
+            eep_stage=False,
+            all2all_manager=SimpleNamespace(world_size=2, rank=1, cpu_group=object()),
+        )

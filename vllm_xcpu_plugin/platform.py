@@ -194,28 +194,48 @@ class McpuPlatform(Platform):
             if model_config.sleep_mode_backend == "cumem":
                 model_config.sleep_mode_backend = BACKEND_NAME
 
-        if (
-            parallel_config.enable_expert_parallel
-            and parallel_config.enable_ep_weight_filter
-            and not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP
-        ):
-            if vllm_config.speculative_config is not None:
-                raise ValueError(
-                    "enable_ep_weight_filter is unsupported with speculative "
-                    "decoding when draft and target expert counts may differ"
-                )
+        if parallel_config.enable_expert_parallel:
             model_cfg = vllm_config.model_config
-            if model_cfg is not None:
-                ep_size = (
-                    parallel_config.data_parallel_size
-                    * parallel_config.tensor_parallel_size
-                )
-                num_experts = model_cfg.get_num_experts()
-                if num_experts % ep_size != 0:
+            ep_size = (
+                parallel_config.data_parallel_size
+                * parallel_config.tensor_parallel_size
+            )
+            if (
+                parallel_config.enable_ep_weight_filter
+                and not parallel_config.enable_eplb
+                and not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP
+            ):
+                if vllm_config.speculative_config is not None:
                     raise ValueError(
-                        f"enable_ep_weight_filter requires num_experts "
-                        f"({num_experts}) to be divisible by ep_size ({ep_size})"
+                        "enable_ep_weight_filter is unsupported with speculative "
+                        "decoding when draft and target expert counts may differ"
                     )
+                if model_cfg is not None:
+                    num_experts = model_cfg.get_num_experts()
+                    if num_experts % ep_size != 0:
+                        raise ValueError(
+                            f"enable_ep_weight_filter requires num_experts "
+                            f"({num_experts}) to be divisible by ep_size ({ep_size})"
+                        )
+            if parallel_config.enable_eplb:
+                all2all_backend = getattr(parallel_config, "all2all_backend", None)
+                if all2all_backend not in {"mpi_alltoallv_v5", "mpi_alltoallv_v6"}:
+                    raise ValueError(
+                        "EPLB on XCPU requires --all2all-backend "
+                        "mpi_alltoallv_v5 or mpi_alltoallv_v6, "
+                        f"got {all2all_backend!r}"
+                    )
+                if model_cfg is not None and model_cfg.is_moe:
+                    physical_experts = (
+                        model_cfg.get_num_experts()
+                        + parallel_config.eplb_config.num_redundant_experts
+                    )
+                    if physical_experts % ep_size != 0:
+                        raise ValueError(
+                            f"EPLB on XCPU requires physical_experts "
+                            f"({physical_experts}) to be divisible by "
+                            f"ep_size ({ep_size})"
+                        )
 
         # The F service builds its own VllmConfig without vLLM EP; only A ranks
         # need the loader that drops remote expert tensors.
@@ -493,3 +513,7 @@ class McpuPlatform(Platform):
     @classmethod
     def mem_get_info(cls, device_index=None, /) -> tuple[int, int]:
         return torch.accelerator.get_memory_info(device_index)
+
+    @classmethod
+    def get_default_eplb_communicator(cls) -> str | None:
+        return "mpi" if envs_xcpu.VLLM_CPU_USE_MPI else "torch_gloo"

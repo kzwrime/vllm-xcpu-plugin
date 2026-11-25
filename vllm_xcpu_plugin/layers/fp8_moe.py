@@ -65,7 +65,7 @@ class XcpuFp8MoEMethod(Fp8MoEMethod):
 
     @property
     def supports_eplb(self) -> bool:
-        return False
+        return True
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         return fp8_w8a16_moe_quant_config(

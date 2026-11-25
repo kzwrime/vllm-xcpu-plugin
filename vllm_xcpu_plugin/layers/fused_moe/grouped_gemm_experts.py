@@ -103,7 +103,11 @@ class XcpuGroupedGemmExperts(mk.FusedMoEExpertsModular):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return not moe_parallel_config.enable_eplb
+        return not moe_parallel_config.enable_eplb or (
+            moe_parallel_config.use_ep
+            and moe_parallel_config.all2all_backend
+            in {"mpi_alltoallv_v5", "mpi_alltoallv_v6"}
+        )
 
     def supports_expert_map(self) -> bool:
         return True

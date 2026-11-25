@@ -1,10 +1,16 @@
 """Platform-scoped RoutedExperts replacement for XCPU MoE methods."""
 
+from collections.abc import Iterable
+
+import torch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.routed_experts import (
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -166,6 +172,80 @@ def _maybe_pad_ep_experts(
     return True, active_local, unpadded_global
 
 
+def _local_redundant_fused_map(layer: "XcpuRoutedExperts") -> list[tuple[int, int]]:
+    """Return local ``(physical_id, logical_id)`` redundant pairs for EPLB."""
+    moe_config = getattr(layer, "moe_config", None)
+    if moe_config is None or not moe_config.moe_parallel_config.enable_eplb:
+        return []
+    num_redundant = moe_config.num_experts - moe_config.num_logical_experts
+    if num_redundant <= 0:
+        return []
+    from vllm.distributed.eplb.eplb_state import EplbState
+
+    num_fused_shared = layer.expert_map_manager.num_fused_shared_experts
+    physical_to_logical = EplbState.build_initial_global_physical_to_logical_map(
+        moe_config.num_logical_experts + num_fused_shared,
+        num_redundant,
+    )
+    num_primary = moe_config.num_logical_experts + num_fused_shared
+    return [
+        (phys_id, physical_to_logical[phys_id])
+        for phys_id in range(num_primary, len(physical_to_logical))
+        if layer._map_global_expert_id_to_local_expert_id(phys_id) != -1
+    ]
+
+
+def _load_redundant_fused_slices(
+    layer: "XcpuRoutedExperts",
+    expert_name: str,
+    logical_slices: dict[int, torch.Tensor],
+    local_redundant: list[tuple[int, int]],
+    expert_mapping: list[tuple[str, str, int, str]],
+) -> Iterable[str]:
+    """Replicate 3D fused checkpoint slices onto local redundant physical slots.
+
+    Upstream ``RoutedExperts.load_weights`` binds 3D fused tensors strictly by
+    logical index ``0..num_logical-1`` and never calls ``weight_loader`` for
+    redundant physical slots (>= ``num_logical``).
+    """
+    qual_name = f"{layer.layer_name}.{expert_name}"
+    matched = False
+    for param_name, weight_name, chunk_id, shard_id in expert_mapping:
+        if weight_name not in qual_name:
+            if matched:
+                break
+            continue
+        matched = True
+        mapped_weight_name = qual_name.replace(weight_name, param_name)
+        resolved_param_name = mapped_weight_name.removeprefix(f"{layer.layer_name}.")
+        param = getattr(layer, resolved_param_name, None)
+        if param is None:
+            continue
+        quant_method = getattr(param, "quant_method", None)
+        uses_weight_layout = (
+            "scale" not in mapped_weight_name
+            or quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+        )
+        transpose = layer.is_fused_checkpoint_transposed and uses_weight_layout
+        for phys_id, logical_id in local_redundant:
+            slice_2d = layer._orient_fused_weight(logical_slices[logical_id], transpose)
+            loaded_expert = (
+                slice_2d.chunk(2, dim=0)[chunk_id]
+                if shard_id in {"w1", "w3"} and layer.moe_config.is_act_and_mul
+                else slice_2d
+            )
+            success = param.weight_loader(
+                param=param,
+                loaded_weight=loaded_expert,
+                weight_name=mapped_weight_name,
+                shard_id=shard_id,
+                expert_id=phys_id,
+                return_success=True,
+            )
+            if success:
+                yield resolved_param_name
+
+
 @RoutedExperts.register_oot
 class XcpuRoutedExperts(RoutedExperts):
     """Delegate checkpoint interpretation upstream, then replace MoE compute."""
@@ -183,6 +263,14 @@ class XcpuRoutedExperts(RoutedExperts):
         padded, active_local, unpadded_global = _maybe_pad_ep_experts(
             moe_config, expert_map_manager
         )
+        if (
+            moe_config.moe_parallel_config.enable_eplb
+            and moe_config.num_experts % moe_config.ep_size != 0
+        ):
+            raise ValueError(
+                f"XCPU EPLB requires physical num_experts ({moe_config.num_experts}) "
+                f"to be divisible by ep_size ({moe_config.ep_size})"
+            )
         super().__init__(
             layer_name,
             params_dtype,
@@ -255,9 +343,67 @@ class XcpuRoutedExperts(RoutedExperts):
 
         if isinstance(self.quant_method, RemoteExpertsFusedMoEMethod):
             return self.quant_method.skip_checkpoint_weights(weights)
-        loaded = super().load_weights(weights)
+
+        local_redundant = _local_redundant_fused_map(self)
+        if local_redundant:
+            needed_logical = sorted({logical_id for _, logical_id in local_redundant})
+            captured: list[tuple[str, dict[int, torch.Tensor]]] = []
+
+            def _capture_fused_weights():
+                for expert_name, loaded_weight in weights:
+                    if loaded_weight.dim() == 3:
+                        captured.append(
+                            (
+                                expert_name,
+                                {
+                                    lid: loaded_weight[lid].clone()
+                                    for lid in needed_logical
+                                },
+                            )
+                        )
+                    yield expert_name, loaded_weight
+
+            def _load_with_redundant():
+                yield from super(XcpuRoutedExperts, self).load_weights(
+                    _capture_fused_weights()
+                )
+                if captured:
+                    expert_mapping = self.get_expert_mapping(include_fused=True)
+                    for expert_name, logical_slices in captured:
+                        yield from _load_redundant_fused_slices(
+                            self,
+                            expert_name,
+                            logical_slices,
+                            local_redundant,
+                            expert_mapping,
+                        )
+
+            loaded = _load_with_redundant()
+        else:
+            loaded = super().load_weights(weights)
+
         if getattr(self, "_xcpu_active_local_experts", None) == 0:
             return set(loaded) | {
                 name for name, _ in self.named_parameters(recurse=False)
             }
         return loaded
+
+    def get_expert_weights(self) -> Iterable[torch.Tensor]:
+        weights = list(super().get_expert_weights())
+        fused_moe = getattr(self, "_xcpu_fused_moe", None)
+        storage_by_ptr: dict[int, torch.Tensor] = {}
+        if fused_moe is not None:
+            for gemm in (
+                fused_moe.params.gemm1.params,
+                fused_moe.params.gemm2.params,
+            ):
+                if gemm.packed_weight.numel() > 0:
+                    storage_by_ptr[gemm.packed_weight.data_ptr()] = (
+                        gemm.packed_weight_storage
+                    )
+        return [
+            storage_by_ptr.get(w.data_ptr(), w)
+            .view(torch.uint8)
+            .view(self.local_num_experts, -1)
+            for w in weights
+        ]

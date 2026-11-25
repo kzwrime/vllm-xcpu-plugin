@@ -724,6 +724,19 @@ def test_install_fused_shared_experts_matches_swiglu_limit(
     assert len(bound) == fused
 
 
+def test_install_fused_shared_experts_skips_prepacked_bf16_linear(monkeypatch):
+    from vllm_xcpu_plugin.layers.fused_moe.shared_experts import (
+        install_fused_shared_experts,
+    )
+
+    monkeypatch.setenv("VLLM_XCPU_FUSE_SHARED_EXPERTS", "1")
+    runner, mlp, bound = _fusable_runner()
+    mlp.gate_up_proj._xcpu_bf16_linear = object()
+    mlp.gate_up_proj.weight = torch.empty(0, dtype=torch.bfloat16)
+    assert install_fused_shared_experts(runner) == 0 and not bound
+    assert runner._shared_experts is not None and runner.routed_scaling_factor == 2.5
+
+
 @pytest.mark.parametrize("version", [5, 6])
 def test_xcpu_ep_experts_accepts_topk3(version):
     plan = ops.initialize_fused_moe(

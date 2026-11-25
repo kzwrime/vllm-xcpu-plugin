@@ -130,3 +130,7 @@ def register_ops():
     install_optional_integration("DeepSeek-V4.1", register_deepseek_v41)
     install_optional_integration("DSpark", register_dspark)
     install_optional_integration("RejectionSampler", register_rejection_sampler)
+
+    from vllm_xcpu_plugin.eplb import install_eplb
+
+    install_eplb()

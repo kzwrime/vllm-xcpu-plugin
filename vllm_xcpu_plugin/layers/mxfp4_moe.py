@@ -31,7 +31,7 @@ class XcpuCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
 
     @property
     def supports_eplb(self) -> bool:
-        return False
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import torch_xcpu
@@ -81,7 +81,7 @@ class XcpuMxfp4MoEMethod(Mxfp4MoEMethod):
 
     @property
     def supports_eplb(self) -> bool:
-        return False
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import torch_xcpu
