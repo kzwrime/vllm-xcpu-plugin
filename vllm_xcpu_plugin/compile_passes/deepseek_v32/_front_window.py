@@ -153,7 +153,7 @@ def _int8_mm_backend(node: Node) -> int:
 
 
 def _is_int8_16x16_nobias(node: Node) -> bool:
-    return (
+    return bool(
         node.kwargs.get("scale_block_n") == 16
         and node.kwargs.get("scale_block_k") == 16
         and node.kwargs.get("bias") is None
@@ -305,12 +305,13 @@ def match_window(graph, cache_af: Node, *, quant_kind: str = "fp8") -> WindowMat
     """Match the core window rooted at ``cache_af`` (raises _Skip)."""
     if quant_kind not in ("fp8", "int8"):
         raise ValueError(f"Unsupported quant_kind={quant_kind!r}")
-    quant_mode = int(cache_af.kwargs.get("quant_mode", 0))
-    if quant_mode not in (0, 1):
+    raw_quant_mode = cache_af.kwargs.get("quant_mode", 0)
+    if not isinstance(raw_quant_mode, int) or raw_quant_mode not in (0, 1):
         raise _Skip(
             "front-window fusion only supports fp8/int8_ds_mla cache "
-            f"(got quant_mode={quant_mode})"
+            f"(got quant_mode={raw_quant_mode})"
         )
+    quant_mode = int(raw_quant_mode)
     kv_norm_af = cache_af.kwargs["key"]
     if not (isinstance(kv_norm_af, Node) and _is_getitem(kv_norm_af)):
         raise _Skip("cache-write key is not an auto_functionalized result")

@@ -204,11 +204,12 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = self.weight_block_size
+        layer_any: Any = layer
+        layer_any.logical_widths = output_partition_sizes
+        layer_any.input_size_per_partition = input_size_per_partition
+        layer_any.output_size_per_partition = output_size_per_partition
+        layer_any.orig_dtype = params_dtype
+        layer_any.weight_block_size = self.weight_block_size
 
         validate_fp8_block_shape(
             layer,
@@ -251,15 +252,16 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import torch_xcpu
 
-        weight_scale = layer.weight_scale_inv.data.contiguous()
+        layer_any: Any = layer
+        weight_scale = layer_any.weight_scale_inv.data.contiguous()
         _initialize_dummy_ue8m0_scale(weight_scale)
 
         bn, bk = self.weight_block_size
-        if getattr(layer, "_xcpu_mla_weight_only", False):
-            w = layer.weight.data
+        if getattr(layer_any, "_xcpu_mla_weight_only", False):
+            w = layer_any.weight.data
             if (
                 w.device.type == "privateuseone"
-                and layer.params_dtype == torch.bfloat16
+                and layer_any.params_dtype == torch.bfloat16
                 and w.shape[0] % bn == 0
                 and w.shape[1] % bk == 0
                 and bk % 16 == 0
@@ -269,7 +271,7 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
                 )
             else:
                 dequant = _dequantize_int8_ue8m0_cpu(
-                    w, weight_scale, bn, bk, layer.params_dtype
+                    w, weight_scale, bn, bk, layer_any.params_dtype
                 )
             replace_parameter(layer, "weight", dequant)
             return
