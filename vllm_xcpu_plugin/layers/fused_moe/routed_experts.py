@@ -91,15 +91,23 @@ def _maybe_pad_ep_experts(
     moe_config: FusedMoEConfig,
     expert_map_manager,
 ) -> tuple[bool, int | None, int]:
-    """Uniformly pad non-divisible EP expert counts for XCPU MPI V5/V6.
+    """Uniformly pad non-divisible EP expert counts for XCPU MPI V5/V6/V8.
 
-    FusedMoE V5/V6 requires equal local_num_experts across ranks. When
-    unpadded num_experts is not divisible by ep_size, pad up to
+    FusedMoE V5/V6/V8 requires equal local_num_experts across expert ranks.
+    When unpadded num_experts is not divisible by ep_size, pad up to
     ceil(unpadded / ep_size) * ep_size using linear contiguous ownership and
     zeroed/unit-scaled trailing expert slots.
     """
     import torch
     from vllm.logger import init_logger
+
+    from vllm_xcpu_plugin.af_ep.attn.runtime import get_remote_experts_client
+
+    # AF-EP attention ranks hold no routed weights; moe_config.ep_size here is
+    # A's DP*TP world size rather than F's EP size. Leave A unpadded so
+    # ExpertsClientV8/AfV8Session pads once against F's expert rank count.
+    if get_remote_experts_client() is not None:
+        return False, None, moe_config.num_experts
 
     existing = getattr(moe_config, "_xcpu_ep_padding_info", None)
     if existing is not None:
@@ -121,7 +129,8 @@ def _maybe_pad_ep_experts(
         or not moe_config.use_ep
         or ep_size <= 1
         or unpadded_global % ep_size == 0
-        or parallel.all2all_backend not in {"mpi_alltoallv_v5", "mpi_alltoallv_v6"}
+        or parallel.all2all_backend
+        not in {"mpi_alltoallv_v5", "mpi_alltoallv_v6", "mpi_alltoallv_v8"}
         or parallel.enable_eplb
         or expert_map_manager.placement_strategy != "linear"
         or expert_map_manager.routing_tables is not None

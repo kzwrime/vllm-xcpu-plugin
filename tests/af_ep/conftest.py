@@ -17,6 +17,12 @@ def make_af_session(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch_xcpu.ops, "moe_af_v7_initialize", lambda *args: None)
     monkeypatch.setattr(torch_xcpu.ops, "moe_af_v8_initialize", lambda *args: None)
+    if hasattr(torch.ops.torch_xcpu, "fused_af_v8_initialize_windows"):
+        monkeypatch.setattr(
+            torch.ops.torch_xcpu,
+            "fused_af_v8_initialize_windows",
+            lambda *args: 0,
+        )
 
     def make(
         cluster_type=ClusterType.ATTN,

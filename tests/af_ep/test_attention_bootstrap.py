@@ -13,9 +13,13 @@ from vllm_xcpu_plugin.af_ep.attn.compatibility import (
 )
 
 
-def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_session):
+@pytest.mark.parametrize("version", [7, 8])
+def test_attention_initializes_transport_after_model_load(
+    monkeypatch, make_af_session, version
+):
     import torch_xcpu
 
+    from vllm_xcpu_plugin.af_ep.attn.client_v8 import ExpertsClientV8
     from vllm_xcpu_plugin.worker.worker_v1 import McpuWorker, Worker
 
     calls = []
@@ -27,28 +31,40 @@ def test_attention_initializes_transport_after_model_load(monkeypatch, make_af_s
         lambda model: calls.append("pack"),
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: calls.append("drain"))
-    monkeypatch.setattr(
-        torch_xcpu.ops,
-        "moe_af_v7_initialize",
-        lambda *args: calls.append(("initialize", *args[:4])),
-    )
+    if version == 7:
+        monkeypatch.setattr(
+            torch_xcpu.ops,
+            "moe_af_v7_initialize",
+            lambda *args: calls.append(("initialize", *args[:4])),
+        )
+    else:
+        monkeypatch.setattr(
+            torch.ops.torch_xcpu,
+            "fused_af_v8_initialize_windows",
+            lambda *args: calls.append(("initialize", *args[:5])) or 0,
+        )
     worker = object.__new__(McpuWorker)
     worker.model_config = SimpleNamespace(
-        hf_text_config=SimpleNamespace(hidden_size=16, num_experts_per_tok=6),
+        hf_text_config=SimpleNamespace(
+            n_routed_experts=10, hidden_size=16, num_experts_per_tok=6
+        ),
         dtype=torch.bfloat16,
     )
-    worker.model_runner = SimpleNamespace(get_model=lambda: None)
-    worker._af_client = ExpertsClientV7(make_af_session())
+    worker.model_runner = SimpleNamespace(
+        get_model=lambda: None, get_draft_model=lambda: None
+    )
+    client_cls = ExpertsClientV8 if version == 8 else ExpertsClientV7
+    worker._af_client = client_cls(make_af_session(version=version))
     worker._engram_client = None
 
     worker.load_model()
 
-    assert calls == [
-        "load",
-        "pack",
-        "drain",
-        ("initialize", 8, 16, 6, torch.bfloat16),
-    ]
+    expected_init = (
+        ("initialize", 8, 16, 6, torch.bfloat16)
+        if version == 7
+        else ("initialize", 8, 6, 16, 5, 2)
+    )
+    assert calls == ["load", "pack", "drain", expected_init]
 
 
 def test_attention_and_expert_rank_counts_are_independent():

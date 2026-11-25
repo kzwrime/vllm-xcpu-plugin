@@ -197,6 +197,7 @@ class McpuPlatform(Platform):
         if (
             parallel_config.enable_expert_parallel
             and parallel_config.enable_ep_weight_filter
+            and not envs_xcpu.VLLM_XCPU_ENABLE_AF_EP
         ):
             if vllm_config.speculative_config is not None:
                 raise ValueError(

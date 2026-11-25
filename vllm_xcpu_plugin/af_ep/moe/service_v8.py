@@ -22,13 +22,16 @@ class _ExpertLayer:
     layer_idx: int
     backend: Any
     expert_map: torch.Tensor
+    swiglu_limit: float = 0.0
 
 
 class ExpertServiceV8:
     """Serialize receive -> compute -> send on one stream, reusing all scratch.
 
-    MPI receive storage remains session-owned. The native transaction owns its
-    internal workspace views; Python only binds an operator and allocates bytes.
+    Mirrors fused_ep_moe_v5 on F ranks: fixed per-rank region wire protocol,
+    indexed GEMM1 + fused SiLU-and-mul directly from the dispatch MPI window,
+    v5_local_reduce, optional chunked multi-round execution, swiglu_limit, and
+    padded/filtered expert_map support.
     """
 
     def __init__(
@@ -43,6 +46,16 @@ class ExpertServiceV8:
         assert session.role_rank == model.ep_rank
         self.model = model
         self.session = session
+        self._local_num_experts = getattr(
+            model,
+            "local_num_experts",
+            (model.num_experts + model.ep_size - 1) // model.ep_size,
+        )
+        self._padded_num_experts = getattr(
+            model,
+            "padded_num_experts",
+            self._local_num_experts * model.ep_size,
+        )
         self._layers = tuple(self._prepare_layer(i) for i in model.layer_indices)
         backend_type = self._layers[0].backend.backend_type
         if any(
@@ -75,7 +88,10 @@ class ExpertServiceV8:
     def initialize(self) -> None:
         # Negotiate the A-side post-SP capacity before allocating F storage.
         self.session.initialize(
-            self.model.hidden_size, self.model.top_k, self.model.dtype
+            self.model.hidden_size,
+            self.model.top_k,
+            self.model.dtype,
+            local_experts=self._local_num_experts,
         )
         if self._workspace is not None:
             return
@@ -91,12 +107,13 @@ class ExpertServiceV8:
                     self.model.top_k,
                     self.model.hidden_size,
                     self.model.intermediate_size,
-                    self.model.num_experts // self.model.ep_size,
+                    self._local_num_experts,
                     self.model.dtype.itemsize,
                     block_n,
                     block_k,
                     gemm1.bias is not None,
                     gemm2.bias is not None,
+                    self.session.max_recv_tokens_per_rank,
                 )
             )
         self._workspace = torch.empty(
@@ -106,7 +123,8 @@ class ExpertServiceV8:
         print(
             f"AF-EP V8 F{self.session.role_rank} "
             f"workspace_bytes={self._workspace.numel()} "
-            f"input_capacity={self.session.expert_capacity}",
+            f"input_capacity={self.session.expert_capacity} "
+            f"recv_quota={self.session.max_recv_tokens_per_rank}",
             flush=True,
         )
 
@@ -134,7 +152,7 @@ class ExpertServiceV8:
             gemm2.bias,
             block_n,
             block_k,
-            self.model.num_experts,
+            self._padded_num_experts,
             layer.expert_map,
             self.session.max_rows_per_attention_rank,
             self.model.top_k,
@@ -143,6 +161,8 @@ class ExpertServiceV8:
             self.session.metadata,
             self.session.communicator_handle,
             self._workspace,
+            self.session.max_recv_tokens_per_rank,
+            layer.swiglu_limit,
         )
 
     def _prepare_layer(self, layer_idx: int) -> _ExpertLayer:
@@ -154,7 +174,7 @@ class ExpertServiceV8:
         elif self.model.ep_size == 1:
             # vLLM builds no map when one rank owns every expert (EP1, A*/F1).
             expert_map = torch.arange(
-                self.model.num_experts, dtype=torch.int32, device=self.model.device
+                self._padded_num_experts, dtype=torch.int32, device=self.model.device
             )
         else:
             raise ValueError("AF experts require a global-to-local expert map")
@@ -163,11 +183,19 @@ class ExpertServiceV8:
         if (
             params.hidden != self.model.hidden_size
             or params.intermediate != self.model.intermediate_size
-            or params.experts != self.model.num_experts // self.model.ep_size
+            or params.experts != self._local_num_experts
         ):
             raise ValueError("AF compute dimensions disagree with the service")
         if params.gemm1.params.scale_block_size != params.gemm2.params.scale_block_size:
             raise ValueError("AF GEMMs require matching scale block sizes")
         if self.model.hidden_act not in ("silu", "swiglu"):
             raise ValueError("AF experts require SiLU-and-mul")
-        return _ExpertLayer(layer_idx, backend, expert_map)
+        quant_method = getattr(layer, "quant_method", None)
+        quant_config = getattr(quant_method, "moe_quant_config", None)
+        swiglu_limit = float(
+            getattr(quant_config, "gemm1_clamp_limit", None)
+            or getattr(layer, "swiglu_limit", None)
+            or getattr(self.model, "swiglu_limit", 0.0)
+            or 0.0
+        )
+        return _ExpertLayer(layer_idx, backend, expert_map, swiglu_limit)

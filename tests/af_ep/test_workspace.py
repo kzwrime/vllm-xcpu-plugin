@@ -2,15 +2,11 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("version", [7, 8])
 @pytest.mark.parametrize("sp,expected_matrix", [(1, 320), (2, 160), (4, 80)])
-def test_af_workspace_compact_capacity(version, sp, expected_matrix):
+def test_af_workspace_compact_capacity(sp, expected_matrix):
     import torch_xcpu  # noqa: F401
 
-    query = getattr(
-        torch.ops.torch_xcpu,
-        f"fused_af_f_moe_v{version}_workspace_size_AccFp8MoeGroupedGemm",
-    )
+    query = torch.ops.torch_xcpu.fused_af_f_moe_v7_workspace_size_AccFp8MoeGroupedGemm
     rows = 1024 // sp
     n = query(4, rows, 8, 6144, 2048, 4, 2, 128, 128, False, False)
     metadata = 4 * rows * 8 * 16 + 4 * 64
@@ -19,16 +15,37 @@ def test_af_workspace_compact_capacity(version, sp, expected_matrix):
         query(4, 0, 8, 6144, 2048, 4, 2, 128, 128, False, False)
 
 
-@pytest.mark.parametrize("version", [7, 8])
+@pytest.mark.parametrize("sp,expected_matrix", [(1, 256), (2, 128), (4, 64)])
+def test_af_v8_workspace_compact_capacity_and_chunking(sp, expected_matrix):
+    import torch_xcpu  # noqa: F401
+
+    query = torch.ops.torch_xcpu.fused_af_f_moe_v8_workspace_size_AccFp8MoeGroupedGemm
+    rows = 1024 // sp
+    align128 = lambda b: (b + 127) // 128 * 128
+    # v8 uses v5 indexed GEMM1 + SiluAndMul (no permuted/intermediate buffers):
+    # activated [R, I] + gemm2 [R, H] = 256 MiB for R = 4*1024*4 = 16384.
+    n = query(4, rows, 8, 6144, 2048, 4, 2, 128, 128, False, False, 0)
+    prefix = (
+        align128(4 * 4 * rows * 4)  # gemm1_index
+        + align128(5 * 4)  # expert_offsets
+        + align128(4 * 4 * 4)  # route_bases
+    )
+    assert n == expected_matrix * 1024**2 + prefix + 128
+    # Chunking scales F workspace linearly with C.
+    half = query(4, rows, 8, 6144, 2048, 4, 2, 128, 128, False, False, rows // 2)
+    assert half < n
+    with pytest.raises(RuntimeError, match="workspace dimensions"):
+        query(4, 0, 8, 6144, 2048, 4, 2, 128, 128, False, False, 0)
+
+
 @pytest.mark.parametrize(
     "local_experts,arena_mib", [(1, 96), (2, 160), (4, 320), (8, 640)]
 )
-def test_af_mxfp4_workspace_without_global_reduce(version, local_experts, arena_mib):
+def test_af_mxfp4_workspace_without_global_reduce(local_experts, arena_mib):
     import torch_xcpu  # noqa: F401
 
-    query = getattr(
-        torch.ops.torch_xcpu,
-        f"fused_af_f_moe_v{version}_workspace_size_AccMxfp4MoeGroupedGemm",
+    query = (
+        torch.ops.torch_xcpu.fused_af_f_moe_v7_workspace_size_AccMxfp4MoeGroupedGemm
     )
     # Four A ranks, 1024 rows per A; the F count is not the receive multiplier.
     # One local expert exercises the GEMM2/output overlap constraint, while
@@ -37,6 +54,17 @@ def test_af_mxfp4_workspace_without_global_reduce(version, local_experts, arena_
     assert query(4, 1024, 8, 6144, 2048, local_experts, 2, 1, 32, False, False) == (
         arena_mib * 1024**2 + metadata
     )
+
+
+@pytest.mark.parametrize("local_experts", [1, 2, 4, 8])
+def test_af_v8_mxfp4_workspace_smaller_than_v7(local_experts):
+    import torch_xcpu  # noqa: F401
+
+    q7 = torch.ops.torch_xcpu.fused_af_f_moe_v7_workspace_size_AccMxfp4MoeGroupedGemm
+    q8 = torch.ops.torch_xcpu.fused_af_f_moe_v8_workspace_size_AccMxfp4MoeGroupedGemm
+    n7 = q7(4, 1024, 8, 6144, 2048, local_experts, 2, 1, 32, False, False)
+    n8 = q8(4, 1024, 8, 6144, 2048, local_experts, 2, 1, 32, False, False, 0)
+    assert n8 < n7
 
 
 @pytest.mark.parametrize("version", [7, 8])

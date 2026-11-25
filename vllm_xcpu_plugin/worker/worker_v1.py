@@ -342,6 +342,13 @@ class McpuWorker(Worker):
             install_fused_shared_experts(draft_model)
         if self._af_client is not None:
             config = self.model_config.hf_text_config
+            num_experts = getattr(config, "num_experts", None)
+            if num_experts is None:
+                num_experts = getattr(config, "n_routed_experts", None)
+            if isinstance(num_experts, int) and hasattr(
+                self._af_client, "register_num_experts"
+            ):
+                self._af_client.register_num_experts(num_experts)
             self._af_client.initialize(
                 config.hidden_size, config.num_experts_per_tok, self.model_config.dtype
             )

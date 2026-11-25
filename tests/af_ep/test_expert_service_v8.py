@@ -65,13 +65,13 @@ def test_expert_service_reuses_workspace_and_binds_each_layer(
 
     def execute(*args):
         calls.append(args)
-        args[-1].fill_(args[13])
+        args[16].fill_(args[13])
 
     service._op = execute
     service.execute_model_pass()
     service.execute_model_pass()
     assert [args[13] for args in calls] == [1, 3, 1, 3]
-    assert all(args[-1] is workspace for args in calls)
+    assert all(args[16] is workspace for args in calls)
     for args in calls:
         assert (
             args[0]

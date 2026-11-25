@@ -32,16 +32,24 @@ class _RemoteKernelDescriptor:
 
     MoERunner queries output_is_reduced() to avoid reducing routed output again
     after the client returns, and to reduce shared-expert output separately.
-    Remote execution currently cannot overlap shared experts. The method below
-    overrides kernel-dependent base properties; actual compute uses the client.
+    Remote execution currently cannot overlap shared experts through MoERunner
+    (v8 instead fuses shared experts inside ExpertsClientV8 via
+    install_fused_shared_experts). The method below overrides kernel-dependent
+    base properties; actual compute uses the client.
     """
 
     is_monolithic = False
     can_overlap_shared_experts = False
 
+    def __init__(self, *, supports_num_valid_tokens: bool = False) -> None:
+        self._supports_num_valid_tokens = supports_num_valid_tokens
+
     @staticmethod
     def output_is_reduced() -> bool:
         return True
+
+    def supports_num_valid_tokens(self) -> bool:
+        return self._supports_num_valid_tokens
 
 
 class RemoteExpertsFusedMoEMethod(FusedMoEMethodBase):
@@ -61,8 +69,16 @@ class RemoteExpertsFusedMoEMethod(FusedMoEMethodBase):
         self.layer_idx = int(match.group("layer"))
         self.layer_name = layer_name
         self.client = client
+        self.swiglu_limit = float(getattr(moe, "swiglu_limit", None) or 0.0)
         client.register_layer_capacity(moe.moe_parallel_config.sp_size)
-        self.moe_kernel = _RemoteKernelDescriptor()  # type: ignore[assignment]
+        num_experts = getattr(moe, "num_experts", None)
+        if isinstance(num_experts, int) and hasattr(client, "register_num_experts"):
+            client.register_num_experts(num_experts)
+        self.moe_kernel = _RemoteKernelDescriptor(  # type: ignore[assignment]
+            supports_num_valid_tokens=bool(
+                getattr(client, "supports_num_valid_tokens", False)
+            )
+        )
         self._seen_checkpoint_names: set[str] = set()
         self._weight_loading_finalized = False
 

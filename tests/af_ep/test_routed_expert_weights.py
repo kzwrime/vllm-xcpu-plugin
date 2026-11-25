@@ -287,3 +287,63 @@ def test_expert_loader_reads_only_local_expert_weights(tmp_path, default_vllm_co
         *(f"model.layers.1.mlp.experts.{e}.down_proj.weight" for e in (2, 3)),
         *(f"model.layers.1.mlp.experts.{e}.down_proj.weight_scale" for e in range(4)),
     }
+
+
+def test_routed_experts_model_v8_forwards_swiglu_limit_and_handles_empty_tail_rank(
+    default_vllm_config,
+):
+    """V8 F model forwards swiglu_limit and handles tail ranks with 0 active experts."""
+    from types import SimpleNamespace
+
+    import torch_mcpu  # noqa: F401
+    from vllm.config import get_current_vllm_config
+
+    from vllm_xcpu_plugin.af_ep.moe.model import RoutedExpertsModel
+
+    current_cfg = get_current_vllm_config()
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        hidden_size=16,
+        moe_intermediate_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=3,
+        hidden_act="silu",
+        swiglu_limit=7.0,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=hf_config,
+            dtype=torch.bfloat16,
+        ),
+        quant_config=None,
+        compilation_config=current_cfg.compilation_config,
+    )
+    # 4 experts across 3 F ranks -> padded_local=2, rank 2 owns 0 active experts.
+    model = RoutedExpertsModel(
+        vllm_config,
+        ep_size=3,
+        ep_rank=2,
+        max_num_tokens=8,
+        device="mcpu",
+        all2all_backend="mpi_alltoallv_v8",
+    )
+    assert model.local_num_experts == 2
+    assert model.padded_num_experts == 6
+    assert model.local_expert_ids() == ()
+    layer = model.routed_experts["1"]
+    assert layer.swiglu_limit == 7.0
+    assert layer._xcpu_padded_experts is True
+    assert layer._xcpu_active_local_experts == 0
+
+    weights = [
+        (f"model.layers.1.mlp.experts.{e}.{proj}.weight", torch.ones(8, 16))
+        for e in range(4)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    ]
+    loaded = model.load_weights(weights)
+    assert loaded == set()
+    assert model.weight_audit is not None
+    assert model.weight_audit.loaded_count == 0
+    assert len(model.weight_audit.remote_checkpoint_names) == 12

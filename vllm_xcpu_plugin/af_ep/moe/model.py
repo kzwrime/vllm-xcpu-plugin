@@ -45,21 +45,24 @@ class RoutedExpertsModel(torch.nn.Module):
             num_experts = getattr(config, "n_routed_experts", None)
         if not isinstance(num_experts, int) or num_experts <= 0:
             raise ValueError("AF-EP requires a routed MoE model")
-        if num_experts % ep_size != 0:
+        if all2all_backend not in AF_EP_BACKENDS:
+            raise ValueError(f"unsupported AF-EP backend: {all2all_backend}")
+        if num_experts % ep_size != 0 and all2all_backend != "mpi_alltoallv_v8":
             raise ValueError("AF-EP requires equal routed-expert shards on all F ranks")
         if max_num_tokens <= 0:
             raise ValueError("max_num_tokens must be positive")
 
-        if all2all_backend not in AF_EP_BACKENDS:
-            raise ValueError(f"unsupported AF-EP backend: {all2all_backend}")
         self.all2all_backend = all2all_backend
         self.num_layers = config.num_hidden_layers
         self.layer_indices = self._moe_layer_indices(config)
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.num_experts = num_experts
+        self.local_num_experts = (num_experts + ep_size - 1) // ep_size
+        self.padded_num_experts = self.local_num_experts * ep_size
         self.top_k = config.num_experts_per_tok
         self.hidden_act = config.hidden_act
+        self.swiglu_limit = float(getattr(config, "swiglu_limit", None) or 0.0)
         self.dtype = model_config.dtype
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -68,7 +71,7 @@ class RoutedExpertsModel(torch.nn.Module):
         self._vllm_config = vllm_config
         from vllm.config import set_current_vllm_config
 
-        with set_current_vllm_config(vllm_config):
+        with set_current_vllm_config(vllm_config), torch.device(self.device):
             self.routed_experts = torch.nn.ModuleDict({
                 str(layer_idx): self._build_routed_experts(layer_idx)
                 for layer_idx in self.layer_indices
@@ -77,9 +80,10 @@ class RoutedExpertsModel(torch.nn.Module):
         self.weight_audit: WeightLoadAudit | None = None
 
     def local_expert_ids(self) -> tuple[int, ...]:
-        local_count = self.num_experts // self.ep_size
+        local_count = self.local_num_experts
         start = self.ep_rank * local_count
-        return tuple(range(start, start + local_count))
+        end = min(self.num_experts, start + local_count)
+        return tuple(range(start, max(start, end)))
 
     def load_routed_weight(
         self,
@@ -190,6 +194,7 @@ class RoutedExpertsModel(torch.nn.Module):
             moe_config=moe_config,
             quant_config=self._vllm_config.quant_config,
             expert_map_manager=expert_map_manager,
+            swiglu_limit=self.swiglu_limit or None,
         )
 
     @staticmethod

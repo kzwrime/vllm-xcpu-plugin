@@ -36,7 +36,9 @@ def direct_aoti(op):
     schema = op._schema
     call = getattr(library, "aoti_torch_mcpu_" + schema.name.split("::")[1])
     call.argtypes = [
-        ctypes.c_int64 if str(a.type) == "int" else ctypes.c_void_p
+        ctypes.c_int64
+        if str(a.type) in ("int", "SymInt")
+        else (ctypes.c_double if str(a.type) == "float" else ctypes.c_void_p)
         for a in schema.arguments
     ] + [ctypes.c_void_p]
     call.restype = ctypes.c_int32
@@ -165,6 +167,8 @@ def run(
     if is_a:
         client = client_cls(session)
         client.register_layer_capacity(sp)
+        if hasattr(client, "register_num_experts"):
+            client.register_num_experts(experts)
         client.initialize(h, topk, torch.bfloat16)
         # Allocate before tracing; only native workspace mutation enters the graph.
         client._ensure_workspace(

@@ -3,7 +3,9 @@
 The common package shares code across roles, not across transport versions.
 MpiWorld owns generic process discovery and the attention/MoE pair
 communicator; PairSession the rank layout and tensor metadata ABI; this
-module adds V8's fixed capacity and collective initialization contract.
+module adds V8's v5-aligned fixed-region window and collective initialization
+contract (including optional EP receive-quota chunking and multi-layout window
+reuse).
 """
 
 from __future__ import annotations
@@ -24,8 +26,8 @@ class AfV8Session(PairSession):
 
     This consumes an already connected MPI world; it does not connect jobs or
     negotiate a transport version. initialize() collectively validates the V8
-    configuration and allocates its role's receive buffer through torch_xcpu on the
-    first call.
+    configuration and allocates its role's v5-protocol MPI window through
+    torch_xcpu on the first call (and supports multi-layout reuse).
     """
 
     protocol_version = AF_PROTOCOL_VERSION
@@ -37,6 +39,7 @@ class AfV8Session(PairSession):
         mpi_world: MpiWorld,
         *,
         max_rows_per_attention_rank: int,
+        max_recv_tokens_per_rank: int | None = None,
     ) -> None:
         assert max_rows_per_attention_rank > 0
         super().__init__(mpi_world)
@@ -46,7 +49,20 @@ class AfV8Session(PairSession):
         self.max_rows_per_attention_rank = max_rows_per_attention_rank
         self._scheduler_capacity = max_rows_per_attention_rank
         self._layer_capacity = 0
+        quota = (
+            envs_xcpu.VLLM_XCPU_MOE_EP_MAX_RECV_TOKENS_PER_RANK
+            if max_recv_tokens_per_rank is None
+            else int(max_recv_tokens_per_rank)
+        )
+        if quota < 0:
+            raise ValueError("AF-EP receive quota must be nonnegative")
+        self.max_recv_tokens_per_rank = quota
+        self._num_experts: int | None = None
+        self.local_experts: int | None = None
         self._model_shape: tuple[int, int, torch.dtype] | None = None
+        self._initialized_layouts: set[tuple[int, int, int, int, int, torch.dtype]] = (
+            set()
+        )
 
     def register_layer_capacity(self, sp_size: int) -> None:
         """A registers actual per-layer SP, before collective initialization."""
@@ -59,6 +75,16 @@ class AfV8Session(PairSession):
         rows = (self._scheduler_capacity + sp_size - 1) // sp_size
         self._layer_capacity = max(self._layer_capacity, rows)
 
+    def register_num_experts(self, num_experts: int) -> None:
+        """Record logical global expert count so A derives padded E per F rank."""
+        if num_experts <= 0:
+            raise ValueError("AF num_experts must be positive")
+        if self._num_experts is not None and self._num_experts != num_experts:
+            raise ValueError(
+                f"AF num_experts changed from {self._num_experts} to {num_experts}"
+            )
+        self._num_experts = num_experts
+
     @property
     def expert_capacity(self) -> int:
         return self.num_attention_ranks * self.max_rows_per_attention_rank
@@ -69,17 +95,62 @@ class AfV8Session(PairSession):
                 self.num_attention_ranks + self.num_expert_ranks
             )
 
-    def initialize(self, hidden_size: int, topk: int, dtype: torch.dtype) -> None:
-        """Allocate receive storage after model load, before any forward."""
+    def initialize(
+        self,
+        hidden_size: int,
+        topk: int,
+        dtype: torch.dtype,
+        *,
+        local_experts: int | None = None,
+        max_recv_tokens_per_rank: int | None = None,
+    ) -> None:
+        """Allocate role MPI window after model load, before any forward."""
         model_shape = (hidden_size, topk, dtype)
+        if max_recv_tokens_per_rank is not None:
+            if max_recv_tokens_per_rank < 0:
+                raise ValueError("AF-EP receive quota must be nonnegative")
+            self.max_recv_tokens_per_rank = int(max_recv_tokens_per_rank)
+
+        if local_experts is None:
+            if self._num_experts is not None:
+                local_experts = (
+                    self._num_experts + self.ep_size - 1
+                ) // self.ep_size
+            elif self.local_experts is not None:
+                local_experts = self.local_experts
+            else:
+                local_experts = 1
+        if local_experts <= 0:
+            raise ValueError("AF local_experts must be positive")
+
         if self._model_shape is not None:
             if self._model_shape != model_shape:
                 raise RuntimeError(
                     f"AF V8 model shape changed: {model_shape} != {self._model_shape}"
                 )
+            layout_key = (
+                self.max_rows_per_attention_rank,
+                hidden_size,
+                topk,
+                local_experts,
+                self.max_recv_tokens_per_rank,
+                dtype,
+            )
+            if layout_key in self._initialized_layouts:
+                return
+            torch.accelerator.synchronize()
+            torch.ops.torch_xcpu.fused_af_v8_initialize_windows(
+                self.max_rows_per_attention_rank,
+                topk,
+                hidden_size,
+                local_experts,
+                dtype.itemsize,
+                self.max_recv_tokens_per_rank,
+                self.metadata,
+                self.communicator_handle,
+            )
+            self._initialized_layouts.add(layout_key)
             return
-
-        from torch_xcpu import ops as xcpu_ops
 
         # Loading/weight conversion may have queued device work. Complete it
         # before entering MPI on this host thread.
@@ -99,19 +170,32 @@ class AfV8Session(PairSession):
         ):
             raise ValueError("AF capacity negotiation has invalid role proposals")
         self.max_rows_per_attention_rank = max(capacities)
-        xcpu_ops.moe_af_v8_initialize(
+        torch.ops.torch_xcpu.fused_af_v8_initialize_windows(
             self.max_rows_per_attention_rank,
-            hidden_size,
             topk,
-            dtype,
+            hidden_size,
+            local_experts,
+            dtype.itemsize,
+            self.max_recv_tokens_per_rank,
             self.metadata,
             self.communicator_handle,
         )
+        self.local_experts = local_experts
         self._model_shape = model_shape
+        self._initialized_layouts.add((
+            self.max_rows_per_attention_rank,
+            hidden_size,
+            topk,
+            local_experts,
+            self.max_recv_tokens_per_rank,
+            dtype,
+        ))
         print(
             f"AF-EP V8 transport ready: role={self.cluster_type.name} "
             f"rank={self.role_rank} hidden_size={hidden_size} topk={topk} "
-            f"max_rows_per_attention_rank={self.max_rows_per_attention_rank}",
+            f"local_experts={local_experts} "
+            f"max_rows_per_attention_rank={self.max_rows_per_attention_rank} "
+            f"recv_quota={self.max_recv_tokens_per_rank}",
             flush=True,
         )
 

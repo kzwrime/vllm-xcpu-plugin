@@ -48,9 +48,9 @@ class RoutedExpertsWeightLoader:
     def __init__(self, target: ExpertWeightTarget) -> None:
         self.target = target
         assert target.layer_indices and target.num_experts > 0
-        assert target.num_experts % target.ep_size == 0
         local_ids = target.local_expert_ids()
-        assert len(local_ids) == target.num_experts // target.ep_size
+        max_local = (target.num_experts + target.ep_size - 1) // target.ep_size
+        assert len(local_ids) <= max_local
         self._layers = frozenset(target.layer_indices)
         self._local_experts = frozenset(local_ids)
 
@@ -102,7 +102,7 @@ class RoutedExpertsWeightLoader:
             )
             loaded_layers.add(layer_idx)
 
-        missing_layers = self._layers - loaded_layers
+        missing_layers = self._layers - loaded_layers if self._local_experts else set()
         if missing_layers:
             raise ValueError(
                 "no local routed-expert weights were loaded for layers "
