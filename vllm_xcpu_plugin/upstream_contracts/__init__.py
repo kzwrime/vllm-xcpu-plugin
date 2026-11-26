@@ -348,9 +348,15 @@ def _watched_file_drift(
     watched: WatchedFile, patches: tuple[Patch, ...]
 ) -> Drift | None:
     path = _source.vllm_repo_path(watched.path)
+    if path is None:
+        # Wheel / non-editable vLLM installs ship only the Python package, not
+        # repo-level sources such as csrc/*.cu; Python-side UpstreamRef and
+        # WatchedModule pins still run normally, while WatchedFile pins are
+        # enforced whenever vLLM is imported from a source checkout.
+        return None
     users = [p for p in patches if watched.path in p.upstream_files]
     target = f"vllm:{watched.path}"
-    if path is None or not path.is_file():
+    if not path.is_file():
         return Drift(
             "missing",
             target,

@@ -197,3 +197,232 @@ def test_rebind_keeps_the_original_resolvable(upstream):
 def test_rebind_of_a_vanished_attribute_fails(upstream):
     with pytest.raises(KernelVersionError, match="no longer exists upstream"):
         uc.rebind(upstream.module, "gate_renamed", lambda x, eps: 0)
+
+
+def _register_watched_file_manifest(
+    monkeypatch,
+    *,
+    rel_path: str,
+    sha256: str,
+    commit: str,
+    category: str = "watched_file_fixture",
+):
+    source = KernelSource(tag="test", local_commit=commit, main_commit=commit)
+    manifest = uc.Manifest(
+        category=category,
+        packages=(),
+        watched_files=(
+            uc.WatchedFile(path=rel_path, sha256=sha256, source=source),
+        ),
+        patches=(
+            uc.Patch(
+                id=f"{category}.kernel",
+                downstream=("tests.downstream:xcpu_kernel",),
+                upstream=(),
+                upstream_files=(rel_path,),
+                source=source,
+                contract="Mirrors the upstream CUDA kernel.",
+            ),
+        ),
+    )
+    mod = types.ModuleType(f"xcpu_contract_{category}_manifest")
+    mod.MANIFEST = manifest
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setitem(uc.MANIFESTS, category, mod.__name__)
+    uc._verified.cache_clear()
+    return manifest
+
+
+def _mock_vllm_module_path(monkeypatch, vllm_init_path):
+    orig_module_path = _source.module_path
+
+    def fake_module_path(module: str):
+        if module == "vllm":
+            return vllm_init_path
+        return orig_module_path(module)
+
+    monkeypatch.setattr(_source, "module_path", fake_module_path)
+
+
+def test_watched_file_checked_in_source_checkout(tmp_path, monkeypatch):
+    from vllm_xcpu_plugin.upstream_contracts.lint import lint, provenance
+
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "vllm").mkdir()
+    vllm_init = tmp_path / "vllm" / "__init__.py"
+    vllm_init.write_text("")
+    kernel = tmp_path / "csrc" / "kernel.cu"
+    kernel.parent.mkdir(parents=True)
+    kernel_v1 = "__global__ void k() { /* v1 */ }\n"
+    kernel.write_text(kernel_v1)
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-q", "-m", "v1")
+    commit = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    _mock_vllm_module_path(monkeypatch, vllm_init)
+    manifest = _register_watched_file_manifest(
+        monkeypatch,
+        rel_path="csrc/kernel.cu",
+        sha256=_source.sha256_text(kernel_v1),
+        commit=commit,
+    )
+
+    assert _source.vllm_repo_root() == tmp_path.resolve()
+    assert _source.vllm_git_root() == tmp_path.resolve()
+    assert uc.check(manifest.category) == []
+    uc.verify(manifest.category)
+    assert provenance(manifest) == []
+
+    # Modifying the watched file surfaces a 'file' drift with diff.
+    kernel.write_text("__global__ void k() { /* v2 */ }\n")
+    (drift,) = uc.check(manifest.category)
+    assert drift.kind == "file"
+    assert drift.target == "vllm:csrc/kernel.cu"
+    assert [p.id for p in drift.patches] == [f"{manifest.category}.kernel"]
+    assert "+__global__ void k() { /* v2 */ }" in (drift.diff or "")
+
+    # Deleting the watched file in a source checkout must still report missing.
+    kernel.unlink()
+    (drift,) = uc.check(manifest.category)
+    assert drift.kind == "missing"
+    assert drift.target == "vllm:csrc/kernel.cu"
+    lint_problems = lint(manifest)
+    assert "watched file csrc/kernel.cu does not exist" in lint_problems
+
+
+def test_watched_file_checked_in_non_git_source_checkout(tmp_path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='vllm'\n")
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.26)\n")
+    (tmp_path / "vllm").mkdir()
+    vllm_init = tmp_path / "vllm" / "__init__.py"
+    vllm_init.write_text("")
+    kernel = tmp_path / "csrc" / "kernel.cu"
+    kernel.parent.mkdir(parents=True)
+    kernel_text = "__global__ void k() {}\n"
+    kernel.write_text(kernel_text)
+
+    _mock_vllm_module_path(monkeypatch, vllm_init)
+    manifest = _register_watched_file_manifest(
+        monkeypatch,
+        rel_path="csrc/kernel.cu",
+        sha256=_source.sha256_text(kernel_text),
+        commit="0" * 40,
+        category="watched_file_nogit",
+    )
+
+    assert _source.vllm_repo_root() == tmp_path.resolve()
+    assert _source.vllm_git_root() is None
+    assert uc.check(manifest.category) == []
+
+    kernel.unlink()
+    (drift,) = uc.check(manifest.category)
+    assert drift.kind == "missing"
+
+
+def test_watched_file_skipped_for_non_editable_vllm_install(tmp_path, monkeypatch):
+    from vllm_xcpu_plugin.upstream_contracts.lint import lint, provenance
+
+    # Place site-packages inside a parent git repo (like dev-kit/.venv) to verify
+    # the parent repo is never mistaken for a vLLM checkout.
+    _git(tmp_path, "init", "-q")
+    site_packages = tmp_path / ".venv" / "lib" / "python3.12" / "site-packages"
+    vllm_dir = site_packages / "vllm"
+    vllm_dir.mkdir(parents=True)
+    vllm_init = vllm_dir / "__init__.py"
+    vllm_init.write_text("")
+
+    _mock_vllm_module_path(monkeypatch, vllm_init)
+    manifest = _register_watched_file_manifest(
+        monkeypatch,
+        rel_path="csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu",
+        sha256=_source.sha256_text("irrelevant"),
+        commit="1" * 40,
+        category="watched_file_wheel",
+    )
+
+    assert _source.vllm_repo_root() is None
+    assert _source.vllm_git_root() is None
+    assert (
+        _source.vllm_repo_path(
+            "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu"
+        )
+        is None
+    )
+    assert _source.reviewed_text(vllm_init, "1" * 40) is None
+    assert uc.check(manifest.category) == []
+    uc.verify(manifest.category)
+    # lint() skips repo-only watched file existence in wheel mode.
+    assert not any("does not exist" in p for p in lint(manifest))
+    # provenance() fails closed with a clear message when vllm has no git repo.
+    prov = provenance(manifest)
+    assert len(prov) == 1 and "git checkout" in prov[0]
+
+
+def test_watched_file_in_package_data_still_checked_in_wheel(tmp_path, monkeypatch):
+    site_packages = tmp_path / "site-packages"
+    vllm_dir = site_packages / "vllm"
+    data_file = vllm_dir / "transformers_utils" / "chat_templates" / "demo.jinja"
+    data_file.parent.mkdir(parents=True)
+    vllm_init = vllm_dir / "__init__.py"
+    vllm_init.write_text("")
+    data_file.write_text("v1")
+
+    _mock_vllm_module_path(monkeypatch, vllm_init)
+    rel = "vllm/transformers_utils/chat_templates/demo.jinja"
+    manifest = _register_watched_file_manifest(
+        monkeypatch,
+        rel_path=rel,
+        sha256=_source.sha256_text("v1"),
+        commit="2" * 40,
+        category="watched_file_pkgdata",
+    )
+
+    assert _source.vllm_repo_root() is None
+    assert _source.vllm_repo_path(rel) == data_file
+    assert _source.vllm_repo_path("vllm/unshipped.cu") is None
+    assert uc.check(manifest.category) == []
+
+    data_file.write_text("v2")
+    (drift,) = uc.check(manifest.category)
+    assert drift.kind == "file"
+    assert drift.target == f"vllm:{rel}"
+
+
+def test_lint_workspace_root_handles_non_editable_plugin(tmp_path):
+    from vllm_xcpu_plugin.upstream_contracts.lint import _workspace_root
+
+    ws = tmp_path / "devkit"
+    (ws / "vllm-xcpu-plugin" / "vllm_xcpu_plugin").mkdir(parents=True)
+    scripts_dir = ws / "vllm_scripts"
+    scripts_dir.mkdir()
+    site_lint = (
+        ws
+        / ".venv"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "vllm_xcpu_plugin"
+        / "upstream_contracts"
+        / "lint.py"
+    )
+    site_lint.parent.mkdir(parents=True)
+    site_lint.write_text("")
+
+    # Editable anchor resolves directly from __file__.
+    editable_lint = (
+        ws / "vllm-xcpu-plugin" / "vllm_xcpu_plugin" / "upstream_contracts" / "lint.py"
+    )
+    assert _workspace_root(anchor=editable_lint, cwd=tmp_path) == ws.resolve()
+    # Non-editable site-packages anchor falls back to cwd ancestors.
+    assert _workspace_root(anchor=site_lint, cwd=scripts_dir) == ws.resolve()
+    # Outside any workspace, returns None instead of pointing into site-packages.
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    assert _workspace_root(anchor=site_lint, cwd=outside) is None

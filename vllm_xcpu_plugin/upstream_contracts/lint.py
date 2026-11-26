@@ -326,19 +326,37 @@ def _resolves(target: str) -> bool:
     return True
 
 
-# Workspace root holding vllm/, vllm-xcpu-plugin/, torch_xcpu/, docs/.
-_WORKSPACE = Path(__file__).resolve().parents[3]
+def _workspace_root(
+    anchor: Path | None = None, cwd: Path | None = None
+) -> Path | None:
+    """Workspace root holding vllm/, vllm-xcpu-plugin/, torch_xcpu/, docs/.
+
+    Editable installs sit at ``<workspace>/vllm-xcpu-plugin/vllm_xcpu_plugin/...``.
+    Non-editable installs sit under ``site-packages/``, so fall back to walking
+    up from ``cwd``. Returns ``None`` outside a workspace checkout.
+    """
+    file_path = (anchor or Path(__file__)).resolve()
+    candidates: list[Path] = []
+    if len(file_path.parents) > 3:
+        candidates.append(file_path.parents[3])
+    cwd_path = (cwd or Path.cwd()).resolve()
+    candidates.append(cwd_path)
+    candidates.extend(cwd_path.parents)
+    for candidate in candidates:
+        if (candidate / "vllm-xcpu-plugin" / "vllm_xcpu_plugin").is_dir():
+            return candidate
+    return None
 
 
-def _reference_problem(entry: str) -> str | None:
+def _reference_problem(entry: str, workspace: Path | None) -> str | None:
     """``path[::symbol] [note]`` entries must name an existing file/symbol."""
     token = entry.split(" ", 1)[0]
     path_part, _, symbol = token.partition("::")
-    if "/" not in path_part:
+    if "/" not in path_part or workspace is None:
         return None
-    matches = sorted(_WORKSPACE.glob(path_part))
+    matches = sorted(workspace.glob(path_part))
     if not matches:
-        return f"{path_part} does not exist under {_WORKSPACE}"
+        return f"{path_part} does not exist under {workspace}"
     if symbol and not any(
         re.search(
             rf"\b(def|class)\s+{re.escape(symbol)}\b|^{re.escape(symbol)}\s*=",
@@ -374,6 +392,7 @@ def lint(manifest: Manifest) -> list[str]:
     for duplicate in sorted({i for i in ids if ids.count(i) > 1}):
         problems.append(f"duplicate patch id {duplicate}")
 
+    workspace = _workspace_root()
     pins: dict[str, tuple[str | None, str | None, str | None]] = {}
     for patch in manifest.patches:
         if not patch.contract.strip():
@@ -384,7 +403,7 @@ def lint(manifest: Manifest) -> list[str]:
             if not _resolves(target):
                 problems.append(f"{patch.id}: downstream {target} does not resolve")
         for entry in (*patch.impl, *patch.tests):
-            if problem := _reference_problem(entry):
+            if problem := _reference_problem(entry, workspace):
                 problems.append(f"{patch.id}: {problem}")
         for ref in patch.upstream:
             pin = (ref.source_hash, ref.signature_hash, ref.expect)
@@ -401,7 +420,7 @@ def lint(manifest: Manifest) -> list[str]:
                 problems.append(f"{patch.id}: upstream file {path} is not pinned")
     for watched_file in manifest.watched_files:
         resolved = _source.vllm_repo_path(watched_file.path)
-        if resolved is None or not resolved.is_file():
+        if resolved is not None and not resolved.is_file():
             problems.append(f"watched file {watched_file.path} does not exist")
 
     downstream = {t: p for p in manifest.patches for t in p.downstream}
@@ -439,12 +458,32 @@ def lint(manifest: Manifest) -> list[str]:
     return problems
 
 
+def _uses_vllm(manifest: Manifest) -> bool:
+    if manifest.watched_files:
+        return True
+    if any(
+        w.module == "vllm" or w.module.startswith("vllm.") for w in manifest.watched
+    ):
+        return True
+    return any(
+        ref.target.startswith(("vllm:", "vllm."))
+        for patch in manifest.patches
+        for ref in patch.upstream
+    )
+
+
 def provenance(manifest: Manifest) -> list[str]:
     """Each pin must match its ``KernelSource.local_commit`` snapshot, so the
     reviewed source can be recovered for the next diff."""
     from vllm_xcpu_plugin.fake_triton.provenance import KernelSource
 
     from . import _reviewed_symbol, origin, resolve
+
+    if _uses_vllm(manifest) and _source.vllm_git_root() is None:
+        return [
+            "vllm is not installed from a git checkout; provenance requires "
+            "a vllm git checkout (editable install)"
+        ]
 
     problems = []
     for patch in manifest.patches:

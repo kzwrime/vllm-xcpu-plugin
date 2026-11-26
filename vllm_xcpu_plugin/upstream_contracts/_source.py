@@ -120,10 +120,58 @@ def module_path(module: str) -> Path | None:
     return Path(spec.origin)
 
 
-def vllm_repo_path(relative: str) -> Path | None:
-    """A path inside the vLLM checkout that provides the ``vllm`` package."""
+def vllm_repo_root() -> Path | None:
+    """The vLLM source checkout root if ``vllm`` is imported from one.
+
+    Non-editable (wheel / ``site-packages``) installs ship only the ``vllm``
+    Python package and omit repository-level non-Python sources such as
+    ``csrc/``, so they return ``None``.
+    """
     package = module_path("vllm")
-    return package.parents[1] / relative if package else None
+    if package is None or package.name != "__init__.py":
+        return None
+    candidate = package.resolve().parents[1]
+    if (candidate / ".git").exists() or (
+        (candidate / "pyproject.toml").is_file()
+        and (candidate / "CMakeLists.txt").is_file()
+    ):
+        return candidate
+    return None
+
+
+def vllm_git_root() -> Path | None:
+    """Git repository root of the imported ``vllm`` package, if any."""
+    root = vllm_repo_root()
+    if root is None:
+        return None
+    git_root = _repo_root(root)
+    return git_root if git_root == root else None
+
+
+def vllm_repo_path(relative: str) -> Path | None:
+    """Path to a watched non-Python file in ``vllm``, or ``None`` if unavailable.
+
+    When ``vllm`` is imported from a source checkout, always returns
+    ``<repo_root>/<relative>`` (even if the file no longer exists, so
+    deletion or rename is reported as ``missing`` drift).
+
+    When ``vllm`` is a non-editable wheel install (``site-packages``),
+    repo-level sources such as ``csrc/*.cu`` are not packaged into the wheel;
+    returns the installed file only if it was shipped inside ``vllm/``
+    package data, and ``None`` otherwise.
+    """
+    root = vllm_repo_root()
+    if root is not None:
+        return root / relative
+    package = module_path("vllm")
+    if package is None or package.name != "__init__.py":
+        return None
+    rel = Path(relative)
+    if rel.parts and rel.parts[0] == "vllm":
+        installed = package.parent.joinpath(*rel.parts[1:])
+        if installed.is_file():
+            return installed
+    return None
 
 
 @functools.cache
@@ -164,10 +212,17 @@ def _repo_root(directory: Path) -> Path | None:
 @functools.cache
 def reviewed_text(path: Path, commit: str) -> str | None:
     """The file as of ``commit`` in the repository that contains it."""
-    root = _repo_root(path.parent)
+    resolved = path.resolve()
+    if "site-packages" in resolved.parts or "dist-packages" in resolved.parts:
+        return None
+    root = _repo_root(resolved.parent)
     if root is None:
         return None
-    return _git(root, "show", f"{commit}:{path.relative_to(root).as_posix()}")
+    try:
+        rel = resolved.relative_to(root).as_posix()
+    except ValueError:
+        return None
+    return _git(root, "show", f"{commit}:{rel}")
 
 
 def reviewed_symbols(path: Path, commit: str) -> dict[str, SymbolSource] | None:

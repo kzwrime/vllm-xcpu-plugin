@@ -41,7 +41,9 @@ adapter）都依赖某些上游代码的语义。上游契约把这种依赖写�
 
 - `WatchedFile`：XCPU 算子镜像的非 Python 上游源码（CUDA kernel 等，路径相对 vLLM
   仓库根目录），按 SHA256 钉住，变化时给出整文件 diff；`Patch.upstream_files`
-  声明依赖它的 patch。
+  声明依赖它的 patch。仅在 `vllm` 来自源码目录（如 `-e` 安装）或文件随 `vllm/`
+  package data 打入 wheel 时校验；非 `-e`/wheel 安装不包含仓库级 `csrc/` 源码，
+  运行时会跳过不可得的 `WatchedFile`，但仍完整校验所有 Python 符号与 `WatchedModule`。
 
 指纹算法与 Fake Triton 相同（规范化 AST、signature）。常量按 `repr` 取指纹。
 
