@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -23,7 +25,69 @@ MPI_ALLTOALLV_BACKENDS = {
 }
 
 
+class _MpiRequestHandle:
+    """Handle wrapping an mpi4py non-blocking request with payload retention."""
+
+    reliable_is_completed = True
+
+    def __init__(self, req: Any, keep_alive: Any = None) -> None:
+        self._req = req
+        self._keep_alive = keep_alive
+        self._done = False
+
+    def wait(self) -> None:
+        if not self._done:
+            self._req.Wait()
+            self._done = True
+            self._keep_alive = None
+
+    def is_completed(self) -> bool:
+        if self._done:
+            return True
+        if self._req.Test():
+            self._done = True
+            self._keep_alive = None
+            return True
+        return False
+
+
+class _McpuEventHandle:
+    """Handle backed by an MCPU stream event for P2P completion and lifetime."""
+
+    def __init__(
+        self,
+        event: Any,
+        wait_stream: Any = None,
+        keep_alive: Any = None,
+    ) -> None:
+        self._event = event
+        self._wait_stream = wait_stream
+        self._keep_alive = keep_alive
+        self._done = False
+
+    def wait(self) -> None:
+        if not self._done:
+            if self._wait_stream is not None:
+                self._wait_stream.wait_event(self._event)
+            else:
+                self._event.synchronize()
+            self._done = True
+            self._keep_alive = None
+
+    def is_completed(self) -> bool:
+        if self._done:
+            return True
+        if self._event.query():
+            self._done = True
+            self._keep_alive = None
+            return True
+        return False
+
+
 class CpuMPICommunicator(DeviceCommunicatorBase):
+    supports_custom_tensor_dict = True
+    supports_custom_pp_broadcast = True
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -71,7 +135,8 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         dist.all_reduce(min_rank_in_group_, op=dist.ReduceOp.MIN, group=self.cpu_group)
         min_rank_in_group = int(min_rank_in_group_.item())
         logger.info("[%d] min_rank_in_group: %d", mpi_cluster_rank, min_rank_in_group)
-        self.mpi_group_comm = cluster_world_comm.Split(min_rank_in_group)
+        # Key by group rank so MPI group rank order matches cpu_group exactly.
+        self.mpi_group_comm = cluster_world_comm.Split(min_rank_in_group, self.rank)
         group_ranks_verify = torch.zeros(num_ranks, dtype=torch.int32)
         self.mpi_group_comm.Allgather(cluster_rank_tensor, group_ranks_verify)
         logger.info(
@@ -130,6 +195,16 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
         self.comm_ptr_wrapper = torch.tensor(
             [self.comm_ptr], dtype=torch.int64, device="cpu"
         )
+        # Isolated communicators so host metadata, tensor P2P, and side-stream
+        # PP sampled-token relay never collide on tags or MPI worker threads.
+        self.mpi_meta_comm = self.mpi_group_comm.Dup()
+        self.mpi_bcast_comm = self.mpi_group_comm.Dup()
+        self.bcast_comm_ptr_wrapper = torch.tensor(
+            [self.mpi_bcast_comm.py2f()], dtype=torch.int64, device="cpu"
+        )
+        self._p2p_send_stream: Any = None
+        self._p2p_recv_stream: Any = None
+        self._pending_meta_handles: list[_MpiRequestHandle] = []
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torch_mpi_ext
@@ -341,9 +416,279 @@ class CpuMPICommunicator(DeviceCommunicatorBase):
             is_sequence_parallel,
         )
 
+    def _normalize_device(self, dev: torch.device | str) -> torch.device:
+        device = torch.device(dev)
+        if device.type in ("mcpu", "privateuseone"):
+            return torch.device("mcpu", torch.mcpu.current_device())
+        return device
+
+    def _get_p2p_send_stream(self) -> Any:
+        if self._p2p_send_stream is None:
+            self._p2p_send_stream = torch.mcpu.Stream()
+        return self._p2p_send_stream
+
+    def _get_p2p_recv_stream(self) -> Any:
+        if self._p2p_recv_stream is None:
+            self._p2p_recv_stream = torch.mcpu.Stream()
+        return self._p2p_recv_stream
+
+    @staticmethod
+    def _should_use_all_gather(
+        key: str,
+        numel: int,
+        all_gather_group: Any | None,
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> bool:
+        if all_gather_group is None:
+            return False
+        use_all_gather = numel % all_gather_group.world_size == 0
+        if all_gather_tensors is not None:
+            use_all_gather = all_gather_tensors.get(key, use_all_gather)
+        return use_all_gather
+
+    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        """Broadcast a tensor from group-local src rank via MPI_Bcast."""
+        if self.world_size <= 1:
+            return tensor
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        import torch_mpi_ext
+
+        contig = tensor if tensor.is_contiguous() else tensor.contiguous()
+        torch_mpi_ext.ops.broadcast_(contig, src, self.comm_ptr_wrapper)
+        if contig is not tensor:
+            tensor.copy_(contig)
+        return tensor
+
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+        """Send a tensor to destination rank using MPI_Send."""
+        import torch_mpi_ext
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+        contig = tensor.contiguous()
+        torch_mpi_ext.ops.send(contig, dst, 0, self.comm_ptr_wrapper)
+
+    def recv(
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
+    ) -> torch.Tensor:
+        """Receive a tensor from source rank using MPI_Recv."""
+        import torch_mpi_ext
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        tensor = torch.empty(
+            size, dtype=dtype, device=self._normalize_device(self.device)
+        )
+        torch_mpi_ext.ops.recv_(tensor, src, 0, self.comm_ptr_wrapper)
+        return tensor
+
+    def isend_tensor_dict(
+        self,
+        tensor_dict: dict[str, Any],
+        dst: int | None = None,
+        all_gather_group: Any | None = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+    ) -> list[Any]:
+        if self.world_size <= 1:
+            return []
+        import torch_mpi_ext
+        from vllm.distributed.parallel_state import _split_tensor_dict
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
+        assert len(tensor_keys) == len(tensor_list)
+
+        self._pending_meta_handles = [
+            h for h in self._pending_meta_handles if not h.is_completed()
+        ]
+        meta_req = self.mpi_meta_comm.isend(metadata_list, dest=dst, tag=0)
+        meta_handle = _MpiRequestHandle(meta_req, keep_alive=metadata_list)
+        self._pending_meta_handles.append(meta_handle)
+        handles: list[Any] = [meta_handle]
+
+        dev_sends: list[tuple[torch.Tensor, int]] = []
+        cpu_sends: list[tuple[torch.Tensor, int]] = []
+        tensor_tag = 0
+        for key, tensor in zip(tensor_keys, tensor_list):
+            if tensor.numel() == 0:
+                continue
+            tensor_tag += 1
+            if self._should_use_all_gather(
+                key, tensor.numel(), all_gather_group, all_gather_tensors
+            ):
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+            contig = tensor.contiguous()
+            if contig.is_cpu:
+                cpu_sends.append((contig, tensor_tag))
+            else:
+                dev_sends.append((contig, tensor_tag))
+
+        if dev_sends:
+            main_stream = torch.mcpu.current_stream()
+            send_stream = self._get_p2p_send_stream()
+            send_stream.wait_stream(main_stream)
+            with torch.mcpu.stream(send_stream):
+                for contig, tag in dev_sends:
+                    torch_mpi_ext.ops.send(contig, dst, tag, self.comm_ptr_wrapper)
+            send_event = send_stream.record_event()
+            handles.append(
+                _McpuEventHandle(
+                    send_event,
+                    wait_stream=None,
+                    keep_alive=[t for t, _ in dev_sends],
+                )
+            )
+
+        for contig, tag in cpu_sends:
+            torch_mpi_ext.ops.send(contig, dst, tag, self.comm_ptr_wrapper)
+
+        return handles
+
+    def irecv_tensor_dict(
+        self,
+        src: int | None = None,
+        all_gather_group: Any | None = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+    ) -> tuple[dict[str, Any] | None, list[Any], list[Any]]:
+        if self.world_size <= 1:
+            return None, [], []
+        import torch_mpi_ext
+        from vllm.distributed.parallel_state import TensorMetadata
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        recv_metadata_list = self.mpi_meta_comm.recv(source=src, tag=0)
+        tensor_dict: dict[str, Any] = {}
+        handles: list[Any] = []
+        postprocess: list[Any] = []
+
+        dev_recvs: list[tuple[torch.Tensor, int]] = []
+        cpu_recvs: list[tuple[torch.Tensor, int]] = []
+        tensor_tag = 0
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                target_device = self._normalize_device(value.device)
+                full_tensor = torch.empty(
+                    value.size, dtype=value.dtype, device=target_device
+                )
+                if full_tensor.numel() == 0:
+                    tensor_dict[key] = full_tensor
+                    continue
+                tensor_tag += 1
+                if self._should_use_all_gather(
+                    key, full_tensor.numel(), all_gather_group, all_gather_tensors
+                ):
+                    orig_shape = full_tensor.shape
+                    slice_tensor = full_tensor.reshape(all_gather_size, -1)[
+                        all_gather_rank
+                    ]
+                    recv_target = slice_tensor
+
+                    def _postprocess(
+                        key: str = key,
+                        slice_tensor: torch.Tensor = slice_tensor,
+                        orig_shape: tuple[int, ...] = tuple(orig_shape),
+                        all_gather_group: Any = all_gather_group,
+                    ) -> None:
+                        assert all_gather_group is not None
+                        tensor_dict[key] = all_gather_group.all_gather(
+                            slice_tensor, dim=0
+                        ).reshape(orig_shape)
+
+                    postprocess.append(_postprocess)
+                    tensor_dict[key] = slice_tensor
+                else:
+                    recv_target = full_tensor
+                    tensor_dict[key] = full_tensor
+
+                if recv_target.is_cpu:
+                    cpu_recvs.append((recv_target, tensor_tag))
+                else:
+                    dev_recvs.append((recv_target, tensor_tag))
+            else:
+                tensor_dict[key] = value
+
+        if dev_recvs:
+            main_stream = torch.mcpu.current_stream()
+            recv_stream = self._get_p2p_recv_stream()
+            recv_stream.wait_stream(main_stream)
+            with torch.mcpu.stream(recv_stream):
+                for recv_target, tag in dev_recvs:
+                    torch_mpi_ext.ops.recv_(
+                        recv_target, src, tag, self.comm_ptr_wrapper
+                    )
+            recv_event = recv_stream.record_event()
+            handles.append(
+                _McpuEventHandle(
+                    recv_event,
+                    wait_stream=main_stream,
+                    keep_alive=[t for t, _ in dev_recvs],
+                )
+            )
+
+        for recv_target, tag in cpu_recvs:
+            torch_mpi_ext.ops.recv_(recv_target, src, tag, self.comm_ptr_wrapper)
+
+        return tensor_dict, handles, postprocess
+
+    def pp_broadcast(self, tensor: torch.Tensor, src: int = 0) -> None:
+        """Broadcast PP sampled tokens via formal MPI send/recv."""
+        if self.world_size <= 1:
+            return
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        import torch_mpi_ext
+
+        contig = tensor if tensor.is_contiguous() else tensor.contiguous()
+        if self.rank_in_group == src:
+            for peer in range(self.world_size):
+                if peer != src:
+                    torch_mpi_ext.ops.send(
+                        contig, peer, peer, self.bcast_comm_ptr_wrapper
+                    )
+        else:
+            torch_mpi_ext.ops.recv_(
+                contig, src, self.rank_in_group, self.bcast_comm_ptr_wrapper
+            )
+            if contig is not tensor:
+                tensor.copy_(contig)
+
     def destroy(self):
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[has-type]
+        for stream_attr in ("_p2p_send_stream", "_p2p_recv_stream"):
+            stream = getattr(self, stream_attr, None)
+            if stream is not None:
+                stream.synchronize()
+                setattr(self, stream_attr, None)
+        from mpi4py import MPI
+
+        if MPI.Is_initialized() and not MPI.Is_finalized():
+            for meta_handle in getattr(self, "_pending_meta_handles", ()):
+                meta_handle.wait()
+            self._pending_meta_handles = []
+            for attr in ("mpi_meta_comm", "mpi_bcast_comm", "mpi_group_comm"):
+                comm = getattr(self, attr, None)
+                if comm is not None:
+                    comm.Free()
+                    setattr(self, attr, None)
 
     pass
