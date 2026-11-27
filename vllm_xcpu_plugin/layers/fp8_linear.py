@@ -151,9 +151,15 @@ class XcpuFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             tuple(self.weight_group_shape),
             bias_fp32,
         )
+        dequant_bf16 = (
+            torch_xcpu.ops.get_acc_fp8_dequant_bf16_linear()
+            if fp8_linear.params.backend == torch_xcpu.ops.Fp8LinearBackend.ACC
+            else False
+        )
         logger.warning_once(
-            "Using torch_xcpu FP8 linear backend=%s",
+            "Using torch_xcpu FP8 linear backend=%s (dequant_bf16_linear=%s)",
             fp8_linear.params.backend.name.lower(),
+            dequant_bf16,
             scope="process",
         )
 

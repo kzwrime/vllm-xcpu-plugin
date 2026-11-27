@@ -1,5 +1,8 @@
 import torch
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekScalingRotaryEmbedding,
+)
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
@@ -151,5 +154,55 @@ class XcpuMRotaryEmbedding(MRotaryEmbedding):
             self.mrope_section,
             self.is_neox_style,
             self.mrope_interleaved,
+        )
+        return query, key
+
+
+@DeepseekScalingRotaryEmbedding.register_oot
+class XcpuDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+    supports_mla_rope_kvcache_fusion = True
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert key is not None
+        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+        return self.forward_static(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.rotary_dim,
+            cos_sin_cache,
+            self.is_neox_style,
+            offsets,
+        )
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if offsets is not None:
+            raise NotImplementedError(
+                "XCPU DeepseekScalingRotaryEmbedding requires offsets=None"
+            )
+        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+
+        import torch_xcpu.ops as ops
+
+        ops.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            cos_sin_cache,
+            self.is_neox_style,
         )
         return query, key

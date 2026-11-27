@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import copy
 from dataclasses import dataclass
 
 import pytest
@@ -421,6 +422,54 @@ def test_llama3_rotary_embedding(
 
     query_cpu = torch.randn(seq_len, 32, head_size, dtype=dtype, device="cpu")
     key_cpu = torch.randn(seq_len, 8, head_size, dtype=dtype, device="cpu")
+    positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
+    _test_rotary_embedding_model(
+        rope,
+        rope_fp32,
+        query_cpu,
+        key_cpu,
+        positions_cpu,
+        query_cpu.to(device),
+        key_cpu.to(device),
+        positions_cpu.to(device),
+        is_neox_style,
+        head_size,
+        dtype,
+        True,
+    )
+
+
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("seq_len", [1, 7, 64])
+@torch.inference_mode()
+def test_deepseek_scaling_rotary_embedding(
+    default_vllm_config,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: str,
+    seq_len: int,
+) -> None:
+    set_random_seed(0)
+    head_size = 64
+    max_position = 131072
+    rope_parameters = {
+        "rope_type": "deepseek_yarn",
+        "rope_theta": 50000.0,
+        "factor": 32.0,
+        "beta_fast": 1.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+        "original_max_position_embeddings": 4096,
+    }
+    rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
+    rope_fp32 = copy.deepcopy(rope).to(device="cpu", dtype=torch.float32)
+    rope = rope.to(dtype=dtype, device=device)
+
+    query_cpu = torch.randn(seq_len, 64, head_size, dtype=dtype, device="cpu")
+    key_cpu = torch.randn(seq_len, 1, head_size, dtype=dtype, device="cpu")
     positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
     _test_rotary_embedding_model(
         rope,

@@ -91,13 +91,13 @@ class McpuPlatform(Platform):
     ) -> str:
 
         if attn_selector_config.use_mla:
-            # Only sparse MLA (GLM5.2 DSA) is supported; the backend is fixed.
-            if not attn_selector_config.use_sparse:
-                raise NotImplementedError("MCPU supports sparse MLA (DSA) only")
             if selected_backend:
                 raise ValueError(
-                    f"MCPU sparse MLA cannot use selected backend {selected_backend}"
+                    f"MCPU MLA cannot use selected backend {selected_backend}"
                 )
+            if not attn_selector_config.use_sparse:
+                logger.info("Using XCPU_MLA_DENSE backend on MCPU")
+                return "vllm_xcpu_plugin.attention.dense_mla.XcpuMLADenseBackend"
             logger.info("Using XCPU_MLA_SPARSE backend on MCPU")
             return "vllm_xcpu_plugin.attention.sparse_mla.XcpuMLASparseBackend"
 

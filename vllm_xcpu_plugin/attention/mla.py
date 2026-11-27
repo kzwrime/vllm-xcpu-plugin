@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse-only MLA projections behind the v0.31 pluggable wrapper."""
+"""Sparse and dense MLA projections behind the v0.31 pluggable wrapper."""
 
 import os
 from dataclasses import replace
@@ -9,10 +9,26 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 from vllm.model_executor.utils import replace_parameter
+from vllm.v1.attention.backends.mla.prefill import MLAPrefillBackend
+
+
+class _XcpuNoOpMLAPrefillBackend(MLAPrefillBackend):
+    """Sentinel prefill backend so dense MLA avoids CUDA FlashAttention lookup."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "XCPU_MLA_NOOP_PREFILL"
+
+    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse, **kwargs):
+        raise NotImplementedError("XCPU MLA uses varlen MQA prefill only")
+
+    def run_prefill_context_chunk(self, chunk, q, k, v, out=None):
+        raise NotImplementedError("XCPU MLA uses varlen MQA prefill only")
 
 
 class XcpuMLAAttention(MLAAttention):
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("prefill_backend_cls", _XcpuNoOpMLAPrefillBackend)
         super().__init__(*args, **kwargs)
         self._fuse_rope_cache = os.getenv("VLLM_XCPU_FUSED_MLA", "1") != "0"
         # Fuse FP8 sparse attention with the following V up-projection; "0"
@@ -27,9 +43,10 @@ class XcpuMLAAttention(MLAAttention):
 
     def _forward_mqa_vproj(self, q, kv_cache, metadata, output):
         # output: [tokens, heads, v_head_dim] rows.
-        if self._fuse_vproj and self.impl.kv_cache_dtype in (
-            "fp8_ds_mla",
-            "int8_ds_mla",
+        if (
+            self._fuse_vproj
+            and getattr(self.impl, "is_sparse", False)
+            and self.impl.kv_cache_dtype in ("fp8_ds_mla", "int8_ds_mla")
         ):
             self.impl.forward_mqa_vproj(q, kv_cache, metadata, self, output)
             return
@@ -179,7 +196,7 @@ class XcpuMLAAttention(MLAAttention):
             or q_dcp_replicated is not None
         ):
             raise NotImplementedError(
-                "XCPU sparse MLA requires unquantized output and local Q"
+                "XCPU MLA requires unquantized output and local Q"
             )
         if attn_metadata is None:
             return output.zero_()
@@ -212,8 +229,6 @@ class XcpuMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not self.is_sparse:
-            raise NotImplementedError("MCPU supports sparse MLA (DSA) only")
         if not type(self)._upstream_verified:
             from vllm_xcpu_plugin.upstream_compatibility import (
                 verify_upstream_compatibility,
@@ -223,29 +238,38 @@ class XcpuMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             type(self)._upstream_verified = True
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        if self.q_lora_rank is None or self.dcp_q_replicate or self.rotary_emb is None:
-            raise NotImplementedError(
-                "XCPU sparse MLA requires q-LoRA and RoPE without DCP"
+        if self.dcp_q_replicate or self.rotary_emb is None:
+            raise NotImplementedError("XCPU MLA requires RoPE without DCP")
+        if self.q_lora_rank is not None:
+            qkv = self.fused_qkv_a_proj(hidden_states)[0]
+            q_c, kv = qkv.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
             )
-        qkv = self.fused_qkv_a_proj(hidden_states)[0]
-        q_c, kv = qkv.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
-        )
-        kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        if self.fuse_qkv_rmsnorm:
-            from vllm.models.common.ops import fused_q_kv_rmsnorm
+            kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            if self.fuse_qkv_rmsnorm:
+                from vllm.models.common.ops import fused_q_kv_rmsnorm
 
-            q_c, kv_c = fused_q_kv_rmsnorm(
-                q_c,
-                kv_c,
-                self.q_a_layernorm.weight,
-                self.kv_a_layernorm.weight,
-                self.q_a_layernorm.variance_epsilon,
-            )
+                q_c, kv_c = fused_q_kv_rmsnorm(
+                    q_c,
+                    kv_c,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                )
+            else:
+                q_c = self.q_a_layernorm(q_c)
+                kv_c = self.kv_a_layernorm(kv_c)
+            q = self.q_b_proj(q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
         else:
-            q_c = self.q_a_layernorm(q_c)
+            if self.indexer is not None:
+                raise NotImplementedError("XCPU sparse MLA indexer requires q-LoRA")
+            kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+            kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
             kv_c = self.kv_a_layernorm(kv_c)
-        q = self.q_b_proj(q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+            q_c = None
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_heads, self.qk_head_dim
+            )
         if self.indexer is not None and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
         self.mla_attn.impl.record_logical_topk_ready()
