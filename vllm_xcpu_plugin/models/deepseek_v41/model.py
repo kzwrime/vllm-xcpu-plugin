@@ -19,6 +19,7 @@ import vllm.models.deepseek_v41.attention as v41_attention
 import vllm.models.deepseek_v41.compressor as v41_compressor
 import vllm.models.deepseek_v41.nvidia.dspark as nv_dspark
 import vllm.models.deepseek_v41.nvidia.model as nv_model
+import vllm.models.deepseek_v41.nvidia.vl_model as nv_vl_model
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -67,6 +68,25 @@ def _indexer_uses_fp4(vllm_config) -> bool:
 
 def _use_v41_mxfp8_kv_record() -> bool:
     return True
+
+
+def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
+    """Parameter name the linear quant method registers for weight scales.
+
+    Upstream keys ``weight_scale`` off ``weight_block_size == [32, 32]`` and
+    ``expert_dtype == "fp4"`` (assuming ModelOpt MXFP8). ``XcpuInt8Ue8m0Config``
+    always registers ``weight_scale_inv``, including for [32, 32] INT8 blocks.
+    """
+    # Reference: vLLM
+    # vllm/models/deepseek_v41/nvidia/model.py::_linear_scale_param_name
+    from vllm_xcpu_plugin.layers.int8_ue8m0 import XcpuInt8Ue8m0Config
+
+    if isinstance(vllm_config.quant_config, XcpuInt8Ue8m0Config):
+        return "weight_scale_inv"
+    return _upstream_linear_scale_param_name(vllm_config, expert_dtype)
+
+
+_upstream_linear_scale_param_name = nv_model._linear_scale_param_name
 
 
 def _insert_context_kv(
@@ -462,6 +482,34 @@ class XcpuDSparkDeepseekV41Model(DSparkDeepseekV4Model):
         try:
             if not projs:
                 return
+            raw_int8_list = [
+                item
+                for proj in projs
+                if (item := getattr(proj, "_xcpu_raw_wkv_int8", None)) is not None
+            ]
+            if len(raw_int8_list) == len(projs):
+                block_sizes = {item[2] for item in raw_int8_list}
+                scale_dtypes = {item[1].dtype for item in raw_int8_list}
+                if len(block_sizes) == 1 and len(scale_dtypes) == 1:
+                    stacked_w = torch.cat(
+                        [item[0] for item in raw_int8_list], dim=0
+                    ).contiguous()
+                    stacked_s = torch.cat(
+                        [item[1] for item in raw_int8_list], dim=0
+                    ).contiguous()
+                    block_size = raw_int8_list[0][2]
+                    self._context_wkv_linear = torch_xcpu.ops.initialize_int8_linear(
+                        stacked_w, stacked_s, block_size
+                    )
+                    logger.info_once(
+                        "DSpark context KV: stacked %d wkv layers into INT8 "
+                        "linear (%s, backend=%s)",
+                        len(projs),
+                        tuple(stacked_w.shape),
+                        self._context_wkv_linear.params.backend.name.lower(),
+                    )
+                    return
+
             raw_fp8_list = [
                 item
                 for proj in projs
@@ -523,6 +571,7 @@ class XcpuDSparkDeepseekV41Model(DSparkDeepseekV4Model):
         finally:
             for proj in projs:
                 proj._xcpu_raw_wkv_fp8 = None
+                proj._xcpu_raw_wkv_int8 = None
                 proj._xcpu_raw_weight = None
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -594,6 +643,9 @@ def install_deepseek_v41() -> None:
     rebind(nv_model, "sp_reduce_scatter", _sp_reduce_scatter)
     rebind(nv_model, "gather_engram_hashes", _gather_engram_hashes)
     rebind(nv_model, "get_engram_dp_size", _get_engram_dp_size)
+    rebind(nv_model, "_linear_scale_param_name", _linear_scale_param_name)
+    rebind(nv_vl_model, "_linear_scale_param_name", _linear_scale_param_name)
+    rebind(nv_dspark, "_linear_scale_param_name", _linear_scale_param_name)
     rebind(nv_dspark, "DSparkDeepseekV4Model", XcpuDSparkDeepseekV41Model)
     rebind(nv_dspark, "mhc_post_tilelang", ops.mhc_post)
     rebind(nv_dspark, "hc_collapse_triton", ops.hc_collapse)

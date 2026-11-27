@@ -51,11 +51,144 @@ def test_xcpu_int8_config_registration_and_mapper() -> None:
     })
     assert cfg.get_name() == "xcpu_int8"
     assert cfg.weight_block_size == [16, 16]
+    assert cfg.expert_dtype is None
     assert cfg.get_supported_act_dtypes() == [torch.bfloat16]
 
     mapper = WeightsMapper(orig_to_new_prefix={"model.": "language_model."})
     cfg.apply_vllm_mapper(mapper)
     assert cfg.ignored_layers == ["lm_head", "language_model.embed_tokens"]
+
+    cfg_fp4_experts = cfg_cls.from_config({
+        "quant_method": "xcpu_int8",
+        "fmt": "int8_ue8m0",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [16, 16],
+        "expert_dtype": "fp4",
+    })
+    assert cfg_fp4_experts.expert_dtype == "fp4"
+    with pytest.raises(ValueError, match="expert_dtype"):
+        XcpuInt8Ue8m0Config(expert_dtype="fp8")
+
+
+def test_xcpu_int8_fp4_expert_dtype_returns_mxfp4_moe(monkeypatch) -> None:
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    from vllm_xcpu_plugin.layers.fused_moe.routed_experts import xcpu_moe_method_factory
+    from vllm_xcpu_plugin.layers.mxfp4_moe import XcpuMxfp4MoEMethod
+
+    parallel_cfg = FusedMoEParallelConfig.make_no_parallel()
+    moe_cfg = FusedMoEConfig(
+        num_experts=4,
+        experts_per_token=2,
+        hidden_dim=64,
+        intermediate_size=64,
+        num_local_experts=4,
+        num_logical_experts=4,
+        activation=MoEActivation.SILU,
+        device="mcpu",
+        routing_method=RoutingMethodType.DeepseekV4,
+        moe_parallel_config=parallel_cfg,
+        in_dtype=torch.bfloat16,
+        max_num_tokens=8,
+    )
+
+    class FakeRoutedExperts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.moe_config = moe_cfg
+
+    monkeypatch.setattr(
+        "vllm_xcpu_plugin.layers.int8_ue8m0.RoutedExperts", FakeRoutedExperts
+    )
+    cfg = XcpuInt8Ue8m0Config(weight_block_size=[16, 16], expert_dtype="fp4")
+    layer = FakeRoutedExperts()
+    fake_vllm_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(quantization_config=None)
+    )
+    with set_current_vllm_config(fake_vllm_cfg):  # type: ignore[arg-type]
+        quant_method = cfg.get_quant_method(layer, "layers.0.ffn.experts")
+        assert type(quant_method) is Mxfp4MoEMethod
+        xcpu_method = xcpu_moe_method_factory(quant_method, cfg, layer)
+        assert type(xcpu_method) is XcpuMxfp4MoEMethod
+
+
+def test_int8_grouped_wo_a_process_and_ops_dispatch(monkeypatch) -> None:
+    import torch_xcpu
+
+    from vllm_xcpu_plugin.models.deepseek_v41 import ops as dsv41_ops
+
+    layer = torch.nn.Module()
+    layer.xcpu_grouped_wo_a = 4
+    layer.bias = None
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.ones((128, 64), dtype=torch.int8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale_inv",
+        torch.nn.Parameter(
+            torch.full((8, 4), 127, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+
+    prepack_calls = []
+
+    def fake_prepack(w):
+        prepack_calls.append(tuple(w.shape))
+        return w.clone()
+
+    monkeypatch.setattr(
+        torch_xcpu.ops, "einsum_int8_tgd_grd_to_tgr_prepack_weight", fake_prepack
+    )
+    monkeypatch.setattr(
+        torch_xcpu.ops, "einsum_int8_tgd_grd_to_tgr_version", lambda: "A0"
+    )
+
+    method = XcpuInt8Ue8m0LinearMethod(XcpuInt8Ue8m0Config(weight_block_size=[16, 16]))
+    method.process_weights_after_loading(layer)
+
+    assert prepack_calls == [(4, 32, 64)]
+    assert hasattr(layer, "xcpu_wo_a")
+    packed, scales = layer.xcpu_wo_a
+    assert packed.shape == (4, 32, 64)
+    assert scales.shape == (4, 2, 4)
+    assert not hasattr(layer, "_xcpu_int8_linear")
+
+    einsum_calls = []
+
+    def fake_einsum_int8(x, w, s, out):
+        einsum_calls.append((tuple(x.shape), w.dtype, s.dtype, tuple(out.shape)))
+        out.fill_(1.0)
+
+    monkeypatch.setattr(torch_xcpu.ops, "einsum_int8_tgd_grd_to_tgr", fake_einsum_int8)
+    o = torch.zeros((3, 8, 32), dtype=torch.bfloat16)
+    z = dsv41_ops.grouped_wo_a(o, packed, scales)
+    assert z.shape == (3, 128)
+    assert einsum_calls == [((3, 4, 64), torch.int8, torch.uint8, (3, 4, 32))]
+
+
+def test_deepseek_v41_linear_scale_param_name_for_int8_32x32() -> None:
+    import vllm.models.deepseek_v41.nvidia.dspark as nv_dspark
+    import vllm.models.deepseek_v41.nvidia.model as nv_model
+    import vllm.models.deepseek_v41.nvidia.vl_model as nv_vl_model
+
+    from vllm_xcpu_plugin.models.deepseek_v41 import model as dsv41_model
+
+    dsv41_model.install_deepseek_v41()
+
+    int8_32_cfg = SimpleNamespace(
+        quant_config=XcpuInt8Ue8m0Config(weight_block_size=[32, 32], expert_dtype="fp4")
+    )
+    for mod in (dsv41_model, nv_model, nv_vl_model, nv_dspark):
+        assert mod._linear_scale_param_name(int8_32_cfg, "fp4") == "weight_scale_inv"
+
+    mxfp8_cfg = SimpleNamespace(
+        quant_config=SimpleNamespace(weight_block_size=[32, 32])
+    )
+    assert dsv41_model._linear_scale_param_name(mxfp8_cfg, "fp4") == "weight_scale"
 
 
 def test_mla_weight_only_int8_ue8m0_dequant() -> None:

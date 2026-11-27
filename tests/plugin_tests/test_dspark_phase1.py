@@ -415,3 +415,83 @@ def test_dspark_deepseek_v41_idle_dummy_skips_projections():
     with _dummy_run_scope(False):
         inner.precompute_and_store_context_kv(aux[:, :64], pos, None)
         assert proj_calls == ["context_wkv"]
+
+
+def test_int8_context_wkv_stacked_matches_unstacked_and_frees_raw(monkeypatch):
+    from vllm_xcpu_plugin.layers.int8_ue8m0 import (
+        XcpuInt8Ue8m0Config,
+        XcpuInt8Ue8m0LinearMethod,
+    )
+
+    q_lora_rank, head_dim, hidden_size = 128, 128, 256
+    int8_projs = []
+    indiv_linears = []
+    method = XcpuInt8Ue8m0LinearMethod(XcpuInt8Ue8m0Config(weight_block_size=[16, 16]))
+    for i in range(3):
+        g = torch.Generator(device="cpu").manual_seed(50 + i)
+        layer = torch.nn.Module()
+        layer.bias = None
+        w = torch.randint(
+            -128,
+            128,
+            (q_lora_rank + head_dim, hidden_size),
+            generator=g,
+            dtype=torch.int8,
+        ).to("mcpu")
+        s = (
+            torch
+            .randint(
+                120,
+                126,
+                ((q_lora_rank + head_dim) // 16, hidden_size // 16),
+                generator=g,
+            )
+            .to(torch.uint8)
+            .to("mcpu")
+        )
+        layer.register_parameter("weight", torch.nn.Parameter(w, requires_grad=False))
+        layer.register_parameter(
+            "weight_scale_inv", torch.nn.Parameter(s, requires_grad=False)
+        )
+        layer._xcpu_keep_raw_wkv_offset = q_lora_rank
+        method.process_weights_after_loading(layer)
+        assert getattr(layer, "_xcpu_raw_wkv_int8", None) is not None
+        indiv_linears.append(layer._xcpu_int8_linear)
+        int8_projs.append(layer)
+
+    _, inner_int8 = _build_fake_dspark_v41(
+        num_layers=3,
+        q_lora_rank=q_lora_rank,
+        head_dim=head_dim,
+        hidden_size=hidden_size,
+        projs=int8_projs,
+    )
+    inner_int8.build_context_wkv_linear()
+    assert inner_int8._context_wkv_linear is not None
+    assert inner_int8._context_wkv_linear.params.out_features == 3 * head_dim
+    assert inner_int8._context_wkv_linear.params.in_features == hidden_size
+    for proj in int8_projs:
+        assert proj._xcpu_raw_wkv_int8 is None
+        assert proj._xcpu_raw_weight is None
+
+    recorded: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        dsv41_model_mod,
+        "_insert_context_kv",
+        lambda attn, kv, positions, slots: recorded.append(kv.detach().cpu().clone()),
+    )
+    for num_tokens in (1, 7, 17):
+        recorded.clear()
+        torch.manual_seed(200 + num_tokens)
+        main_x = (
+            torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16) * 0.5
+        ).to("mcpu")
+        pos = torch.arange(num_tokens, dtype=torch.int64, device="mcpu")
+        with _dummy_run_scope(False):
+            inner_int8.precompute_and_store_context_kv(main_x, pos, [pos, pos, pos])
+        assert len(recorded) == 3
+        for layer, lin, got in zip(
+            inner_int8.layers, indiv_linears, recorded, strict=True
+        ):
+            ref = layer.attn.kv_norm(lin(main_x)[..., q_lora_rank:])
+            assert torch.equal(got, ref.cpu())

@@ -88,7 +88,10 @@ def grouped_wo_a(
     groups, rank = packed_weight.shape[:2]
     x = o.reshape(o.shape[0], groups, -1)
     out = o.new_empty((o.shape[0], groups, rank))
-    torch_xcpu.ops.einsum_fp8_tgd_grd_to_tgr(x, packed_weight, weight_scale, out)
+    if packed_weight.dtype == torch.int8:
+        torch_xcpu.ops.einsum_int8_tgd_grd_to_tgr(x, packed_weight, weight_scale, out)
+    else:
+        torch_xcpu.ops.einsum_fp8_tgd_grd_to_tgr(x, packed_weight, weight_scale, out)
     return out.flatten(1)
 
 

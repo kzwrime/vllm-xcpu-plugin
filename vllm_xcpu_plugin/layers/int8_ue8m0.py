@@ -100,6 +100,7 @@ class XcpuInt8Ue8m0Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
+        expert_dtype: str | None = None,
     ) -> None:
         super().__init__()
         if fmt != "int8_ue8m0":
@@ -109,6 +110,8 @@ class XcpuInt8Ue8m0Config(QuantizationConfig):
                 "xcpu_int8 only supports dynamic/unquantized activations "
                 f"(W8A16), got {activation_scheme!r}"
             )
+        if expert_dtype not in (None, "int8", "fp4"):
+            raise ValueError(f"Unsupported xcpu_int8 expert_dtype: {expert_dtype!r}")
         block_size = (
             list(_DEFAULT_BLOCK_SIZE)
             if weight_block_size is None
@@ -123,6 +126,7 @@ class XcpuInt8Ue8m0Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = list(ignored_layers or [])
         self.weight_block_size = block_size
+        self.expert_dtype = expert_dtype
 
     def get_name(self) -> Any:
         return "xcpu_int8"
@@ -154,11 +158,13 @@ class XcpuInt8Ue8m0Config(QuantizationConfig):
         weight_block_size = cls.get_from_keys_or(
             config, ["weight_block_size"], _DEFAULT_BLOCK_SIZE
         )
+        expert_dtype = cls.get_from_keys_or(config, ["expert_dtype"], None)
         return cls(
             fmt=fmt,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            expert_dtype=expert_dtype,
         )
 
     def get_quant_method(
@@ -179,6 +185,12 @@ class XcpuInt8Ue8m0Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+            if self.expert_dtype == "fp4":
+                from vllm.model_executor.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(layer.moe_config)
             return XcpuInt8Ue8m0MoEMethod(self, layer)
         return None
 
@@ -276,6 +288,39 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", dequant)
             return
 
+        groups = getattr(layer_any, "xcpu_grouped_wo_a", 0)
+        if groups:
+            weight = layer_any.weight.data
+            n, k = weight.shape
+            if (
+                getattr(layer, "bias", None) is not None
+                or not torch_xcpu.ops.int8_scale_format_supported(
+                    (bn, bk), weight_scale.dtype
+                )
+                or n % (groups * 32) != 0
+                or n % (groups * bn) != 0
+                or k % 16 != 0
+                or k % bk != 0
+            ):
+                raise RuntimeError(
+                    "XCPU INT8 grouped wo_a requires bias=None, supported "
+                    f"UE8M0 block={(bn, bk)}, R % 32 == 0, R % {bn} == 0, "
+                    f"D % 16 == 0, and D % {bk} == 0, "
+                    f"got weight={tuple(weight.shape)}, groups={groups}"
+                )
+            weight_3d = weight.contiguous().view(groups, n // groups, k)
+            packed = torch_xcpu.ops.einsum_int8_tgd_grd_to_tgr_prepack_weight(weight_3d)
+            scales_3d = weight_scale.view(groups, -1, weight_scale.shape[-1])
+            layer_any.xcpu_wo_a = (packed, scales_3d)
+            logger.info_once(
+                "Using torch_xcpu einsum_int8_tgd_grd_to_tgr (%s) for wo_a",
+                torch_xcpu.ops.einsum_int8_tgd_grd_to_tgr_version(),
+                scope="process",
+            )
+            replace_parameter(layer, "weight", packed)
+            replace_parameter(layer, "weight_scale_inv", scales_3d)
+            return
+
         layer_bias = getattr(layer, "bias", None)
         if getattr(layer, "skip_bias_add", False) or (
             isinstance(layer, RowParallelLinear) and layer.tp_rank > 0
@@ -285,6 +330,20 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
         if layer_bias is not None:
             assert isinstance(layer_bias, torch.Tensor)
             bias_fp32 = layer_bias.float().contiguous()
+
+        wkv_offset = getattr(layer_any, "_xcpu_keep_raw_wkv_offset", None)
+        if (
+            isinstance(wkv_offset, int)
+            and 0 < wkv_offset < layer_any.weight.shape[0]
+            and wkv_offset % bn == 0
+            and (layer_any.weight.shape[0] - wkv_offset) % bn == 0
+            and bias_fp32 is None
+        ):
+            layer_any._xcpu_raw_wkv_int8 = (
+                layer_any.weight.data[wkv_offset:].detach().contiguous(),
+                weight_scale[wkv_offset // bn :].detach().contiguous(),
+                (bn, bk),
+            )
 
         int8_linear = torch_xcpu.ops.initialize_int8_linear(
             layer.weight,
@@ -321,7 +380,7 @@ class XcpuInt8Ue8m0LinearMethod(LinearMethodBase):
                 "The runtime bias does not match the bias used to initialize "
                 "torch_xcpu INT8 linear"
             )
-        return int8_linear(x)
+        return int8_linear(x if x.is_contiguous() else x.contiguous())
 
 
 class XcpuInt8Ue8m0MoEMethod(FusedMoEMethodBase):

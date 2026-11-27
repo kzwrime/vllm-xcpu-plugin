@@ -544,7 +544,7 @@ MANIFEST = Manifest(
                 "and stacks the 3 layers' unpacked wkv slices once in post-quant "
                 "process_weights_after_loading (skipped during load_weights's "
                 "pre-quant call via _loading_checkpoint_weights) into one "
-                "torch_xcpu FP8/BF16 linear, freeing temporary raw stashes; "
+                "torch_xcpu INT8/FP8/BF16 linear, freeing temporary raw stashes; "
                 "(3) under torch_xcpu.ops.is_dummy_run() (runtime idle-DP sync "
                 "batches), combine_hidden_states and unslotted "
                 "precompute_and_store_context_kv return without GEMMs. "
@@ -554,6 +554,7 @@ MANIFEST = Manifest(
             ),
             impl=(
                 "torch_xcpu/torch_xcpu/ops_defs/deepseek_v41/__init__.py::deepseek_v41_qnorm_rope_kv_insert",
+                "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/int8_ue8m0.py::XcpuInt8Ue8m0LinearMethod",
                 "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/mxfp8_linear.py::XcpuMxfp8LinearKernel",
                 "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/fp8_linear.py::XcpuFp8BlockScaledMMLinearKernel",
             ),
@@ -910,10 +911,13 @@ MANIFEST = Manifest(
             ),
             contract=(
                 "Grouped wo_a (einsum tgd,grd->tgr over n_local_groups; W8A16 "
-                "MXFP8 packed or BF16 fallback) then _wo_b_proj. Re-check: group "
-                "layout, head slicing, wo_b reduction."
+                "MXFP8 or INT8 UE8M0 packed, or BF16 fallback) then _wo_b_proj. "
+                "Re-check: group layout, head slicing, wo_b reduction."
             ),
-            impl=("torch_xcpu/torch_xcpu/ops.py::einsum_fp8_tgd_grd_to_tgr",),
+            impl=(
+                "torch_xcpu/torch_xcpu/ops.py::einsum_fp8_tgd_grd_to_tgr",
+                "torch_xcpu/torch_xcpu/ops.py::einsum_int8_tgd_grd_to_tgr",
+            ),
             tests=("docs/upgrade/11-dsv41-serial.md (eager + compile + DSpark)",),
         ),
         Patch(
@@ -1904,6 +1908,59 @@ MANIFEST = Manifest(
                 "finalization order in DeepseekV41LLMForCausalLM.load_weights."
             ),
             tests=("vllm-xcpu-plugin/tests/engram_parallel/test_layout_and_loader.py",),
+        ),
+        Patch(
+            id="deepseek_v41.quant.linear_scale_param_name",
+            source=_V031,
+            downstream=(
+                "vllm_xcpu_plugin.models.deepseek_v41.model:_linear_scale_param_name",
+            ),
+            upstream=(
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:_linear_scale_param_name",
+                    source_hash="2f6c4b5f50b3ed124cb59b7983cc4b59d71e3cac59103ad1012b42879c4851e4",
+                    signature_hash="d14dbd05f16a8200539de0a3bd08ccec604c2dec8b0266121203a21b060bf101",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.vl_model:_linear_scale_param_name",
+                    source_hash="2f6c4b5f50b3ed124cb59b7983cc4b59d71e3cac59103ad1012b42879c4851e4",
+                    signature_hash="d14dbd05f16a8200539de0a3bd08ccec604c2dec8b0266121203a21b060bf101",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:_linear_scale_param_name",
+                    source_hash="2f6c4b5f50b3ed124cb59b7983cc4b59d71e3cac59103ad1012b42879c4851e4",
+                    signature_hash="d14dbd05f16a8200539de0a3bd08ccec604c2dec8b0266121203a21b060bf101",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.__init__",
+                    source_hash="54bf9a148b88ef4d5824068463591b15418a5e0f71f56cb3eb92b280a924402a",
+                    signature_hash="0268aa001d71a5bab9e4761758b7b321b8822f20f4554d61286ec2ca4dd91920",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.__init__",
+                    source_hash="eee102dcf160a9a21e93fe6bbc857920e4d5c79276dfb46fc7bb34d995ad8ce1",
+                    signature_hash="41e09ea153ede580447e3e22bd8e67225987f82aa5682a96a2ac3bb3d3bdba35",
+                ),
+                UpstreamRef(
+                    target="vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.__init__",
+                    source_hash="19d27a794c12036dc94d704054c31699c6d9589990a0ca476032cb3cddca7e8b",
+                    signature_hash="0268aa001d71a5bab9e4761758b7b321b8822f20f4554d61286ec2ca4dd91920",
+                ),
+            ),
+            contract=(
+                "Upstream _linear_scale_param_name returns 'weight_scale' whenever "
+                "weight_block_size == [32, 32] and expert_dtype == 'fp4' (assuming "
+                "ModelOpt MXFP8). XcpuInt8Ue8m0LinearMethod always registers "
+                "'weight_scale_inv', so XcpuInt8Ue8m0Config overrides all three "
+                "call sites (model, vl_model, dspark) to 'weight_scale_inv' "
+                "while delegating other quant configs upstream. Re-check: new "
+                "call sites importing _linear_scale_param_name or scale suffix "
+                "changes in _make_deepseek_v4_weights_mapper."
+            ),
+            impl=(
+                "vllm-xcpu-plugin/vllm_xcpu_plugin/layers/int8_ue8m0.py::XcpuInt8Ue8m0LinearMethod",
+            ),
+            tests=("vllm-xcpu-plugin/tests/layers/test_int8_ue8m0.py",),
         ),
     ),
 )
