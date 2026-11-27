@@ -390,3 +390,49 @@ def test_rotary_embedding(
                 dtype,
                 use_key,
             )
+
+
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("seq_len", [1, 7, 128])
+@torch.inference_mode()
+def test_llama3_rotary_embedding(
+    default_vllm_config,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: str,
+    seq_len: int,
+) -> None:
+    set_random_seed(0)
+    head_size = 64
+    max_position = 131072
+    rope_parameters = {
+        "rope_type": "llama3",
+        "rope_theta": 500000.0,
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+    rope = get_rope(head_size, max_position, is_neox_style, rope_parameters)
+    rope_fp32 = rope.to(dtype=torch.float32)
+    rope = rope.to(dtype=dtype, device=device)
+
+    query_cpu = torch.randn(seq_len, 32, head_size, dtype=dtype, device="cpu")
+    key_cpu = torch.randn(seq_len, 8, head_size, dtype=dtype, device="cpu")
+    positions_cpu = torch.randint(0, max_position, (seq_len,), device="cpu")
+    _test_rotary_embedding_model(
+        rope,
+        rope_fp32,
+        query_cpu,
+        key_cpu,
+        positions_cpu,
+        query_cpu.to(device),
+        key_cpu.to(device),
+        positions_cpu.to(device),
+        is_neox_style,
+        head_size,
+        dtype,
+        True,
+    )
